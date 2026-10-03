@@ -72,7 +72,7 @@ use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{clamp_selection, App, HitTarget, Overlay};
-use crate::filter_list::FilterList;
+use crate::filter_list::{FilterList, QueryTerms};
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
 use crate::pull_request::{gh, login, str_at, web_url};
@@ -446,7 +446,9 @@ pub struct IssuesView {
     /// (`ui::browser_button`), for the click and the pointer resting on
     /// it; `Rect::default()` — no point inside — while there is none.
     pub browser_area: Rect,
-    /// Issues plus the list's live filter/cursor. Empty query shows every
+    /// Issues plus the list's live filter/cursor: the rows narrow to the
+    /// fuzzy matches of `#15 title`, best first, and to the issues carrying
+    /// every `label:` term typed ([`LABEL_KEY`]). Empty query shows every
     /// row in the cache's order.
     pub list: FilterList<Issue>,
     /// `Ctrl+e`: the reading pane turned into the editor for the row under the
@@ -1173,7 +1175,25 @@ fn has_query(view: &IssuesView) -> bool {
 
 fn rebuild_list(view: &mut IssuesView, rows: &[Issue]) {
     view.list.items = rows.to_vec();
-    view.list.apply_filter(|issue| issue.label());
+    view.list
+        .apply_filter_where(&[LABEL_KEY], |issue| issue.label(), carries_labels);
+}
+
+/// The issues list's one filter key: `label:bug` keeps the rows carrying a
+/// label containing `bug` (`label:plugin` finds `browser-plugin` and
+/// `plugin-sdk` alike, case ignored), every such term must match, and the
+/// rest of the text ranks and lights `#15 title` as before.
+const LABEL_KEY: &str = "label";
+
+/// Whether `issue` carries a label for every `label:` term typed.
+fn carries_labels(issue: &Issue, terms: &QueryTerms) -> bool {
+    terms.values(LABEL_KEY).all(|term| {
+        let term = term.to_lowercase();
+        issue
+            .labels
+            .iter()
+            .any(|label| label.to_lowercase().contains(&term))
+    })
 }
 
 /// The row under the cursor, as an index into `list`: `selected` while
@@ -2516,7 +2536,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     f.render_widget(block, list_a);
     // The always-live filter on the list's first line, the rows under it.
     if let Some(query_area) = row_rect(list_inner, 0) {
-        let line = search_line(&view.list.query, "type to filter…", query_area, th);
+        let line = search_line(
+            &view.list.query,
+            "type to filter… label:name",
+            query_area,
+            th,
+        );
         f.render_widget(Paragraph::new(line), query_area);
     }
     let mut rows_area = crate::ui::below_first_row(list_inner);
@@ -4039,7 +4064,7 @@ mod tests {
         assert_eq!(cursor_number(&app), Some(second));
         let shot = screen(&mut app, 120, 40);
         assert!(shot.contains("(3)"), "{shot}");
-        assert!(shot.contains("type to filter…"), "{shot}");
+        assert!(shot.contains("type to filter… label:name"), "{shot}");
         handle_key(
             &mut app,
             key(KeyCode::Esc, KeyModifiers::NONE),
@@ -4990,5 +5015,52 @@ esac
             .list
             .retain(|i| i.origin == Origin::Source);
         assert!(!screen(&mut app, 120, 20).contains("retries"));
+    }
+
+    /// `label:` keeps the rows carrying a matching label — part of a label
+    /// is enough, and every term must match — and the rest of the text
+    /// still ranks and lights `#15 title` as before.
+    #[test]
+    fn label_terms_narrow_the_rows() {
+        let tagged = |n: u64, title: &str, labels: &[&str]| Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, title)
+        };
+        let list = vec![
+            tagged(15, "Fix login redirect", &["bug", "browser-plugin"]),
+            tagged(14, "Docs pass", &["documentation"]),
+            tagged(13, "Login on Linux", &["bug", "plugin-sdk", "p1"]),
+            tagged(12, "Good first one", &["good first issue"]),
+        ];
+        let filtered = |query: &str| -> Vec<(String, Vec<usize>)> {
+            // What `rebuild_list` runs.
+            let mut rows = FilterList::new(list.clone());
+            rows.query.set_text(query);
+            rows.apply_filter_where(&[LABEL_KEY], |issue| issue.label(), carries_labels);
+            rows.matches
+                .iter()
+                .map(|m| (list[m.item].id.clone(), m.positions.clone()))
+                .collect()
+        };
+        let ids = |query: &str| -> Vec<String> {
+            filtered(query).into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(ids("label:bug"), ["15", "13"], "list order, nothing ranked");
+        assert_eq!(ids("label:plugin"), ["15", "13"], "part of a label");
+        assert_eq!(ids("label:bug label:p1"), ["13"], "every term");
+        assert_eq!(ids("LABEL:BUG label:P1"), ["13"], "case ignored");
+        assert_eq!(ids("label:\"good first\""), ["12"]);
+        assert_eq!(ids("label:nothing"), Vec::<String>::new());
+        assert_eq!(ids("label:"), ["15", "14", "13", "12"]);
+        let rows = filtered("label:bug linux");
+        assert_eq!(rows.len(), 1);
+        let (id, positions) = &rows[0];
+        assert_eq!(id, "13");
+        let label = list.iter().find(|i| &i.id == id).unwrap().label();
+        let lit: String = positions
+            .iter()
+            .map(|&p| label.chars().nth(p).unwrap())
+            .collect();
+        assert_eq!(lit.to_lowercase(), "linux", "the text part is what lights");
     }
 }
