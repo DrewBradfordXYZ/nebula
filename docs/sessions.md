@@ -513,7 +513,11 @@ best first, the cursor on the best with its comments asked for as any move asks 
 letters lit in each row and the title's count reading `2/14`. A `label:` term keeps only the issues
 carrying a matching label — part of the name is enough, any case, and every term must match:
 `label:bug login` is the bug-labelled issues matching `login`, and `label:"good first issue"` quotes
-a label with spaces. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
+a label with spaces. `Ctrl+l` opens the LABEL PICKER in the reading pane's place: every label on the
+issues the filter shows, the most used first with how many carry it, filtered as you type. `Enter`
+adds the one under the cursor as a `label:` term and puts the pane back, so a second pick narrows
+what the first left; `Esc` goes back without one. A click on a label in the reading pane adds it the
+same way. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
 matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` (or `Ctrl+y`) and `Ctrl+o` act on the issue you found. `Esc`
 clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every
 fuzzy overlay; a filter nothing matches says `no issues match` and leaves the cursor where it was for

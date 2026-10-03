@@ -449,6 +449,23 @@ pub struct IssuesView {
     /// view rides a `Comment` answer, and two text fields would make that
     /// variant several times the others' size.
     pub editor: Option<Box<IssueEditor>>,
+    /// `Ctrl+l`: the LABEL PICKER in the reading pane's place, until Enter
+    /// has added its label to the filter or Esc has put the pane back.
+    pub label_picker: Option<Box<LabelPicker>>,
+}
+
+/// The LABEL PICKER: every label on the rows the filter leaves, with how
+/// many carry it, filtered as you type. Enter adds `label:<name>` to the
+/// list's filter, so a label can be found without knowing how it is
+/// spelled — and, since the counts follow the filter, the next label
+/// narrows what the last one left.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LabelPicker {
+    pub query: TextInput,
+    /// Cursor into the picker's visible rows.
+    pub selected: usize,
+    /// The picker's rows, written back during draw for clicks.
+    pub list_area: Rect,
 }
 
 impl IssuesView {
@@ -468,6 +485,7 @@ impl IssuesView {
             query: TextInput::new(),
             cursor_row: 0,
             editor: None,
+            label_picker: None,
         }
     }
 
@@ -1125,6 +1143,12 @@ impl IssueFilter {
         }
         filter.text = text.join(" ");
         filter
+    }
+
+    /// Whether a term already asks for exactly `label`.
+    fn has_label(&self, label: &str) -> bool {
+        let label = label.to_lowercase();
+        self.labels.contains(&label)
     }
 
     /// Whether `issue` carries a label for every term.
@@ -1944,6 +1968,11 @@ pub(crate) fn paste(app: &mut App, text: &str) -> bool {
     let Some(Overlay::Issues(view)) = &mut app.overlay else {
         return false;
     };
+    if let Some(picker) = &mut view.label_picker {
+        picker.query.insert_str(text);
+        picker.selected = 0;
+        return true;
+    }
     if view.editor.is_none() {
         view.query.insert_str(text);
         query_changed(app);
@@ -1972,8 +2001,10 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
             }
             Origin::Source => "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save  Esc: cancel edit",
         }
+    } else if view.label_picker.is_some() {
+        "type to filter labels  ↑/↓ ^n/^p: label  Enter: filter the issues by it  Esc: back"
     } else {
-        "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c/^y: comment  ^o: browser  ^r: refresh  Esc: clear / close"
+        "type to filter (label:name)  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c/^y: comment  ^l: labels  ^o: browser  ^r: refresh  Esc: clear / close"
     }
 }
 
@@ -2079,6 +2110,181 @@ pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
+// ---- labels ----
+
+/// Each label's name and how many of the listed issues carry it.
+type LabelCounts = Vec<(String, usize)>;
+
+/// The picker's visible rows: indices into its [`LabelCounts`], each with
+/// the matched char positions of the name.
+type PickerRows = Vec<(usize, Vec<usize>)>;
+
+/// Every label on the rows `query` leaves, with how many of them carry it:
+/// the most used first, then by name. What the LABEL PICKER lists.
+fn label_counts(query: &str, list: &[Issue]) -> LabelCounts {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (i, _) in visible_rows(query, list) {
+        for label in &list[i].labels {
+            match counts.iter_mut().find(|(name, _)| name == label) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((label.clone(), 1)),
+            }
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts
+}
+
+/// The picker's rows: indices into `counts` matching its own filter, best
+/// first, each with the matched char positions of the label's name; every
+/// label in count order with nothing typed.
+fn picker_rows(picker: &LabelPicker, counts: &[(String, usize)]) -> PickerRows {
+    crate::fuzzy::rank(
+        picker.query.as_str(),
+        counts.iter().map(|(name, _)| name.as_str()),
+    )
+}
+
+/// The labels the picker would offer right now, and its rows over them.
+fn picker_state(app: &App) -> Option<(LabelCounts, PickerRows)> {
+    let Some(Overlay::Issues(view)) = &app.overlay else {
+        return None;
+    };
+    let picker = view.label_picker.as_ref()?;
+    let list = app
+        .issues
+        .get(&view.project)
+        .map_or(&[][..], |l| l.list.as_slice());
+    let counts = label_counts(&view.query, list);
+    let rows = picker_rows(picker, &counts);
+    Some((counts, rows))
+}
+
+/// `Ctrl+l`: the LABEL PICKER over the rows the filter leaves. With no
+/// labels among them there is nothing to pick, and the footer says so.
+fn open_label_picker(app: &mut App) {
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return;
+    };
+    let list = app
+        .issues
+        .get(&view.project)
+        .map_or(&[][..], |l| l.list.as_slice());
+    if label_counts(&view.query, list).is_empty() {
+        app.flash = Some("no labels on these issues".into());
+        return;
+    }
+    view.label_picker = Some(Box::default());
+}
+
+/// Add `label:<name>` to the list's filter — quoted when the name has a
+/// space — unless a term already asks for exactly that label, and land the
+/// cursor as any filter change does. A trailing space leaves the line
+/// ready for the next word. Shared by the picker's Enter and a click on a
+/// label in the reading pane.
+fn add_label_term(app: &mut App, label: &str) {
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return;
+    };
+    view.label_picker = None;
+    if IssueFilter::parse(&view.query).has_label(label) {
+        app.flash = Some(format!("already filtering by {label}"));
+        return;
+    }
+    let term = if label.contains(char::is_whitespace) {
+        format!("label:\"{label}\"")
+    } else {
+        format!("label:{label}")
+    };
+    let typed = view.query.as_str().trim_end();
+    let text = if typed.is_empty() {
+        format!("{term} ")
+    } else {
+        format!("{typed} {term} ")
+    };
+    view.query.set_text(text);
+    query_changed(app);
+}
+
+/// Keys while the LABEL PICKER is up: typing filters the labels, ↑/↓ (and
+/// Ctrl+n/p) walk them, Enter filters the list by the one under the
+/// cursor, Esc puts the reading pane back — clearing the picker's own
+/// filter first, as every fuzzy overlay's Esc does.
+fn handle_picker_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let Some((counts, rows)) = picker_state(app) else {
+        return;
+    };
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return;
+    };
+    let Some(picker) = view.label_picker.as_mut() else {
+        return;
+    };
+    let last = rows.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc if !picker.query.is_empty() => {
+            picker.query.clear();
+            picker.selected = 0;
+        }
+        KeyCode::Esc => view.label_picker = None,
+        KeyCode::Down => picker.selected = (picker.selected + 1).min(last),
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Char('n') if ctrl => picker.selected = (picker.selected + 1).min(last),
+        KeyCode::Char('p') if ctrl => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Enter => {
+            if let Some((index, _)) = rows.get(picker.selected) {
+                let label = counts[*index].0.clone();
+                add_label_term(app, &label);
+            }
+        }
+        _ => {
+            if picker.query.handle_key(&key).changed() {
+                picker.selected = 0;
+            }
+        }
+    }
+    app.dirty = true;
+}
+
+/// Which of `labels`, drawn as the reading pane's label row (`INDENT`,
+/// then the names joined by ` · `), sits under column `col` of the pane.
+/// None between names and past the last.
+fn label_at(labels: &[String], col: usize) -> Option<usize> {
+    let mut x = INDENT.chars().count();
+    for (i, label) in labels.iter().enumerate() {
+        let w = label.chars().count();
+        if (x..x + w).contains(&col) {
+            return Some(i);
+        }
+        x += w + LABEL_SEP.chars().count();
+    }
+    None
+}
+
+/// What separates the names on the reading pane's label row.
+const LABEL_SEP: &str = " · ";
+
+/// The label a click at `pos` lands on in the reading pane, if any: the
+/// label row is the pane's third line (headline, state, labels) and is
+/// never wrapped, so its columns are the names' own.
+fn clicked_label(app: &App, pos: Position) -> Option<String> {
+    let Some(Overlay::Issues(view)) = &app.overlay else {
+        return None;
+    };
+    let area = view.body_area;
+    if !area.contains(pos) {
+        return None;
+    }
+    let (issue, _) = selected_issue(app)?;
+    let line = (pos.y - area.y) as usize + view.scroll as usize;
+    if line != 2 || issue.labels.is_empty() {
+        return None;
+    }
+    let index = label_at(&issue.labels, (pos.x - area.x) as usize)?;
+    Some(issue.labels[index].clone())
+}
+
 // ---- keys and mouse ----
 
 /// Keys in the ISSUES MODAL. While the editor is up they are all its
@@ -2088,6 +2294,10 @@ pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if matches!(&app.overlay, Some(Overlay::Issues(v)) if v.editor.is_some()) {
         handle_editor_key(app, key);
+        return;
+    }
+    if matches!(&app.overlay, Some(Overlay::Issues(v)) if v.label_picker.is_some()) {
+        handle_picker_key(app, key);
         return;
     }
     let Some(Overlay::Issues(view)) = &mut app.overlay else {
@@ -2132,6 +2342,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         KeyCode::Char('c') | KeyCode::Char('y') if ctrl => open_comment_for_selected(app),
         KeyCode::Char('o') if ctrl => open_in_browser(app, out),
         KeyCode::Char('r') if ctrl => refresh(app),
+        KeyCode::Char('l') if ctrl => open_label_picker(app),
         // Everything else feeds the always-live fuzzy filter, which edits
         // like a terminal line (see text_input).
         _ => {
@@ -2171,6 +2382,17 @@ pub(crate) fn handle_mouse(
         app.dirty = true;
         return;
     }
+    if matches!(&app.overlay, Some(Overlay::Issues(v)) if v.label_picker.is_some()) {
+        handle_picker_mouse(app, mouse, mouse_pos);
+        return;
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        if let Some(label) = clicked_label(app, mouse_pos) {
+            add_label_term(app, &label);
+            app.dirty = true;
+            return;
+        }
+    }
     let Some(Overlay::Issues(view)) = &mut app.overlay else {
         return;
     };
@@ -2196,6 +2418,36 @@ pub(crate) fn handle_mouse(
             );
             if let Some(row) = crate::list_hit::row_at(list, first, visible.len(), mouse_pos) {
                 select(app, visible[row].0 as i64);
+            }
+        }
+        _ => {}
+    }
+    app.dirty = true;
+}
+
+/// Mouse while the LABEL PICKER is up: a click on a label filters by it,
+/// the wheel walks the labels, and anything else is swallowed — Esc is the
+/// way back, as from the editor.
+fn handle_picker_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position) {
+    let Some((counts, rows)) = picker_state(app) else {
+        return;
+    };
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return;
+    };
+    let Some(picker) = view.label_picker.as_mut() else {
+        return;
+    };
+    let last = rows.len().saturating_sub(1);
+    match mouse.kind {
+        MouseEventKind::ScrollDown => picker.selected = (picker.selected + 1).min(last),
+        MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(1),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let area = picker.list_area;
+            let first = window_start(picker.selected, area.height as usize);
+            if let Some(row) = crate::list_hit::row_at(area, first, rows.len(), mouse_pos) {
+                let label = counts[rows[row].0].0.clone();
+                add_label_term(app, &label);
             }
         }
         _ => {}
@@ -2254,13 +2506,18 @@ pub fn lines(
     }
     out.push(fit(meta, width));
     if !issue.labels.is_empty() {
-        out.push(fit(
-            vec![
-                Span::styled(INDENT.to_string(), dim),
-                Span::styled(issue.labels.join(" · "), Style::default().fg(th.warn)),
-            ],
-            width,
-        ));
+        // One span per name, so a click can tell them apart (`label_at`).
+        let mut spans = vec![Span::styled(INDENT.to_string(), dim)];
+        for (i, label) in issue.labels.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(
+                    LABEL_SEP.to_string(),
+                    Style::default().fg(th.warn),
+                ));
+            }
+            spans.push(Span::styled(label.clone(), Style::default().fg(th.warn)));
+        }
+        out.push(fit(spans, width));
     }
     out.push(Line::from(""));
 
@@ -2389,7 +2646,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     );
     let block = panel_block(&title, list_focused, th).title_bottom(
         Line::from(Span::styled(
-            " Enter: prompt  ⇧Tab: preset  ^e: edit  ^c: comment  ^o: browser  ^r: refresh ",
+            " Enter: prompt  ⇧Tab: preset  ^e: edit  ^c: comment  ^l: labels  ^o: browser  ^r: refresh ",
             Style::default().fg(th.dim),
         ))
         .left_aligned(),
@@ -2496,6 +2753,28 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         return;
     }
 
+    // ---- right: the label picker, while it is up ----
+    if let Some(picker) = &view.label_picker {
+        let counts = label_counts(&view.query, &rows);
+        let list_area = draw_label_picker(f, body_a, picker, &counts, th);
+        if let Some(Overlay::Issues(v)) = &mut app.overlay {
+            v.area = area;
+            v.list_area = rows_area;
+            v.cursor_row = cursor_row;
+            v.browser_area = Rect::default();
+            if let Some(index) = cursor {
+                v.selected = index;
+            }
+            if let Some(p) = &mut v.label_picker {
+                p.list_area = list_area;
+                p.selected = p
+                    .selected
+                    .min(picker_rows(p, &counts).len().saturating_sub(1));
+            }
+        }
+        return;
+    }
+
     // ---- right: the reading pane ----
     let current = cursor.and_then(|i| rows.get(i));
     // The frame names the number; the headline inside carries the title.
@@ -2560,6 +2839,59 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         }
         v.scroll = scroll;
     }
+}
+
+/// The LABEL PICKER in the reading pane's place: its own filter on the
+/// first row, then each label with how many of the listed issues carry
+/// it, the matched letters lit. Returns the rows' rect for clicks.
+fn draw_label_picker(
+    f: &mut Frame,
+    area: Rect,
+    picker: &LabelPicker,
+    counts: &[(String, usize)],
+    th: Theme,
+) -> Rect {
+    let rows = picker_rows(picker, counts);
+    let title = format!("Labels ({})", rows.len());
+    let block = panel_block(&title, true, th).title_bottom(
+        Line::from(Span::styled(
+            " Enter: filter by it  Esc: back ",
+            Style::default().fg(th.dim),
+        ))
+        .left_aligned(),
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if let Some(query_area) = row_rect(inner, 0) {
+        let line = search_line(&picker.query, "type to filter labels…", query_area, th);
+        f.render_widget(Paragraph::new(line), query_area);
+    }
+    let list_area = crate::ui::below_first_row(inner);
+    if rows.is_empty() {
+        empty_list_row(f, list_area, "no labels match", th);
+        return list_area;
+    }
+    let selected = picker.selected.min(rows.len() - 1);
+    let start = window_start(selected, list_area.height as usize);
+    let budget = (list_area.width as usize).saturating_sub(2);
+    for (row, (index, positions)) in rows.iter().enumerate().skip(start) {
+        let Some(row_area) = row_rect(list_area, row - start) else {
+            break;
+        };
+        let (name, count) = &counts[*index];
+        let count = count.to_string();
+        let name_budget = budget.saturating_sub(count.len() + 2);
+        let shown = truncate(name, name_budget);
+        let lit = visible_positions(positions, &shown, name);
+        let mut spans = fuzzy_highlight_styled(&shown, lit, Style::default(), th);
+        let used = shown.chars().count();
+        if used + count.len() < budget {
+            spans.push(Span::raw(" ".repeat(budget - used - count.len())));
+            spans.push(Span::styled(count, Style::default().fg(th.dim)));
+        }
+        render_row(f, row_area, spans, row == selected, true, th);
+    }
+    list_area
 }
 
 /// The reading pane as the form: the title on the first row, the
@@ -4618,5 +4950,214 @@ esac
             .map(|&p| list[*i].label().chars().nth(p).unwrap())
             .collect();
         assert_eq!(lit.to_lowercase(), "linux", "the text part is what lights");
+    }
+
+    fn labelled(n: u64, title: &str, labels: &[&str]) -> Issue {
+        Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, title)
+        }
+    }
+
+    fn labelled_rows() -> Vec<Issue> {
+        vec![
+            labelled(15, "Fix login redirect", &["bug", "browser-plugin"]),
+            labelled(14, "Docs pass", &["documentation"]),
+            labelled(13, "Login on Linux", &["bug", "plugin-sdk", "p1"]),
+            labelled(12, "Good first one", &["good first issue", "p1"]),
+        ]
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_key(
+                app,
+                key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+    }
+
+    fn picker(app: &App) -> Option<&LabelPicker> {
+        issues_view(app).label_picker.as_deref()
+    }
+
+    /// The picker counts the labels on the rows the filter leaves, the
+    /// most used first and then by name — so after one label the next
+    /// choice is among what is left.
+    #[test]
+    fn the_picker_counts_the_labels_on_the_listed_rows() {
+        let rows = labelled_rows();
+        let counts = label_counts("", &rows);
+        assert_eq!(
+            counts
+                .iter()
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect::<Vec<_>>(),
+            [
+                "bug 2",
+                "p1 2",
+                "browser-plugin 1",
+                "documentation 1",
+                "good first issue 1",
+                "plugin-sdk 1"
+            ]
+        );
+        let narrowed = label_counts("label:p1", &rows);
+        assert_eq!(
+            narrowed
+                .iter()
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect::<Vec<_>>(),
+            ["p1 2", "bug 1", "good first issue 1", "plugin-sdk 1"]
+        );
+    }
+
+    /// `Ctrl+l` opens the picker; typing narrows it, ↓ moves, Enter adds
+    /// the label to the list's filter and puts the reading pane back; a
+    /// second label is added after the first, and one already asked for
+    /// is not added twice.
+    #[test]
+    fn the_picker_adds_a_label_term_to_the_filter() {
+        let (mut app, _) = modal_with(labelled_rows());
+        let ctrl_l = key(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_l, &mut Vec::new());
+        assert!(picker(&app).is_some());
+        assert!(footer_hint(issues_view(&app)).starts_with("type to filter labels"));
+        typed(&mut app, "plug");
+        // browser-plugin and plugin-sdk match, best first; ↓ to the second.
+        let (counts, rows) = picker_state(&app).expect("the picker");
+        assert_eq!(rows.len(), 2);
+        let second = counts[rows[1].0].0.clone();
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert!(picker(&app).is_none(), "Enter puts the pane back");
+        let view = issues_view(&app);
+        assert_eq!(view.query.as_str(), format!("label:{second} "));
+        let expected = if second == "plugin-sdk" { 13 } else { 15 };
+        assert_eq!(
+            cursor_number(&app),
+            Some(expected),
+            "the cursor lands on a match"
+        );
+        // Start over from one known label for the rest.
+        if let Some(Overlay::Issues(view)) = &mut app.overlay {
+            view.query.set_text("label:plugin-sdk ");
+        }
+
+        handle_key(&mut app, ctrl_l, &mut Vec::new());
+        typed(&mut app, "p1");
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).query.as_str(),
+            "label:plugin-sdk label:p1 "
+        );
+
+        add_label_term(&mut app, "P1");
+        assert_eq!(
+            issues_view(&app).query.as_str(),
+            "label:plugin-sdk label:p1 "
+        );
+        assert!(app.flash.as_deref().is_some_and(|f| f.contains("already")));
+    }
+
+    /// Esc clears the picker's own filter first, then puts the pane back
+    /// with the list's filter untouched; a list with no labels opens no
+    /// picker at all.
+    #[test]
+    fn the_picker_steps_back_on_esc_and_needs_labels() {
+        let (mut app, _) = modal_with(labelled_rows());
+        typed(&mut app, "login");
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        typed(&mut app, "bu");
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc, &mut Vec::new());
+        assert_eq!(picker(&app).map(|p| p.query.as_str()), Some(""));
+        handle_key(&mut app, esc, &mut Vec::new());
+        assert!(picker(&app).is_none());
+        assert_eq!(issues_view(&app).query.as_str(), "login");
+
+        let (mut bare, _) = modal_with(vec![labelled(1, "No labels", &[])]);
+        handle_key(
+            &mut bare,
+            key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        );
+        assert!(picker(&bare).is_none());
+        assert_eq!(bare.flash.as_deref(), Some("no labels on these issues"));
+    }
+
+    /// A label with a space goes in quoted, after whatever was typed.
+    #[test]
+    fn a_label_with_a_space_is_quoted() {
+        let (mut app, _) = modal_with(labelled_rows());
+        typed(&mut app, "good");
+        add_label_term(&mut app, "good first issue");
+        assert_eq!(
+            issues_view(&app).query.as_str(),
+            "good label:\"good first issue\" "
+        );
+        assert_eq!(cursor_number(&app), Some(12));
+    }
+
+    /// The label row's columns: the indent, then each name with ` · `
+    /// between; the separators and the space past the last are no label.
+    #[test]
+    fn label_at_maps_columns_to_names() {
+        let labels: Vec<String> = vec!["bug".into(), "p1".into()];
+        let indent = INDENT.chars().count();
+        assert_eq!(label_at(&labels, indent), Some(0));
+        assert_eq!(label_at(&labels, indent + 2), Some(0));
+        assert_eq!(label_at(&labels, indent + 3), None, "the separator");
+        assert_eq!(label_at(&labels, indent + 6), Some(1));
+        assert_eq!(label_at(&labels, indent + 8), None, "past the last");
+        assert_eq!(label_at(&labels, 0), None, "the indent");
+    }
+
+    /// A click on a label in the reading pane filters by it, as the
+    /// picker's Enter does; a click elsewhere on the pane does not.
+    #[test]
+    fn clicking_a_label_in_the_pane_filters_by_it() {
+        let (mut app, _) = modal_with(labelled_rows());
+        if let Some(Overlay::Issues(view)) = &mut app.overlay {
+            view.body_area = Rect::new(40, 5, 50, 20);
+            view.scroll = 0;
+        }
+        let click = |x: u16, y: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let indent = INDENT.chars().count() as u16;
+        // Row 15's labels: "bug · browser-plugin"; the second starts 6 in.
+        let at = Position::new(40 + indent + 6, 7);
+        handle_mouse(&mut app, click(at.x, at.y), at, &mut Vec::new());
+        assert_eq!(issues_view(&app).query.as_str(), "label:browser-plugin ");
+
+        let headline = Position::new(40 + indent, 5);
+        handle_mouse(
+            &mut app,
+            click(headline.x, headline.y),
+            headline,
+            &mut Vec::new(),
+        );
+        assert_eq!(issues_view(&app).query.as_str(), "label:browser-plugin ");
     }
 }
