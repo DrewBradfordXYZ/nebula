@@ -515,7 +515,17 @@ carrying a matching label — part of the name is enough, any case, and every te
 a label with spaces. While the caret ends a `label:` word, LABEL COMPLETION hangs the labels that
 could finish it under the filter, with how many of the listed issues carry each — names that start
 with what you typed first. `Tab` (or `Enter`, or a click) finishes the word with the highlighted one,
-`↑`/`↓` choose, and `Esc` closes the suggestions before it clears anything. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
+`↑`/`↓` choose, and `Esc` closes the suggestions before it clears anything.
+
+While the listed issues carry labels, the LABEL BAR is the line under the filter: the filter's own
+`label:` terms first, as chips with how many issues they leave and a `×`, then the other labels on
+those issues, the most used first with their counts, as many as fit before `+N` names the rest. A
+label every listed issue carries narrows nothing and is left off. A click on a label adds it to the
+filter as a `label:` term and a click on a chip takes its term out — the same text typing writes,
+so the bar is also where the syntax shows itself; the counts follow the filter, so the next label
+narrows what the last one left. The cursor stays on the issue you are reading while it still
+matches. Each label underlines under the pointer, as the header's counts do. A repo whose issues
+carry no labels never sees the bar, and the rows keep their place. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
 matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` (or `Ctrl+y`) and `Ctrl+o` act on the issue you found. `Esc`
 clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every
 fuzzy overlay; a filter nothing matches says `no issues match` and leaves the cursor where it was for
