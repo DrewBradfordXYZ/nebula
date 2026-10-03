@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
@@ -46,9 +47,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Single writer task; everything else sends frames through this channel
     // so PTY forwards and RPC replies never interleave mid-frame.
     let (out_tx, mut out_rx) = mpsc::channel::<ServerEvent>(256);
+    // What the client said it speaks in `Hello`, read by the writer so each
+    // frame is one that client can decode (`ServerEvent::for_peer`).
+    let peer_protocol = Arc::new(AtomicU32::new(PROTOCOL_VERSION));
+    let writer_peer = peer_protocol.clone();
     let writer_task = tokio::spawn(async move {
         let mut w = BufWriter::new(write_half);
-        while let Some(ev) = out_rx.recv().await {
+        while let Some(mut ev) = out_rx.recv().await {
+            ev.for_peer(writer_peer.load(Ordering::Relaxed));
             if write_frame(&mut w, &ev).await.is_err() {
                 break;
             }
@@ -56,7 +62,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         let _ = w.shutdown().await;
     });
 
-    let mut client = ClientConnection::new(daemon, out_tx);
+    let mut client = ClientConnection::new(daemon, out_tx, peer_protocol);
     let result: Result<()> = async {
         while let Some(req) = read_frame::<ClientRequest, _>(&mut reader).await? {
             if !client.handle_request(req).await? {
@@ -79,13 +85,20 @@ struct ClientConnection {
     attached: HashMap<SessionRef, tokio::task::JoinHandle<()>>,
     subscription: Option<tokio::task::JoinHandle<()>>,
     handshaken: bool,
+    /// Shared with the connection's writer task: set from `Hello`.
+    peer_protocol: Arc<AtomicU32>,
 }
 
 impl ClientConnection {
-    fn new(daemon: Arc<Daemon>, out_tx: mpsc::Sender<ServerEvent>) -> Self {
+    fn new(
+        daemon: Arc<Daemon>,
+        out_tx: mpsc::Sender<ServerEvent>,
+        peer_protocol: Arc<AtomicU32>,
+    ) -> Self {
         Self {
             daemon,
             out_tx,
+            peer_protocol,
             attached: HashMap::new(),
             subscription: None,
             handshaken: false,
@@ -238,6 +251,8 @@ impl ClientConnection {
                 cloud_prompt,
                 starting_prompt,
                 issue_url,
+                issue_id,
+                issue_source,
                 role,
             } => {
                 self.handle_create_agent(
@@ -252,6 +267,8 @@ impl ClientConnection {
                     cloud_prompt,
                     starting_prompt,
                     issue_url,
+                    issue_id,
+                    issue_source,
                     role,
                 )
                 .await;
@@ -625,6 +642,8 @@ impl ClientConnection {
 
     async fn handle_hello(&mut self, protocol_version: u32) -> bool {
         self.handshaken = nebula_core::protocol_compatible_with(protocol_version);
+        self.peer_protocol
+            .store(protocol_version, Ordering::Relaxed);
         let reply = if self.handshaken {
             ServerEvent::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
@@ -804,14 +823,17 @@ impl ClientConnection {
         cloud_prompt: Option<String>,
         starting_prompt: Option<String>,
         issue_url: Option<String>,
+        issue_id: Option<String>,
+        issue_source: Option<String>,
         role: nebula_core::AgentRole,
     ) {
         // Logged by mode only — never the task, prompt text or issue URL.
-        let launch_mode = match (&cloud_prompt, &starting_prompt, &issue_url) {
+        let issue = issue_url.is_some() || issue_id.is_some();
+        let launch_mode = match (&cloud_prompt, &starting_prompt, issue) {
             (Some(_), _, _) => Some("cloud"),
-            (None, _, Some(_)) => Some("issue"),
-            (None, Some(_), None) => Some("preset"),
-            (None, None, None) => None,
+            (None, _, true) => Some("issue"),
+            (None, Some(_), false) => Some("preset"),
+            (None, None, false) => None,
         };
         let result = self
             .daemon
@@ -827,6 +849,8 @@ impl ClientConnection {
                 starting_prompt,
                 pr_url: None,
                 issue_url,
+                issue_id,
+                issue_source,
                 role,
             })
             .await;

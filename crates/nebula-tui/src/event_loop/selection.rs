@@ -1089,6 +1089,22 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
         placeholder::defer_launch(app, draft, out);
         return;
     }
+    // A daemon older than ISSUE_SOURCES_PROTOCOL can't decode a source
+    // issue's id; sent without it, the session would start with no issue
+    // at all. Say so rather than launch the wrong thing.
+    if draft.issue_id.is_some()
+        && app
+            .chrome
+            .daemon_protocol
+            .is_some_and(|v| v < nebula_core::ISSUE_SOURCES_PROTOCOL)
+    {
+        app.chrome.flash = Some(
+            "the running daemon predates issue sources — restart it (nebula reload) to launch this issue"
+                .into(),
+        );
+        app.chrome.dirty = true;
+        return;
+    }
     let AgentLaunchDraft {
         worktree,
         kind,
@@ -1101,6 +1117,8 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
         reopen_on_error,
         pr,
         issue_url,
+        issue_id,
+        issue_source,
         focus_pane,
         placeholder,
         follow,
@@ -1239,6 +1257,8 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
             cloud_prompt,
             starting_prompt,
             issue_url,
+            issue_id,
+            issue_source,
             role: nebula_core::AgentRole::Worker,
         },
     });

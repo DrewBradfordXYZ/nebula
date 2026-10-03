@@ -102,9 +102,16 @@ pub(crate) struct CreateAgentSpec {
     pub starting_prompt: Option<String>,
     pub pr_url: Option<String>,
     /// The GitHub issue an ISSUE SESSION was launched for (see
-    /// `pr_scope::issue_rule`). Persisted like `pr_url`.
+    /// `pr_scope::issue_rule`) — or, beside `issue_id`, the page of an
+    /// ISSUE SOURCE's issue. Persisted like `pr_url`.
     pub issue_url: Option<String>,
     pub role: nebula_core::AgentRole,
+    /// The issue's id when it comes from an ISSUE SOURCE beside GitHub.
+    /// Persisted like `issue_url`.
+    pub issue_id: Option<String>,
+    /// The ISSUE SOURCE program `issue_id` came from: one of the values of
+    /// the worktree's `nebula.issueSource`. Persisted with it.
+    pub issue_source: Option<String>,
 }
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
@@ -2378,6 +2385,8 @@ mod tests {
                 pr_url: None,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -2397,6 +2406,8 @@ mod tests {
                 pr_url: None,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -2416,6 +2427,8 @@ mod tests {
                 pr_url: None,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -2435,6 +2448,8 @@ mod tests {
                 pr_url: None,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -2457,6 +2472,8 @@ mod tests {
             pr_url: Some("https://github.com/o/r/pull/7".into()),
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -2622,6 +2639,8 @@ mod tests {
             pr_url: None,
             issue_url: Some("https://github.com/o/r/issues/15".into()),
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -2650,6 +2669,59 @@ mod tests {
         };
         let err = daemon.create_agent(not_an_issue).await.unwrap_err();
         assert!(err.to_string().contains("not an issue URL"), "{err}");
+
+        // An ISSUE SOURCE's issue is named by its id, with any page or none:
+        // both reach the worktree lookup, and a bad id never does.
+        for url in [
+            Some("https://linear.app/acme/issue/ENG-123/fix-login"),
+            None,
+        ] {
+            let from_source = CreateAgentSpec {
+                issue_url: url.map(String::from),
+                issue_id: Some("ENG-123".into()),
+                issue_source: Some("/opt/bin/linear-issues".into()),
+                ..spec(AgentKind::Claude, None)
+            };
+            let err = daemon.create_agent(from_source).await.unwrap_err();
+            assert!(
+                err.to_string().contains("worktree not found"),
+                "{url:?}: {err}"
+            );
+        }
+        let bad_id = CreateAgentSpec {
+            issue_url: None,
+            issue_id: Some("--help".into()),
+            issue_source: Some("/opt/bin/linear-issues".into()),
+            ..spec(AgentKind::Claude, None)
+        };
+        let err = daemon.create_agent(bad_id).await.unwrap_err();
+        assert!(err.to_string().contains("not an issue id"), "{err}");
+        // An id names its source, and a source comes with an id.
+        let no_source = CreateAgentSpec {
+            issue_url: None,
+            issue_id: Some("ENG-123".into()),
+            ..spec(AgentKind::Claude, None)
+        };
+        let err = daemon.create_agent(no_source).await.unwrap_err();
+        assert!(err.to_string().contains("needs the issue source"), "{err}");
+        let no_id = CreateAgentSpec {
+            issue_source: Some("/opt/bin/linear-issues".into()),
+            ..spec(AgentKind::Claude, None)
+        };
+        let err = daemon.create_agent(no_id).await.unwrap_err();
+        assert!(err.to_string().contains("needs the issue id"), "{err}");
+        let source_in_cloud = CreateAgentSpec {
+            starting_prompt: None,
+            issue_url: None,
+            issue_id: Some("ENG-123".into()),
+            issue_source: Some("/opt/bin/linear-issues".into()),
+            ..spec(AgentKind::Claude, Some("Fix auth"))
+        };
+        let err = daemon.create_agent(source_in_cloud).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not supported for Claude Cloud"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -2668,6 +2740,8 @@ mod tests {
             pr_url: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         };
         // Validation runs before the worktree lookup, so an unknown
         // worktree is fine here and every failure is the prompt's own.
@@ -2777,6 +2851,8 @@ mod tests {
             pr_url: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         };
 
         let created = |mut events: broadcast::Receiver<ServerEvent>| {
@@ -2922,6 +2998,7 @@ mod tests {
                 alive: false,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             })
             .unwrap();
@@ -3071,6 +3148,8 @@ mod tests {
                 pr_url: None,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap()
@@ -3212,6 +3291,8 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
+                issue_source: None,
                 role: nebula_core::AgentRole::Worker,
             })
             .await
@@ -3316,6 +3397,7 @@ mod tests {
                     alive: false,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 },
                 true,
@@ -4122,6 +4204,67 @@ mod tests {
 
         assert!(!wt.exists());
         assert!(drain_warnings(&mut events).is_empty());
+    }
+
+    /// The source a launch names is persisted and told to the agent on
+    /// every spawn, so it must be one the repository configures — any of
+    /// several — never whatever the client sent.
+    #[tokio::test]
+    async fn an_issue_source_must_be_one_the_repository_configures() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "nebula.issueSource",
+                "/opt/bin/git-bug-issues",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "nebula.issueSource",
+                "/opt/bin/linear-issues",
+            ],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        let spec = |source: &str| CreateAgentSpec {
+            worktree: WorktreeId("rt".into()),
+            name: "issue".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: true,
+            cloud_prompt: None,
+            starting_prompt: None,
+            pr_url: None,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+            issue_id: Some("ENG-123".into()),
+            issue_source: Some(source.into()),
+        };
+        let err = daemon.create_agent(spec("/tmp/evil")).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not one of this repository's issue sources"),
+            "{err}"
+        );
+        for configured in ["/opt/bin/git-bug-issues", "/opt/bin/linear-issues"] {
+            if let Err(err) = daemon.create_agent(spec(configured)).await {
+                assert!(
+                    !err.to_string().contains("issue sources"),
+                    "{configured}: {err}"
+                );
+            }
+        }
     }
 
     fn git_in(repo: &Path, args: &[&str]) {

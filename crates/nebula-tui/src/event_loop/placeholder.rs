@@ -216,6 +216,7 @@ pub(super) fn stage_agent(
         alive: false,
         issue_url: None,
         role: nebula_core::AgentRole::Worker,
+        source_issue: None,
         recent_prompts: Vec::new(),
     });
     if let Some(i) = project.and_then(|id| {
@@ -692,6 +693,7 @@ mod tests {
             alive: true,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            source_issue: None,
             recent_prompts: Vec::new(),
         }
     }

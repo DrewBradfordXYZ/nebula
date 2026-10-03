@@ -610,6 +610,7 @@ mod tests {
             cloud_session_id: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            source_issue: None,
             sort_order: 0,
             alive: false,
             recent_prompts: Vec::new(),

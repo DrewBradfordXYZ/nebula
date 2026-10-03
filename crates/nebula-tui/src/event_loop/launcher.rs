@@ -1018,9 +1018,15 @@ pub(super) fn open_issue(app: &mut App, out: &mut Vec<ClientRequest>) {
         app.chrome.flash = Some(NO_CARD_FOR_ISSUE.into());
         return;
     };
-    match agent.issue_url {
-        Some(url) => super::open_link(app, &url, out),
-        None => app.chrome.flash = Some(NO_ISSUE.into()),
+    let label = agent.issue_label();
+    match (agent.issue_url, label) {
+        (Some(url), _) => super::open_link(app, &url, out),
+        (None, Some(label)) => {
+            app.chrome.flash = Some(format!(
+                "issue {label} has no web page — i lists the project's issues"
+            ))
+        }
+        (None, None) => app.chrome.flash = Some(NO_ISSUE.into()),
     }
 }
 
@@ -1110,10 +1116,19 @@ pub(super) fn duplicate_agent(app: &mut App, id: AgentId) {
         app.chrome.flash = Some("quick prompt: worktree is still being created".into());
         return;
     }
-    let issue = agent
-        .issue_url
-        .as_deref()
-        .and_then(|url| issue_ref(app, &worktree.project_id, url));
+    let issue = match &agent.source_issue {
+        Some(issue) => source_issue_ref(
+            app,
+            &worktree.project_id,
+            &issue.source,
+            &issue.id,
+            agent.issue_url.as_deref(),
+        ),
+        None => agent
+            .issue_url
+            .as_deref()
+            .and_then(|url| issue_ref(app, &worktree.project_id, url)),
+    };
     let launch = QuickLaunch::of_kind(
         QuickTarget::Worktree(worktree.id),
         agent.kind,
@@ -1141,8 +1156,46 @@ fn issue_ref(app: &App, project: &ProjectId, url: &str) -> Option<crate::issues:
         .map(|i| i.title.clone())
         .unwrap_or_default();
     Some(crate::issues::IssueRef {
+        key: url.to_string(),
+        id: number.to_string(),
+        origin: crate::issues::Origin::GitHub,
+        source: String::new(),
         url: url.to_string(),
-        number,
+        title,
+    })
+}
+
+/// [`issue_ref`] for an issue from the project's ISSUE SOURCE: the id the
+/// row persisted, its page when it had one, and its title from the
+/// fetched list when it is in there.
+fn source_issue_ref(
+    app: &App,
+    project: &ProjectId,
+    source: &str,
+    id: &str,
+    url: Option<&str>,
+) -> Option<crate::issues::IssueRef> {
+    let dir = app
+        .tree
+        .projects
+        .iter()
+        .find(|p| &p.id == project)?
+        .repo_path
+        .clone();
+    let key = crate::issues::source_key(&dir, source, id);
+    let title = app
+        .github
+        .issues
+        .get(project)
+        .and_then(|issues| issues.list.iter().find(|i| i.key == key))
+        .map(|i| i.title.clone())
+        .unwrap_or_default();
+    Some(crate::issues::IssueRef {
+        key,
+        id: id.to_string(),
+        origin: crate::issues::Origin::Source,
+        source: source.to_string(),
+        url: url.unwrap_or_default().to_string(),
         title,
     })
 }
@@ -2666,8 +2719,8 @@ pub(super) fn click_box_field(app: &mut App, field: BoxField) {
 fn open_project_picker(app: &mut App, back: QuickReturn) {
     if let Some(issue) = &back.launch.issue {
         app.chrome.flash = Some(format!(
-            "this box is for issue #{} — its project is fixed",
-            issue.number
+            "this box is for issue {} — its project is fixed",
+            issue.tag()
         ));
         return;
     }
@@ -3130,6 +3183,7 @@ mod tests {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -3171,6 +3225,7 @@ mod tests {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -3224,6 +3279,7 @@ mod tests {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -8638,6 +8694,7 @@ mod tests {
                         alive: true,
                         issue_url: None,
                         role: nebula_core::AgentRole::Worker,
+                        source_issue: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -9657,8 +9714,11 @@ mod tests {
             assert_eq!(launch.model.as_deref(), Some("gpt-5"));
             assert_eq!(launch.effort.as_deref(), Some("high"));
             assert_eq!(
-                launch.issue.as_ref().map(|i| (i.url.as_str(), i.number)),
-                Some((ISSUE_15, 15))
+                launch
+                    .issue
+                    .as_ref()
+                    .map(|i| (i.url.as_str(), i.id.as_str())),
+                Some((ISSUE_15, "15"))
             );
             assert!(launch.preset.is_none());
             assert!(!launch.cloud);
