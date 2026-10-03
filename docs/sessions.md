@@ -569,7 +569,22 @@ leaves `Enter` and `↑`/`↓` to the rows. A `source:` term does for where an i
 does for its labels: `source:github` keeps GitHub's own issues and `source:git-bug` those from an
 ISSUE SOURCE whose program's file name contains `git-bug` — the name the reading pane gives it — and a
 `source:` word completes from the sources on the listed rows the same way. There is no negation:
-`-label:bug` is text like any other. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
+`-label:bug` is text like any other.
+
+While any issue in the list carries a label, the LABEL BAR is the line under the filter: the filter's
+own `label:` terms first, as chips with how many issues they leave and a `×`, then the other labels on
+the listed issues, the most used first with their counts, as many as fit before the MORE CHIP — `22
+more ▾`, as the project tabs have one — stands for the rest: a click on it opens the MORE LIST of just
+those labels (`↑`/`↓` choose, `Enter` or a click adds one, `Esc` or any other key closes it). A label
+every listed issue carries narrows nothing and is left off. A click on a label adds it to the filter as
+a `label:` term and a click on a chip takes its term out — the same text typing writes, so the bar is
+also where the syntax shows itself; the counts follow the filter, so the next label narrows what the
+last one left. However a term arrives — typed, completed or clicked — the cursor stays on the issue you
+are reading while the filter still lists it and no other text is typed, since a term narrows the list
+without ranking it. Each label underlines under the pointer, as the header's counts do. The line stays
+while the filter narrows, so the rows never jump, and LABEL COMPLETION leaves it blank while its
+suggestions are up. A repo whose issues carry no labels never sees the bar, and the rows keep their
+place. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
 matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` (or `Ctrl+y`) and `Ctrl+o` act on the issue you found. `Esc`
 clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every
 fuzzy overlay; a filter nothing matches says `no issues match` and leaves the cursor where it was for

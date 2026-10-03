@@ -473,6 +473,19 @@ pub struct IssuesView {
     /// Whether suggestions were up at the last draw, so the footer can
     /// name their keys.
     pub completing: bool,
+    /// The LABEL BAR's items as last drawn, for clicks and the pointer;
+    /// empty while the bar is not drawn.
+    pub bar: Vec<BarItem>,
+    /// The LABEL BAR's MORE CHIP (`22 more ▾`) as last drawn —
+    /// `Rect::default()` while every label fits — and the labels it stands
+    /// for, with their counts.
+    pub more_chip: Rect,
+    pub bar_hidden: Vec<(String, usize)>,
+    /// The MORE LIST, while open: which of the hidden labels is
+    /// highlighted. Its rows as last drawn, and the first one shown.
+    pub more: Option<usize>,
+    pub more_rows: Rect,
+    pub more_first: usize,
 }
 
 impl IssuesView {
@@ -495,6 +508,12 @@ impl IssuesView {
             suggestions_area: Rect::default(),
             suggestions_first: 0,
             completing: false,
+            bar: Vec::new(),
+            more_chip: Rect::default(),
+            bar_hidden: Vec::new(),
+            more: None,
+            more_rows: Rect::default(),
+            more_first: 0,
         }
     }
 
@@ -1941,9 +1960,11 @@ fn select(app: &mut App, index: i64) {
     let next = clamp_selection(index, len);
     if next != view.selected {
         view.selected = next;
-        view.list.move_to_item(next);
         view.scroll = 0;
     }
+    // Even onto the row it was on: a rebuilt filter may have moved the
+    // list's own cursor off it.
+    view.list.move_to_item(next);
     schedule_detail(app);
     app.chrome.dirty = true;
 }
@@ -1974,10 +1995,309 @@ fn step(app: &mut App, delta: i64) {
     }
 }
 
+// ---- the label bar ----
+
+/// One label on the LABEL BAR as last drawn: where it is, which label —
+/// for a chip, the term as typed — and whether it is one of the filter's
+/// own terms (a chip, whose click drops it) or one more to add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarItem {
+    pub area: Rect,
+    pub label: String,
+    pub active: bool,
+}
+
+/// Labels, or the filter's terms, each with how many listed issues carry it.
+type LabelCounts = Vec<(String, usize)>;
+
+/// What the LABEL BAR lists for `query` over `list`: the filter's own
+/// `label:` terms first, as typed, each with how many rows the filter
+/// leaves; then every other label on those rows, the most used first and
+/// then by name, leaving out one that every listed row carries — it would
+/// narrow nothing. Empty when there is nothing to show, and then the bar
+/// is not drawn.
+fn bar_labels(query: &str, list: &[Issue]) -> (LabelCounts, LabelCounts) {
+    let shown = filtered_rows(query, list);
+    let terms: Vec<String> = QueryTerms::parse(query, &[LABEL_KEY])
+        .values(LABEL_KEY)
+        .map(str::to_string)
+        .collect();
+    let chips: Vec<(String, usize)> = terms.iter().map(|t| (t.clone(), shown.len())).collect();
+    let mut others: Vec<(String, usize)> = Vec::new();
+    for i in &shown {
+        for label in &list[*i].labels {
+            match others.iter_mut().find(|(name, _)| name == label) {
+                Some((_, n)) => *n += 1,
+                None => others.push((label.clone(), 1)),
+            }
+        }
+    }
+    others.retain(|(name, n)| {
+        *n < shown.len() && !terms.iter().any(|t| t.eq_ignore_ascii_case(name))
+    });
+    others.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    (chips, others)
+}
+
+/// The query with `label` added as a `label:` term — quoted when the name
+/// has a space — after whatever is typed, and a space for the next word. A
+/// quote left open (`label:"good fi`) is closed first, or it would swallow
+/// the new term into its name.
+fn with_label_term(query: &str, label: &str) -> String {
+    let term = if label.contains(char::is_whitespace) {
+        format!("label:\"{label}\"")
+    } else {
+        format!("label:{label}")
+    };
+    let closed;
+    let query = if query.matches('"').count() % 2 == 1 {
+        closed = format!("{}\"", query.trim_end());
+        closed.as_str()
+    } else {
+        query
+    };
+    match query.trim_end() {
+        "" => format!("{term} "),
+        typed => format!("{typed} {term} "),
+    }
+}
+
+/// The query with its `label:` term for `label` taken out, the words on
+/// either side closing up.
+fn without_label_term(query: &str, label: &str) -> String {
+    let terms = QueryTerms::parse(query, &[LABEL_KEY]);
+    let Some(token) = terms
+        .terms
+        .iter()
+        .find(|t| t.key == LABEL_KEY && t.value.eq_ignore_ascii_case(label))
+    else {
+        return query.to_string();
+    };
+    let before = query[..token.span.start].trim_end();
+    let after = query[token.span.end..].trim_start();
+    match (before.is_empty(), after.is_empty()) {
+        (true, _) => after.to_string(),
+        (false, true) => format!("{before} "),
+        (false, false) => format!("{before} {after}"),
+    }
+}
+
+/// Set the filter to `text` from the LABEL BAR or its MORE LIST, the
+/// caret at its end: the same [`query_changed`] every typed letter and
+/// completed word goes through, so the cursor lands where the keys would
+/// have left it.
+fn set_filter_from_bar(app: &mut App, text: String) {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return;
+    };
+    view.list.query.set_text(text);
+    query_changed(app);
+}
+
+/// A click on the LABEL BAR: a label adds its term to the filter, a chip
+/// takes its own term out — the same text typing `label:…` writes, so the
+/// click and the keys end in the same state.
+fn click_bar_item(app: &mut App, item: &BarItem) {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+        return;
+    };
+    let text = if item.active {
+        without_label_term(&view.list.query, &item.label)
+    } else {
+        with_label_term(&view.list.query, &item.label)
+    };
+    set_filter_from_bar(app, text);
+}
+
+/// The LABEL BAR item under the pointer, for `event_loop::update_pointer`
+/// to underline as it does the header's counts: the modal keeps the bar's
+/// rects outside the hit map, as it does the browser button's.
+pub(crate) fn bar_item_under(app: &App, pos: Position) -> Option<HitTarget> {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+        return None;
+    };
+    if view.more_chip.contains(pos) {
+        return Some(HitTarget::IssueLabelsMore);
+    }
+    view.bar
+        .iter()
+        .find(|item| item.area.contains(pos))
+        .map(|item| HitTarget::IssueLabel(item.label.clone()))
+}
+
+/// What [`draw_label_bar`] drew: each label's place, and the MORE CHIP's
+/// with the labels it stands for.
+struct DrawnBar {
+    items: Vec<BarItem>,
+    more_chip: Option<Rect>,
+    hidden: LabelCounts,
+}
+
+/// Draw the LABEL BAR on `area`, one line: the chips, then the other labels
+/// joined by ` · `, as many as fit with room left for the MORE CHIP —
+/// `22 more ▾`, the project tabs' `2 more ▾` for labels — standing for
+/// the rest. `hover` is the label under the pointer, `more_hover` whether
+/// the pointer is on the chip; both underline.
+fn draw_label_bar(
+    f: &mut Frame,
+    area: Rect,
+    chips: &[(String, usize)],
+    others: &[(String, usize)],
+    hover: Option<&str>,
+    more_hover: bool,
+    th: Theme,
+) -> DrawnBar {
+    let width = area.width as usize;
+    let mut items = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let place = |spans: &mut Vec<Span<'static>>, used: &mut usize, text: String, style: Style| {
+        let w = text.width();
+        let rect = Rect {
+            x: area.x + *used as u16,
+            y: area.y,
+            width: w as u16,
+            height: 1,
+        };
+        spans.push(Span::styled(text, style));
+        *used += w;
+        rect
+    };
+    let underline = |label: &str, style: Style| {
+        if hover == Some(label) {
+            style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            style
+        }
+    };
+    // The focused title chip's colors: a term the filter already has.
+    let chip = Style::default().fg(th.on_accent).bg(th.accent);
+    for (term, count) in chips {
+        let text = format!(" {term} {count} × ");
+        if used + text.width() > width {
+            break;
+        }
+        let rect = place(&mut spans, &mut used, text, underline(term, chip));
+        items.push(BarItem {
+            area: rect,
+            label: term.clone(),
+            active: true,
+        });
+        place(&mut spans, &mut used, " ".into(), Style::default());
+    }
+    let label_style = Style::default().fg(th.warn);
+    let more_text = |n: usize| format!("{n} more ▾");
+    let mut more_chip = None;
+    let mut hidden = Vec::new();
+    for (i, (name, count)) in others.iter().enumerate() {
+        let sep = if i == 0 { "" } else { " · " };
+        let text = format!("{name} {count}");
+        let rest = others.len() - i - 1;
+        let tail = if rest > 0 {
+            3 + more_text(rest).width()
+        } else {
+            0
+        };
+        if used + sep.width() + text.width() + tail > width {
+            hidden = others[i..].to_vec();
+            place(
+                &mut spans,
+                &mut used,
+                sep.to_string(),
+                Style::default().fg(th.dim),
+            );
+            let style = Style::default().fg(th.muted);
+            let style = if more_hover {
+                style.add_modifier(Modifier::UNDERLINED)
+            } else {
+                style
+            };
+            let text = more_text(hidden.len());
+            if used + text.width() <= width {
+                more_chip = Some(place(&mut spans, &mut used, text, style));
+            }
+            break;
+        }
+        place(
+            &mut spans,
+            &mut used,
+            sep.to_string(),
+            Style::default().fg(th.dim),
+        );
+        let rect = place(&mut spans, &mut used, text, underline(name, label_style));
+        items.push(BarItem {
+            area: rect,
+            label: name.clone(),
+            active: false,
+        });
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    DrawnBar {
+        items,
+        more_chip,
+        hidden,
+    }
+}
+
+/// The MORE CHIP: open the MORE LIST of the labels the bar had no room
+/// for, or close it when it is open — the project tabs' `2 more ▾`.
+fn toggle_more(app: &mut App) {
+    if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
+        view.more = match view.more {
+            Some(_) => None,
+            None => (!view.bar_hidden.is_empty()).then_some(0),
+        };
+        app.chrome.dirty = true;
+    }
+}
+
+/// A pick from the MORE LIST: its label joins the filter as a bar click's
+/// does, and the list closes.
+fn pick_more(app: &mut App, index: usize) {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return;
+    };
+    view.more = None;
+    let Some((label, _)) = view.bar_hidden.get(index).cloned() else {
+        return;
+    };
+    let text = with_label_term(&view.list.query, &label);
+    set_filter_from_bar(app, text);
+}
+
+/// Keys while the MORE LIST is open: ↑/↓ (and Ctrl+n/p) choose, Enter
+/// picks, Esc closes it. Any other key closes it and goes on to the
+/// filter, so typing never stops working. True when the key was the
+/// list's.
+fn handle_more_key(app: &mut App, key: &KeyEvent) -> bool {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return false;
+    };
+    let Some(selected) = view.more else {
+        return false;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let last = view.bar_hidden.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Down => view.more = Some((selected + 1).min(last)),
+        KeyCode::Up => view.more = Some(selected.saturating_sub(1)),
+        KeyCode::Char('n') if ctrl => view.more = Some((selected + 1).min(last)),
+        KeyCode::Char('p') if ctrl => view.more = Some(selected.saturating_sub(1)),
+        KeyCode::Enter => pick_more(app, selected),
+        KeyCode::Esc => view.more = None,
+        _ => {
+            view.more = None;
+            return false;
+        }
+    }
+    app.chrome.dirty = true;
+    true
+}
+
 // ---- label completion ----
 
-/// The most suggestions shown at once; the rest scroll, the frame saying
-/// how many are out of sight.
+/// The most rows a label list (the suggestions, the MORE LIST) shows at
+/// once; the rest scroll, the frame saying how many are out of sight.
 const MAX_SUGGESTIONS: usize = 8;
 
 /// What LABEL COMPLETION offers for the word the caret ends: its key
@@ -2147,9 +2467,13 @@ fn handle_completion_key(app: &mut App, key: &KeyEvent) -> bool {
 /// The filter's text changed: the cursor goes to its best match — the
 /// pane rewinds onto it and its comments are asked for, as any move does
 /// — or stays where it is once nothing is typed, so the row just found
-/// keeps the cursor after Esc has cleared the letters that found it. A
-/// filter nothing matches moves nothing: the list says so, the pane has
-/// no row to read, and the next letter or Backspace decides.
+/// keeps the cursor after Esc has cleared the letters that found it. With
+/// only `label:`/`source:` terms typed it stays on its issue too, while
+/// the filter still lists it: a term narrows the list without ranking it,
+/// so there is no better row to move to — and that holds however the term
+/// arrived, typed, completed or clicked on the LABEL BAR. A filter nothing
+/// matches moves nothing: the list says so, the pane has no row to read,
+/// and the next letter or Backspace decides.
 fn query_changed(app: &mut App) {
     if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
         view.suggestion = 0;
@@ -2168,10 +2492,16 @@ fn query_changed(app: &mut App) {
     };
     rebuild_list(view_mut, &list);
     let view = view_mut;
-    let target = if has_query(view) {
-        view.list.matches.first().map(|m| m.item)
-    } else {
+    let ranked = !QueryTerms::parse(view.list.query.as_str(), FILTER_KEYS)
+        .text
+        .is_empty();
+    let stays = view.list.matches.iter().any(|m| m.item == view.selected);
+    let target = if !has_query(view) {
         cursor_index(view, &list)
+    } else if !ranked && stays {
+        Some(view.selected)
+    } else {
+        view.list.matches.first().map(|m| m.item)
     };
     match target {
         Some(index) => select(app, index as i64),
@@ -2353,6 +2683,8 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
             }
             Origin::Source => "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save  Esc: cancel edit",
         }
+    } else if view.more.is_some() {
+        "↑/↓ ^n/^p: label  Enter: filter by it  Esc: close the list"
     } else if view.completing {
         "Tab/Enter: complete the word  ↑/↓ ^n/^p: choose  Esc: close the suggestions"
     } else {
@@ -2473,6 +2805,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         handle_editor_key(app, key);
         return;
     }
+    if handle_more_key(app, &key) {
+        return;
+    }
     if handle_completion_key(app, &key) {
         return;
     }
@@ -2558,6 +2893,36 @@ pub(crate) fn handle_mouse(
         return;
     }
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        // The MORE CHIP and its list first: a click on the chip opens or
+        // closes the list, one on a row picks it, and one anywhere else
+        // closes the list and goes on as it would have.
+        let (on_chip, more_row) = match &app.modals.overlay {
+            Some(Overlay::Issues(v)) => (
+                v.more_chip.contains(mouse_pos),
+                (v.more.is_some() && v.more_rows.contains(mouse_pos))
+                    .then(|| v.more_first + (mouse_pos.y - v.more_rows.y) as usize),
+            ),
+            _ => (false, None),
+        };
+        if on_chip {
+            toggle_more(app);
+            return;
+        }
+        if let Some(row) = more_row {
+            pick_more(app, row);
+            return;
+        }
+        if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
+            v.more = None;
+        }
+        let on_bar = match &app.modals.overlay {
+            Some(Overlay::Issues(v)) => v.bar.iter().find(|i| i.area.contains(mouse_pos)).cloned(),
+            _ => None,
+        };
+        if let Some(item) = on_bar {
+            click_bar_item(app, &item);
+            return;
+        }
         let over = match &app.modals.overlay {
             Some(Overlay::Issues(v)) if v.suggestions_area.contains(mouse_pos) => {
                 Some((mouse_pos.y - v.suggestions_area.y) as usize)
@@ -2806,14 +3171,62 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         );
         f.render_widget(Paragraph::new(line), query_area);
     }
-    let mut rows_area = crate::ui::below_first_row(list_inner);
+    // LABEL COMPLETION, drawn over the rows further down: while it is up
+    // it is the label picker, and the bar under it stays blank.
+    let completion = if view.suggestions_closed || view.editor.is_some() {
+        None
+    } else {
+        term_completion(
+            &view.list.query,
+            view.list.query.cursor_chars(),
+            &view.list.items,
+        )
+    };
+    // The LABEL BAR on the line under the filter, while any issue in the
+    // list carries a label — whatever the filter leaves, so the rows don't
+    // jump a line as typing narrows them; the rows start under it.
+    let (chips, others) = bar_labels(&view.list.query, &rows);
+    let hover = match &app.launcher.hover_crumb {
+        Some(HitTarget::IssueLabel(label)) => Some(label.clone()),
+        _ => None,
+    };
+    let more_hover = app.launcher.hover_crumb == Some(HitTarget::IssueLabelsMore);
+    let labelled = rows.iter().any(|issue| !issue.labels.is_empty());
+    let (mut rows_area, bar, more_chip, hidden) = match row_rect(list_inner, 1) {
+        Some(bar_area) if labelled => {
+            let below = crate::ui::below_first_row(crate::ui::below_first_row(list_inner));
+            if completion.is_some() {
+                (below, Vec::new(), None, Vec::new())
+            } else {
+                let drawn = draw_label_bar(
+                    f,
+                    bar_area,
+                    &chips,
+                    &others,
+                    hover.as_deref(),
+                    more_hover,
+                    th,
+                );
+                (below, drawn.items, drawn.more_chip, drawn.hidden)
+            }
+        }
+        _ => (
+            crate::ui::below_first_row(list_inner),
+            Vec::new(),
+            None,
+            Vec::new(),
+        ),
+    };
+    if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
+        v.bar = bar;
+    }
     let missed = app
         .github
         .issue_sources_missed
         .get(&view.project)
         .cloned()
         .unwrap_or_default();
-    // Listed rows from a source that stopped answering — or a source whose
+    // Under the LABEL BAR (when there is one): listed rows from a source that stopped answering — or a source whose
     // rows are missing — say so on a row of their own under the filter, as
     // the PULL REQUESTS MODAL's stale list does: an ISSUE SOURCE whenever it
     // didn't answer, GitHub when its rows are the last answer that worked
@@ -2908,15 +3321,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     }
 
     // LABEL COMPLETION over the rows, under the word it would finish.
-    let completion = if view.suggestions_closed || view.editor.is_some() {
-        None
-    } else {
-        term_completion(
-            &view.list.query,
-            view.list.query.cursor_chars(),
-            &view.list.items,
-        )
-    };
     let (suggestions_area, suggestions_first) = match &completion {
         Some(completion) => draw_label_list(
             f,
@@ -2929,10 +3333,26 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         ),
         None => (Rect::default(), 0),
     };
+    // The MORE LIST under its chip, while it is open.
+    let (more_rows, more_first) = match (view.more, more_chip) {
+        (Some(selected), Some(chip)) if !hidden.is_empty() => {
+            draw_label_list(f, list_inner, chip.x, chip.y + 1, &hidden, selected, th)
+        }
+        _ => (Rect::default(), 0),
+    };
     if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
         v.suggestions_area = suggestions_area;
         v.suggestions_first = suggestions_first;
         v.completing = completion.is_some();
+        v.more_chip = more_chip.unwrap_or_default();
+        v.more_rows = more_rows;
+        v.more_first = more_first;
+        v.bar_hidden = hidden.clone();
+        // No chip drawn, no list: one left open would take ↑/↓ and Enter
+        // out of sight.
+        if more_chip.is_none() {
+            v.more = None;
+        }
     }
 
     // ---- right: the editor, while it is up ----
@@ -3023,12 +3443,13 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     }
 }
 
-/// A list of labels with their counts in a box hung over the rows (LABEL
-/// COMPLETION's suggestions): its left edge at `x` (pulled in to fit
-/// `bounds`), its top at `y`, at most [`MAX_SUGGESTIONS`] rows with the
-/// window following `selected` and the frame saying `↑ 3 more` /
-/// `↓ 5 more` for what is out of sight, as a long text box does. Returns
-/// the rows' rect and the index of the first row shown, for clicks.
+/// A list of labels with their counts in a box hung over the rows — LABEL
+/// COMPLETION's suggestions, or the LABEL BAR's MORE LIST: its left edge
+/// at `x` (pulled in to fit `bounds`), its top at `y`, at most
+/// [`MAX_SUGGESTIONS`] rows with the window following `selected` and the
+/// frame saying `↑ 3 more` / `↓ 5 more` for what is out of sight, as a
+/// long text box does. Returns the rows' rect and the index of the first
+/// row shown, for clicks.
 fn draw_label_list(
     f: &mut Frame,
     bounds: Rect,
@@ -5737,8 +6158,158 @@ esac
         );
     }
 
+    fn counted(v: &[(String, usize)]) -> Vec<String> {
+        v.iter().map(|(n, k)| format!("{n} {k}")).collect()
+    }
+
+    /// The bar lists the filter's own terms first, then the other labels on
+    /// the listed rows by use, leaving out one every listed row carries.
+    #[test]
+    fn the_bar_lists_terms_then_labels_that_would_narrow() {
+        let rows = tagged_rows();
+        let (chips, others) = bar_labels("", &rows);
+        assert!(chips.is_empty());
+        assert_eq!(
+            counted(&others),
+            [
+                "plan 3",
+                "bug 2",
+                "browser-plugin 1",
+                "documentation 1",
+                "good first issue 1",
+                "plugin-sdk 1"
+            ],
+            "the most used first, then by name"
+        );
+        // With bug on: its two rows both carry plan too, so plan narrows
+        // nothing and drops out; bug is a chip.
+        let (chips, others) = bar_labels("label:bug", &rows);
+        assert_eq!(counted(&chips), ["bug 2"]);
+        assert_eq!(counted(&others), ["browser-plugin 1", "plugin-sdk 1"]);
+        // No labels anywhere: nothing to draw.
+        let bare = vec![Issue {
+            labels: vec![],
+            ..issue(1, "Plain")
+        }];
+        let (chips, others) = bar_labels("", &bare);
+        assert!(chips.is_empty() && others.is_empty());
+    }
+
+    #[test]
+    fn terms_are_added_and_taken_out_of_the_typed_text() {
+        assert_eq!(with_label_term("", "bug"), "label:bug ");
+        assert_eq!(with_label_term("login  ", "bug"), "login label:bug ");
+        // A quote left open is closed, so the new term stands on its own.
+        let added = with_label_term("label:\"good fi", "bug");
+        assert_eq!(added, "label:\"good fi\" label:bug ");
+        let parsed = QueryTerms::parse(&added, FILTER_KEYS);
+        assert_eq!(
+            parsed.values(LABEL_KEY).collect::<Vec<_>>(),
+            ["good fi", "bug"]
+        );
+        assert_eq!(
+            with_label_term("x", "good first issue"),
+            "x label:\"good first issue\" "
+        );
+        assert_eq!(without_label_term("label:bug ", "bug"), "");
+        assert_eq!(without_label_term("login label:bug ", "BUG"), "login ");
+        assert_eq!(without_label_term("label:bug login", "bug"), "login");
+        assert_eq!(
+            without_label_term("a label:\"good first issue\" b", "good first issue"),
+            "a b"
+        );
+        assert_eq!(
+            without_label_term("login", "bug"),
+            "login",
+            "nothing to take"
+        );
+    }
+
+    /// A click on a label adds it and keeps the cursor on the issue being
+    /// read while it still matches; a click on a chip takes it back out.
+    #[test]
+    fn clicking_the_bar_adds_and_drops_terms() {
+        let (mut app, _) = modal_with(tagged_rows());
+        for _ in 0..2 {
+            handle_key(
+                &mut app,
+                key(KeyCode::Down, KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(cursor_number(&app), Some(13));
+        let item = |label: &str, active: bool| BarItem {
+            area: Rect::default(),
+            label: label.into(),
+            active,
+        };
+        click_bar_item(&mut app, &item("bug", false));
+        assert_eq!(issues_view(&app).list.query.as_str(), "label:bug ");
+        assert_eq!(cursor_number(&app), Some(13), "15 matches first, 13 stays");
+        click_bar_item(&mut app, &item("browser-plugin", false));
+        assert_eq!(cursor_number(&app), Some(15), "13 is filtered out");
+        click_bar_item(&mut app, &item("bug", true));
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            "label:browser-plugin "
+        );
+    }
+
+    /// Drawn: the bar sits on the line under the filter with the rows under
+    /// it, a click on a drawn label lands on that label, and a list with no
+    /// labels draws no bar and keeps its rows where they were.
+    #[test]
+    fn the_bar_is_drawn_under_the_filter_only_when_there_are_labels() {
+        let (mut app, _) = modal_with(tagged_rows());
+        let shot = screen(&mut app, 120, 30);
+        let line = shot
+            .lines()
+            .find(|l| l.contains("plan 3"))
+            .expect("the bar is drawn");
+        assert!(line.contains("bug 2 · "), "{line}");
+        let bar = issues_view(&app).bar.clone();
+        let plan = bar.iter().find(|i| i.label == "plan").expect("plan drawn");
+        let filter_y = shot
+            .lines()
+            .position(|l| l.contains("type to filter"))
+            .unwrap() as u16;
+        assert_eq!(plan.area.y, filter_y + 1, "the line under the filter");
+        assert_eq!(
+            issues_view(&app).list.list_area.y,
+            filter_y + 2,
+            "rows under the bar"
+        );
+        let at = Position::new(plan.area.x + 1, plan.area.y);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(issues_view(&app).list.query.as_str(), "label:plan ");
+        assert_eq!(
+            bar_item_under(&app, at),
+            Some(HitTarget::IssueLabel("plan".into()))
+        );
+
+        let bare = vec![Issue {
+            labels: vec![],
+            ..issue(1, "Plain")
+        }];
+        let (mut plain, _) = modal_with(bare);
+        let _ = screen(&mut plain, 120, 30);
+        assert!(issues_view(&plain).bar.is_empty());
+        let filter_y = screen(&mut plain, 120, 30)
+            .lines()
+            .position(|l| l.contains("type to filter"))
+            .unwrap() as u16;
+        assert_eq!(issues_view(&plain).list.list_area.y, filter_y + 1);
+    }
+
     /// Twelve issues, each with a label of its own and `common` on all but
-    /// the last: more labels than the suggestions show at once.
+    /// the last: more labels than the suggestions show at once, or than a
+    /// narrow modal's bar has room for.
     fn many_labels() -> Vec<Issue> {
         (1..=12)
             .map(|n| {
@@ -5815,5 +6386,187 @@ esac
             "the highlight (7) is among rows {first}..{}",
             first + rows
         );
+    }
+
+    /// The labels the bar has no room for stand behind `N more ▾`: a click
+    /// opens their list, Enter picks one into the filter, Esc closes it,
+    /// and a typed letter closes it and types.
+    #[test]
+    fn the_more_chip_lists_the_labels_the_bar_had_no_room_for() {
+        let (mut app, _) = modal_with(many_labels());
+        let shot = screen(&mut app, 100, 30);
+        let view = issues_view(&app);
+        let hidden = view.bar_hidden.len();
+        assert!(hidden > 0, "a narrow modal hides some: {shot}");
+        assert!(shot.contains(&format!("{hidden} more ▾")), "{shot}");
+        assert_eq!(
+            view.bar.len() + hidden,
+            13,
+            "every label is on the bar or behind the chip"
+        );
+        let chip = view.more_chip;
+        let at = Position::new(chip.x + 1, chip.y);
+        assert_eq!(bar_item_under(&app, at), Some(HitTarget::IssueLabelsMore));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(issues_view(&app).more, Some(0));
+        assert!(footer_hint(issues_view(&app)).contains("Enter: filter by it"));
+        let shot = screen(&mut app, 100, 30);
+        let first_hidden = issues_view(&app).bar_hidden[0].0.clone();
+        assert!(shot.contains(&first_hidden), "the list is drawn: {shot}");
+
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        let second = issues_view(&app).bar_hidden[1].0.clone();
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            format!("label:{second} ")
+        );
+        assert_eq!(issues_view(&app).more, None);
+
+        let (mut app, _) = modal_with(many_labels());
+        let _ = screen(&mut app, 100, 30);
+        toggle_more(&mut app);
+        handle_key(
+            &mut app,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(issues_view(&app).more, None);
+        assert!(
+            app.modals.overlay.is_some(),
+            "Esc closed the list, not the modal"
+        );
+        toggle_more(&mut app);
+        typed(&mut app, "x");
+        assert_eq!(issues_view(&app).more, None);
+        assert_eq!(issues_view(&app).list.query.as_str(), "x");
+    }
+
+    /// Labels are laid out by display width: a wide glyph (an emoji, as
+    /// GitHub labels often carry) takes two cells, and every label after
+    /// it is clicked where it is drawn.
+    #[test]
+    fn the_bar_measures_labels_in_cells() {
+        let tagged = |n: u64, labels: &[&str]| Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, "Plain")
+        };
+        let (mut app, _) = modal_with(vec![
+            tagged(3, &["🐛 bug", "docs"]),
+            tagged(2, &["🐛 bug"]),
+            tagged(1, &[]),
+        ]);
+        let _ = screen(&mut app, 120, 30);
+        let bar = issues_view(&app).bar.clone();
+        let (bug, docs) = (&bar[0], &bar[1]);
+        assert_eq!(bug.label, "🐛 bug");
+        assert_eq!(bug.area.width as usize, "🐛 bug 2".width());
+        assert_eq!(bug.area.width, 8, "the emoji is two cells, not one char");
+        assert_eq!(docs.area.x, bug.area.right() + 3, "after ` · `");
+    }
+
+    /// The bar's line stays while any issue carries a label, so the rows
+    /// don't jump as the filter narrows to issues whose labels are all
+    /// shared; while LABEL COMPLETION is up the line is left blank, the
+    /// suggestions being the label picker, and no MORE LIST outlives its
+    /// chip.
+    #[test]
+    fn the_bar_keeps_its_line_and_steps_aside_for_completion() {
+        let (mut app, _) = modal_with(tagged_rows());
+        let _ = screen(&mut app, 120, 30);
+        let rows_y = issues_view(&app).list.list_area.y;
+        typed(&mut app, "docs");
+        let shot = screen(&mut app, 120, 30);
+        assert_eq!(issues_view(&app).list.matches.len(), 1, "{shot}");
+        assert_eq!(issues_view(&app).list.list_area.y, rows_y, "no jump");
+
+        let (mut app, _) = modal_with(many_labels());
+        let _ = screen(&mut app, 100, 30);
+        toggle_more(&mut app);
+        assert!(issues_view(&app).more.is_some());
+        typed(&mut app, "label:");
+        if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
+            view.more = Some(0);
+        }
+        let shot = screen(&mut app, 100, 30);
+        let view = issues_view(&app);
+        assert!(view.bar.is_empty(), "no bar under the suggestions");
+        assert_eq!(view.more_chip, Rect::default());
+        assert_eq!(view.more, None, "no chip, no list");
+        assert!(!shot.contains("more ▾"), "{shot}");
+    }
+
+    /// INPUT PARITY: a label clicked on the bar and the same term typed
+    /// leave the same filter and the same cursor — the issue being read
+    /// while it still matches, the first match once it doesn't.
+    #[test]
+    fn a_clicked_label_and_a_typed_one_land_alike() {
+        // No title has an `l`, so the letters of `label` match nothing on
+        // their way and move nothing, as the click moves nothing.
+        let tagged = |n: u64, title: &str, labels: &[&str]| Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, title)
+        };
+        let rows = vec![
+            tagged(15, "Fix crash on start", &["bug", "ui"]),
+            tagged(14, "Docs pass", &["docs"]),
+            tagged(13, "Crash on Windows", &["bug"]),
+        ];
+        for (label, expect) in [("bug", 13), ("ui", 15)] {
+            let digest = |app: &App| {
+                let v = issues_view(app);
+                (
+                    v.list.query.as_str().to_string(),
+                    cursor_number(app),
+                    v.scroll,
+                )
+            };
+            let start = || {
+                let (mut app, _) = modal_with(rows.clone());
+                for _ in 0..2 {
+                    handle_key(
+                        &mut app,
+                        key(KeyCode::Down, KeyModifiers::NONE),
+                        &mut Vec::new(),
+                    );
+                }
+                assert_eq!(cursor_number(&app), Some(13));
+                app
+            };
+            let mut by_keys = start();
+            typed(&mut by_keys, &format!("label:{label} "));
+            let mut by_mouse = start();
+            let _ = screen(&mut by_mouse, 120, 30);
+            let item = issues_view(&by_mouse)
+                .bar
+                .iter()
+                .find(|i| i.label == label)
+                .cloned()
+                .expect("drawn");
+            let at = Position::new(item.area.x + 1, item.area.y);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: at.x,
+                row: at.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(&mut by_mouse, click, at, &mut Vec::new());
+            assert_eq!(digest(&by_keys), digest(&by_mouse), "{label}");
+            assert_eq!(cursor_number(&by_mouse), Some(expect), "{label}");
+        }
     }
 }
