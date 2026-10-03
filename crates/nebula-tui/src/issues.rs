@@ -436,8 +436,9 @@ pub struct IssuesView {
     /// it; `Rect::default()` — no point inside — while there is none.
     pub browser_area: Rect,
     /// The list's live filter: the rows narrow to the fuzzy matches of
-    /// `#15 title`, best first ([`visible_rows`]), as every letter lands.
-    /// Empty shows every row in the list's order.
+    /// `#15 title`, best first ([`visible_rows`]), as every letter lands,
+    /// and to the issues carrying every `label:` term typed
+    /// ([`IssueFilter`]). Empty shows every row in the list's order.
     pub query: TextInput,
     /// Where the cursor sat among the visible rows as of the last draw:
     /// the follow-window's anchor, and what a click's row math counts
@@ -1064,8 +1065,77 @@ fn has_query(view: &IssuesView) -> bool {
 /// call rather than kept — a repo's open issues are a screenful — so it
 /// can never go stale against the list.
 fn visible_rows(query: &str, list: &[Issue]) -> Vec<(usize, Vec<usize>)> {
-    let labels: Vec<String> = list.iter().map(|issue| issue.label()).collect();
-    crate::fuzzy::rank(query, labels.iter().map(String::as_str))
+    let filter = IssueFilter::parse(query);
+    let texts: Vec<String> = list.iter().map(|issue| issue.label()).collect();
+    crate::fuzzy::rank(&filter.text, texts.iter().map(String::as_str))
+        .into_iter()
+        .filter(|(i, _)| filter.keeps(&list[*i]))
+        .collect()
+}
+
+/// What the typed filter asks for: `label:` terms, each of which a row
+/// must carry, and the rest of the text, fuzzy-matched against `#15
+/// title` as before. `label:bug p1 login` keeps the issues labelled with
+/// something containing `bug` whose number or title matches `p1 login`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IssueFilter {
+    /// Lowercased; a row's label matches when it contains the term, so
+    /// `label:plugin` finds `browser-plugin` and `plugin-sdk` alike.
+    labels: Vec<String>,
+    text: String,
+}
+
+impl IssueFilter {
+    /// Split the typed query. `label:` takes the word after it, or a quoted
+    /// phrase for a label with spaces (`label:"good first issue"`; the
+    /// closing quote may still be untyped). A bare `label:` — the moment
+    /// before its word is typed — filters nothing, so the list doesn't
+    /// blink empty mid-word. The key is case-insensitive.
+    fn parse(query: &str) -> Self {
+        const KEY: &str = "label:";
+        let mut filter = IssueFilter::default();
+        let mut text: Vec<&str> = Vec::new();
+        let mut rest = query.trim_start();
+        while !rest.is_empty() {
+            let is_label = rest
+                .get(..KEY.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(KEY));
+            let (term, after) = if is_label {
+                let value = &rest[KEY.len()..];
+                match value.strip_prefix('"') {
+                    Some(quoted) => match quoted.find('"') {
+                        Some(end) => (&quoted[..end], &quoted[end + 1..]),
+                        None => (quoted, ""),
+                    },
+                    None => {
+                        let end = value.find(char::is_whitespace).unwrap_or(value.len());
+                        (&value[..end], &value[end..])
+                    }
+                }
+            } else {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                text.push(&rest[..end]);
+                ("", &rest[end..])
+            };
+            let term = term.trim();
+            if is_label && !term.is_empty() {
+                filter.labels.push(term.to_lowercase());
+            }
+            rest = after.trim_start();
+        }
+        filter.text = text.join(" ");
+        filter
+    }
+
+    /// Whether `issue` carries a label for every term.
+    fn keeps(&self, issue: &Issue) -> bool {
+        self.labels.iter().all(|term| {
+            issue
+                .labels
+                .iter()
+                .any(|label| label.to_lowercase().contains(term.as_str()))
+        })
+    }
 }
 
 /// The row under the cursor, as an index into `list`: `selected` while
@@ -2328,7 +2398,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     f.render_widget(block, list_a);
     // The always-live filter on the list's first line, the rows under it.
     if let Some(query_area) = row_rect(list_inner, 0) {
-        let line = search_line(&view.query, "type to filter…", query_area, th);
+        let line = search_line(&view.query, "type to filter… label:name", query_area, th);
         f.render_widget(Paragraph::new(line), query_area);
     }
     let rows_area = crate::ui::below_first_row(list_inner);
@@ -3792,7 +3862,7 @@ mod tests {
         assert_eq!(cursor_number(&app), Some(second));
         let shot = screen(&mut app, 120, 40);
         assert!(shot.contains("(3)"), "{shot}");
-        assert!(shot.contains("type to filter…"), "{shot}");
+        assert!(shot.contains("type to filter… label:name"), "{shot}");
         handle_key(
             &mut app,
             key(KeyCode::Esc, KeyModifiers::NONE),
@@ -4478,5 +4548,75 @@ esac
         let editor = view.editor.as_ref().expect("editing");
         assert_eq!(editor.original.body, "The real one.");
         assert_eq!(editor.source, SOURCE);
+    }
+
+    #[test]
+    fn the_filter_splits_label_terms_from_text() {
+        let parse = IssueFilter::parse;
+        assert_eq!(parse(""), IssueFilter::default());
+        assert_eq!(
+            parse("login label:bug redirect"),
+            IssueFilter {
+                labels: vec!["bug".into()],
+                text: "login redirect".into(),
+            }
+        );
+        assert_eq!(
+            parse("LABEL:UI label:\"good first issue\" crash"),
+            IssueFilter {
+                labels: vec!["ui".into(), "good first issue".into()],
+                text: "crash".into(),
+            }
+        );
+        // Mid-typing: a bare key filters nothing, an open quote takes the
+        // rest of the line.
+        assert_eq!(parse("label:"), IssueFilter::default());
+        assert_eq!(
+            parse("label:\"good fir"),
+            IssueFilter {
+                labels: vec!["good fir".into()],
+                text: String::new(),
+            }
+        );
+        // Only a leading `label:` is a term.
+        assert_eq!(parse("relabel:x").labels, Vec::<String>::new());
+    }
+
+    /// `label:` keeps the rows carrying a matching label — part of a label
+    /// is enough, and every term must match — and the rest of the text
+    /// still ranks and lights `#15 title` as before.
+    #[test]
+    fn label_terms_narrow_the_rows() {
+        let tagged = |n: u64, title: &str, labels: &[&str]| Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, title)
+        };
+        let list = vec![
+            tagged(15, "Fix login redirect", &["bug", "browser-plugin"]),
+            tagged(14, "Docs pass", &["documentation"]),
+            tagged(13, "Login on Linux", &["bug", "plugin-sdk", "p1"]),
+            tagged(12, "Good first one", &["good first issue"]),
+        ];
+        let numbers = |query: &str| -> Vec<u64> {
+            visible_rows(query, &list)
+                .iter()
+                .map(|(i, _)| list[*i].id.parse::<u64>().unwrap())
+                .collect()
+        };
+        assert_eq!(numbers("label:bug"), [15, 13], "list order, nothing ranked");
+        assert_eq!(numbers("label:plugin"), [15, 13], "part of a label");
+        assert_eq!(numbers("label:bug label:p1"), [13], "every term");
+        assert_eq!(numbers("label:\"good first\""), [12]);
+        assert_eq!(numbers("label:nothing"), Vec::<u64>::new());
+        assert_eq!(numbers("label:"), [15, 14, 13, 12]);
+        let rows = visible_rows("label:bug linux", &list);
+        assert_eq!(rows.len(), 1);
+        let (i, positions) = &rows[0];
+        assert_eq!(list[*i].id, "13");
+        let lit: String = positions
+            .iter()
+            .map(|&p| list[*i].label().chars().nth(p).unwrap())
+            .collect();
+        assert_eq!(lit.to_lowercase(), "linux", "the text part is what lights");
     }
 }
