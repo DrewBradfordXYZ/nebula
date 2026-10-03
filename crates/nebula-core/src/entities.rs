@@ -232,6 +232,13 @@ pub struct Agent {
     /// issue in the browser.
     #[serde(default)]
     pub issue_url: Option<String>,
+    /// The issue's id in the project's ISSUE SOURCE (`ENG-123`, `e6c61bf`)
+    /// when the session was started from one other than GitHub — None for
+    /// a GitHub issue, whose number rides `issue_url`, and for every other
+    /// row. A source's issue may have no web page, so `issue_url` can be
+    /// None while this is set.
+    #[serde(default)]
+    pub issue_id: Option<String>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
@@ -257,6 +264,16 @@ impl Agent {
     /// path) — None for every other row.
     pub fn issue_number(&self) -> Option<u64> {
         url_number_after(self.issue_url.as_deref()?, "/issues/")
+    }
+
+    /// How the card names the issue this ISSUE SESSION was started from:
+    /// `#15` for a GitHub issue, the source's own id (`ENG-123`) for any
+    /// other ISSUE SOURCE's — None for every other row.
+    pub fn issue_label(&self) -> Option<String> {
+        match &self.issue_id {
+            Some(id) => Some(id.clone()),
+            None => self.issue_number().map(|n| format!("#{n}")),
+        }
     }
 }
 

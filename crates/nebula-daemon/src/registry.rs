@@ -93,8 +93,12 @@ pub(crate) struct CreateAgentSpec {
     pub starting_prompt: Option<String>,
     pub pr_url: Option<String>,
     /// The GitHub issue an ISSUE SESSION was launched for (see
-    /// `pr_scope::issue_rule`). Persisted like `pr_url`.
+    /// `pr_scope::issue_rule`) — or, beside `issue_id`, the page of an
+    /// ISSUE SOURCE's issue. Persisted like `pr_url`.
     pub issue_url: Option<String>,
+    /// The issue's id when it comes from an ISSUE SOURCE other than
+    /// GitHub. Persisted like `issue_url`.
+    pub issue_id: Option<String>,
 }
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
@@ -1000,6 +1004,7 @@ impl Daemon {
             starting_prompt,
             pr_url,
             issue_url,
+            issue_id,
         } = spec;
         let cloud_prompt = match cloud_prompt {
             Some(_) if kind != AgentKind::Claude => {
@@ -1025,9 +1030,21 @@ impl Daemon {
             Some(url) => Some(crate::pr_scope::validate_pr_url(&url)?),
             None => None,
         };
+        let issue_id = match issue_id {
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("issue launch context is not supported for Claude Cloud")
+            }
+            Some(id) => Some(crate::pr_scope::validate_issue_id(&id)?),
+            None => None,
+        };
         let issue_url = match issue_url {
             Some(_) if cloud_prompt.is_some() => {
                 bail!("issue launch context is not supported for Claude Cloud")
+            }
+            // An ISSUE SOURCE's issue may live at any page; only a GitHub
+            // issue, named by its URL alone, must be one.
+            Some(url) if issue_id.is_some() => {
+                Some(crate::pr_scope::validate_source_issue_url(&url)?)
             }
             Some(url) => Some(crate::pr_scope::validate_issue_url(&url)?),
             None => None,
@@ -1046,7 +1063,7 @@ impl Daemon {
         let optimistic_run = Self::launch_submits_first_prompt(
             &harness,
             starting_prompt.as_deref(),
-            pr_url.is_some() || issue_url.is_some(),
+            pr_url.is_some() || issue_url.is_some() || issue_id.is_some(),
         ) && cloud_prompt.is_none();
         let worktree = self
             .store
@@ -1060,6 +1077,7 @@ impl Daemon {
         let adopted = (cloud_prompt.is_none()
             && pr_url.is_none()
             && issue_url.is_none()
+            && issue_id.is_none()
             && starting_prompt.is_none())
         .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
         .flatten();
@@ -1103,6 +1121,7 @@ impl Daemon {
             status_changed_at: nebula_core::clock::now_ms(),
             alive: false,
             issue_url: issue_url.clone(),
+            issue_id,
             recent_prompts: Vec::new(),
         };
         self.store.insert_agent_with_launch_context(
@@ -1274,6 +1293,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
         self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
@@ -2436,13 +2456,14 @@ impl Daemon {
         // prompt (see `pr_scope`). Rebuilt from the row's *current*
         // worktree on every spawn, so a relocated session is told where it
         // now works.
-        let (pr_url, issue_url) = if cloud_task.is_none() {
+        let (pr_url, issue_url, issue_id) = if cloud_task.is_none() {
             (
                 self.store.agent_pr_url(&agent.id)?,
                 self.store.agent_issue_url(&agent.id)?,
+                self.store.agent_issue_id(&agent.id)?,
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         let root = match &pr_url {
             Some(_) if !worktree.is_main => self
@@ -2457,8 +2478,22 @@ impl Daemon {
             branch: &worktree.branch,
             root: root.as_deref(),
         });
-        let issue_scope = issue_url.as_deref().map(|url| crate::pr_scope::IssueScope {
-            url,
+        // An ISSUE SOURCE's program is read fresh, as nebula reads it to
+        // list: the rule tells the agent to read the issue through it.
+        let issue_program = issue_id
+            .as_ref()
+            .and_then(|_| issue_source_program(&worktree.path));
+        let issue = match (&issue_id, &issue_url) {
+            (Some(id), url) => Some(crate::pr_scope::IssueOf::Source {
+                id,
+                url: url.as_deref(),
+                program: issue_program.as_deref(),
+            }),
+            (None, Some(url)) => Some(crate::pr_scope::IssueOf::GitHub(url)),
+            (None, None) => None,
+        };
+        let issue_scope = issue.map(|issue| crate::pr_scope::IssueScope {
+            issue,
             worktree: &worktree.path,
             branch: &worktree.branch,
         });
@@ -3322,6 +3357,23 @@ fn shell_has_children(session: &PtySession) -> bool {
 /// scheme-less value gets https://. Anything else — another scheme, or no
 /// host at all — is refused rather than stored: the TUI hands these to
 /// `open(1)`, and only http(s) may ever reach it.
+/// The ISSUE SOURCE program `dir`'s repository names in git config
+/// (`nebula.issueSource`), or None when it names none. Blocking, like the
+/// rest of a spawn's preparation (the managed hooks it writes, the PTY it
+/// forks): one `git config` read, only for an ISSUE SESSION's spawn.
+fn issue_source_program(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", "nebula.issueSource"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !value.is_empty()).then_some(value)
+}
+
 pub(crate) fn normalize_url(url: &str) -> Result<String> {
     let url = url.trim();
     if url.is_empty() {
@@ -4844,6 +4896,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
             })
             .await
             .unwrap_err();
@@ -4862,6 +4915,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
             })
             .await
             .unwrap_err();
@@ -4880,6 +4934,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
             })
             .await
             .unwrap_err();
@@ -4898,6 +4953,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
             })
             .await
             .unwrap_err();
@@ -4919,6 +4975,7 @@ mod tests {
             starting_prompt: None,
             pr_url: Some("https://github.com/o/r/pull/7".into()),
             issue_url: None,
+            issue_id: None,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -5083,6 +5140,7 @@ mod tests {
             starting_prompt: Some("Fix it".into()),
             pr_url: None,
             issue_url: Some("https://github.com/o/r/issues/15".into()),
+            issue_id: None,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -5110,6 +5168,42 @@ mod tests {
         };
         let err = daemon.create_agent(not_an_issue).await.unwrap_err();
         assert!(err.to_string().contains("not an issue URL"), "{err}");
+
+        // An ISSUE SOURCE's issue is named by its id, with any page or none:
+        // both reach the worktree lookup, and a bad id never does.
+        for url in [
+            Some("https://linear.app/acme/issue/ENG-123/fix-login"),
+            None,
+        ] {
+            let from_source = CreateAgentSpec {
+                issue_url: url.map(String::from),
+                issue_id: Some("ENG-123".into()),
+                ..spec(AgentKind::Claude, None)
+            };
+            let err = daemon.create_agent(from_source).await.unwrap_err();
+            assert!(
+                err.to_string().contains("worktree not found"),
+                "{url:?}: {err}"
+            );
+        }
+        let bad_id = CreateAgentSpec {
+            issue_url: None,
+            issue_id: Some("--help".into()),
+            ..spec(AgentKind::Claude, None)
+        };
+        let err = daemon.create_agent(bad_id).await.unwrap_err();
+        assert!(err.to_string().contains("not an issue id"), "{err}");
+        let source_in_cloud = CreateAgentSpec {
+            starting_prompt: None,
+            issue_url: None,
+            issue_id: Some("ENG-123".into()),
+            ..spec(AgentKind::Claude, Some("Fix auth"))
+        };
+        let err = daemon.create_agent(source_in_cloud).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not supported for Claude Cloud"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -5127,6 +5221,7 @@ mod tests {
             starting_prompt: starting.map(String::from),
             pr_url: None,
             issue_url: None,
+            issue_id: None,
         };
         // Validation runs before the worktree lookup, so an unknown
         // worktree is fine here and every failure is the prompt's own.
@@ -5235,6 +5330,7 @@ mod tests {
             starting_prompt: task.map(String::from),
             pr_url: None,
             issue_url: None,
+            issue_id: None,
         };
 
         let created = |mut events: broadcast::Receiver<ServerEvent>| {
@@ -5365,6 +5461,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                issue_id: None,
                 recent_prompts: Vec::new(),
             })
             .unwrap();
@@ -5498,6 +5595,7 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
             })
             .await
             .unwrap()
@@ -5644,6 +5742,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    issue_id: None,
                     recent_prompts: Vec::new(),
                 },
                 true,
@@ -6279,6 +6378,27 @@ mod tests {
 
         assert!(!wt.exists());
         assert!(drain_warnings(&mut events).is_empty());
+    }
+
+    /// An ISSUE SESSION's spawn reads the ISSUE SOURCE program the way the
+    /// TUI does — the repo's git config, a worktree seeing its main
+    /// checkout's — and finds none where none is set.
+    #[test]
+    fn issue_source_program_reads_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        assert_eq!(issue_source_program(&repo), None);
+        git_in(
+            &repo,
+            &["config", "nebula.issueSource", "/opt/my tools/issues"],
+        );
+        assert_eq!(
+            issue_source_program(&repo).as_deref(),
+            Some("/opt/my tools/issues")
+        );
+        assert_eq!(issue_source_program(&dir.path().join("gone")), None);
     }
 
     fn git_in(repo: &Path, args: &[&str]) {

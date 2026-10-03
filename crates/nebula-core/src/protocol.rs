@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -127,6 +127,13 @@ pub enum ClientRequest {
         /// since a spare booted bare never got it.
         #[serde(default)]
         issue_url: Option<String>,
+        /// The issue's id when it comes from an ISSUE SOURCE other than
+        /// GitHub (`git config nebula.issueSource`): the session is an
+        /// ISSUE SESSION for it, with or without an `issue_url` (a source's
+        /// issue may have no web page). None for a GitHub issue, which
+        /// `issue_url` alone names.
+        #[serde(default)]
+        issue_id: Option<String>,
     },
     /// Create a local AGENT of any kind from an OPEN PRS row — a PR
     /// SESSION. It never runs in the ROOT WORKTREE: the daemon finds the

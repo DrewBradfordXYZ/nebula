@@ -510,6 +510,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
         store

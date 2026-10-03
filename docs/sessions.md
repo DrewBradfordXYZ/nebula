@@ -492,7 +492,8 @@ the word `archived`: the header says it once, for all of them.
 ## The ISSUES MODAL and ISSUE SESSIONS
 
 `i` lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,
-pull requests left out — down the left of a modal, and reads the one under the cursor on the right:
+pull requests left out, or the project's own tracker's when its repository names an ISSUE SOURCE
+(see [Configuration](configuration.md#issue-sources)) — down the left of a modal, and reads the one under the cursor on the right:
 number and title, who opened it and when, its labels, the description rendered as markdown (a newline
 is a line break, as GitHub shows a comment), and,
 once the cursor has rested on the row for a moment, its comments (`gh issue view`, one call per issue
