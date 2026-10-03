@@ -239,14 +239,25 @@ pub fn rank_where<T>(
 /// login` is one `label` term (`bug`) and the text `login`. A value is the
 /// word after the colon, or a quoted phrase for one with spaces
 /// (`label:"good first issue"`; the closing quote may still be untyped).
-/// Keys are case-insensitive and values are kept lowercased. A bare `key:`
-/// — the moment before its value is typed — is dropped rather than read
-/// as text, so the list doesn't blink empty mid-word. A word that merely
-/// contains a key (`relabel:x`) stays text.
+/// Keys are case-insensitive; values keep the case typed, and a modal
+/// compares them as it likes. A bare `key:` — the moment before its value
+/// is typed — is dropped rather than read as text, so the list doesn't
+/// blink empty mid-word. A word that merely contains a key (`relabel:x`)
+/// stays text.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct QueryTerms {
-    pub terms: Vec<(&'static str, String)>,
+    pub terms: Vec<QueryTerm>,
     pub text: String,
+}
+
+/// One `key:value` term of a [`QueryTerms`], with where it sits in the
+/// query — key, value and any quotes — so a modal can take it back out or
+/// replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryTerm {
+    pub key: &'static str,
+    pub value: String,
+    pub span: std::ops::Range<usize>,
 }
 
 impl QueryTerms {
@@ -255,6 +266,7 @@ impl QueryTerms {
         let mut text: Vec<&str> = Vec::new();
         let mut rest = query.trim_start();
         while !rest.is_empty() {
+            let start = query.len() - rest.len();
             let key = keys.iter().copied().find(|key| {
                 rest.get(..key.len())
                     .is_some_and(|head| head.eq_ignore_ascii_case(key))
@@ -275,7 +287,11 @@ impl QueryTerms {
                     };
                     let term = term.trim();
                     if !term.is_empty() {
-                        out.terms.push((key, term.to_lowercase()));
+                        out.terms.push(QueryTerm {
+                            key,
+                            value: term.to_string(),
+                            span: start..query.len() - after.len(),
+                        });
                     }
                     after
                 }
@@ -291,12 +307,12 @@ impl QueryTerms {
         out
     }
 
-    /// The values typed for `key`, in order.
+    /// The values typed for `key`, in order, as typed.
     pub fn values<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.terms
             .iter()
-            .filter(move |(k, _)| *k == key)
-            .map(|(_, v)| v.as_str())
+            .filter(move |term| term.key == key)
+            .map(|term| term.value.as_str())
     }
 }
 
@@ -317,32 +333,34 @@ mod tests {
         QueryTerms::parse(query, &["label"])
     }
 
+    fn split(query: &str) -> (Vec<(&'static str, String)>, String) {
+        let parsed = terms(query);
+        (
+            parsed.terms.into_iter().map(|t| (t.key, t.value)).collect(),
+            parsed.text,
+        )
+    }
+
     #[test]
     fn known_keys_split_from_the_text() {
         assert_eq!(terms(""), QueryTerms::default());
         assert_eq!(
-            terms("login label:bug redirect"),
-            QueryTerms {
-                terms: vec![("label", "bug".into())],
-                text: "login redirect".into(),
-            }
+            split("login label:bug redirect"),
+            (vec![("label", "bug".into())], "login redirect".into())
         );
         assert_eq!(
-            terms("LABEL:UI label:\"good first issue\" crash"),
-            QueryTerms {
-                terms: vec![("label", "ui".into()), ("label", "good first issue".into())],
-                text: "crash".into(),
-            }
+            split("LABEL:UI label:\"good first issue\" crash"),
+            (
+                vec![("label", "UI".into()), ("label", "good first issue".into())],
+                "crash".into()
+            )
         );
         // Mid-typing: a bare key filters nothing, an open quote takes the
         // rest of the line.
         assert_eq!(terms("label:"), QueryTerms::default());
         assert_eq!(
-            terms("label:\"good fir"),
-            QueryTerms {
-                terms: vec![("label", "good fir".into())],
-                text: String::new(),
-            }
+            split("label:\"good fir"),
+            (vec![("label", "good fir".into())], String::new())
         );
         // Only a leading key is a term, and an unknown key is text.
         assert!(terms("relabel:x").terms.is_empty());
@@ -353,5 +371,19 @@ mod tests {
             terms("label:a label:b").values("label").collect::<Vec<_>>(),
             ["a", "b"]
         );
+    }
+
+    /// Each term knows where it sits, quotes included, so a modal can
+    /// take it back out.
+    #[test]
+    fn terms_carry_their_place_in_the_query() {
+        let query = "  login label:\"good first\" x label:bug";
+        let parsed = terms(query);
+        assert_eq!(&query[parsed.terms[0].span.clone()], "label:\"good first\"");
+        assert_eq!(parsed.terms[0].span, 8..26);
+        assert_eq!(&query[parsed.terms[1].span.clone()], "label:bug");
+        assert_eq!(parsed.text, "login x");
+        let open = "a label:\"good fi";
+        assert_eq!(terms(open).terms[0].span, 2..open.len());
     }
 }
