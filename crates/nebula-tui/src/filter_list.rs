@@ -153,6 +153,26 @@ impl<T> FilterList<T> {
         self.apply_filter_by(labels, |i| i);
     }
 
+    /// [`apply_filter`](Self::apply_filter) for a list whose query may also
+    /// carry `key:value` terms ([`QueryTerms`]) naming the `keys` given: the
+    /// terms are lifted out and handed to `keeps`, which drops the rows they
+    /// rule out, and only the text left over ranks and lights `label`.
+    pub fn apply_filter_where(
+        &mut self,
+        keys: &[&'static str],
+        label: impl Fn(&T) -> String,
+        keeps: impl Fn(&T, &QueryTerms) -> bool,
+    ) {
+        let terms = QueryTerms::parse(self.query.as_str(), keys);
+        let labels: Vec<String> = self.items.iter().map(label).collect();
+        let matches = crate::fuzzy::rank(&terms.text, labels.iter().map(String::as_str))
+            .into_iter()
+            .filter(|(item, _)| keeps(&self.items[*item], &terms))
+            .map(|(item, positions)| FilterMatch { item, positions })
+            .collect();
+        self.replace_matches(matches);
+    }
+
     /// Apply the common modal keys: two-stage Esc, Up/Down, Ctrl+n/p and
     /// text input. PageUp/PageDown are included because the branch switcher
     /// and long file lists have always treated them as larger cursor moves.
@@ -199,6 +219,72 @@ impl<T> FilterList<T> {
     }
 }
 
+/// A modal query split into the `key:value` terms that modal knows and the
+/// free text left for fuzzy ranking: with keys `["label"]`, `label:bug
+/// login` is one `label` term (`bug`) and the text `login`. A value is the
+/// word after the colon, or a quoted phrase for one with spaces
+/// (`label:"good first issue"`; the closing quote may still be untyped).
+/// Keys are case-insensitive and values are kept lowercased. A bare `key:`
+/// — the moment before its value is typed — is dropped rather than read
+/// as text, so the list doesn't blink empty mid-word. A word that merely
+/// contains a key (`relabel:x`) stays text.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct QueryTerms {
+    pub terms: Vec<(&'static str, String)>,
+    pub text: String,
+}
+
+impl QueryTerms {
+    pub fn parse(query: &str, keys: &[&'static str]) -> Self {
+        let mut out = QueryTerms::default();
+        let mut text: Vec<&str> = Vec::new();
+        let mut rest = query.trim_start();
+        while !rest.is_empty() {
+            let key = keys.iter().copied().find(|key| {
+                rest.get(..key.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(key))
+                    && rest[key.len()..].starts_with(':')
+            });
+            let after = match key {
+                Some(key) => {
+                    let value = &rest[key.len() + 1..];
+                    let (term, after) = match value.strip_prefix('"') {
+                        Some(quoted) => match quoted.find('"') {
+                            Some(end) => (&quoted[..end], &quoted[end + 1..]),
+                            None => (quoted, ""),
+                        },
+                        None => {
+                            let end = value.find(char::is_whitespace).unwrap_or(value.len());
+                            (&value[..end], &value[end..])
+                        }
+                    };
+                    let term = term.trim();
+                    if !term.is_empty() {
+                        out.terms.push((key, term.to_lowercase()));
+                    }
+                    after
+                }
+                None => {
+                    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    text.push(&rest[..end]);
+                    &rest[end..]
+                }
+            };
+            rest = after.trim_start();
+        }
+        out.text = text.join(" ");
+        out
+    }
+
+    /// The values typed for `key`, in order.
+    pub fn values<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.terms
+            .iter()
+            .filter(move |(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 pub fn clamp_selection(index: i64, len: usize) -> usize {
     let max = len.saturating_sub(1) as i64;
     index.clamp(0, max) as usize
@@ -206,4 +292,51 @@ pub fn clamp_selection(index: i64, len: usize) -> usize {
 
 pub fn window_start(selected: usize, height: usize) -> usize {
     (selected + 1).saturating_sub(height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terms(query: &str) -> QueryTerms {
+        QueryTerms::parse(query, &["label"])
+    }
+
+    #[test]
+    fn known_keys_split_from_the_text() {
+        assert_eq!(terms(""), QueryTerms::default());
+        assert_eq!(
+            terms("login label:bug redirect"),
+            QueryTerms {
+                terms: vec![("label", "bug".into())],
+                text: "login redirect".into(),
+            }
+        );
+        assert_eq!(
+            terms("LABEL:UI label:\"good first issue\" crash"),
+            QueryTerms {
+                terms: vec![("label", "ui".into()), ("label", "good first issue".into())],
+                text: "crash".into(),
+            }
+        );
+        // Mid-typing: a bare key filters nothing, an open quote takes the
+        // rest of the line.
+        assert_eq!(terms("label:"), QueryTerms::default());
+        assert_eq!(
+            terms("label:\"good fir"),
+            QueryTerms {
+                terms: vec![("label", "good fir".into())],
+                text: String::new(),
+            }
+        );
+        // Only a leading key is a term, and an unknown key is text.
+        assert!(terms("relabel:x").terms.is_empty());
+        assert_eq!(terms("author:me").text, "author:me");
+        // A multi-byte character where the colon would sit is plain text.
+        assert_eq!(terms("labelé").text, "labelé");
+        assert_eq!(
+            terms("label:a label:b").values("label").collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
 }
