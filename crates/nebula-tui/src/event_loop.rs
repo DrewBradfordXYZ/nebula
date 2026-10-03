@@ -6447,6 +6447,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.animations = cfg.animations;
     app.black_background = cfg.black_background;
     app.card_issue_number = cfg.card_issue_number;
+    app.always_show_jump_labels = cfg.always_show_jump_labels;
     app.show_all_worktrees = cfg.show_all_worktrees;
     app.hide_card_marks = cfg.hide_card_marks;
     app.highlight_current_card = cfg.highlight_current_card;

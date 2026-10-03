@@ -10468,4 +10468,58 @@ mod tests {
             assert!(app.term_locked);
         });
     }
+
+    /// ALWAYS SHOW JUMP LABELS: the labels sit on the grid with no mode
+    /// up, and they are the very labels `'` then uses, so a label read off
+    /// the grid lands where it says. A modal over the grid hides them.
+    #[test]
+    fn always_shown_labels_are_the_ones_jump_mode_uses() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            let a1 = crate::jump::JumpTarget::Card(SessionRef::Agent(AgentId("a1".into())));
+            let label = app
+                .jump_labels
+                .held
+                .iter()
+                .find(|(_, t)| *t == a1)
+                .map(|(l, _)| l.clone())
+                .expect("agent-1 holds a label");
+            let corner = |app: &mut App| {
+                let term = draw(app);
+                let bands = crate::launcher::bands(app);
+                let rect = app
+                    .hits
+                    .iter()
+                    .find_map(|(r, h)| match h {
+                        HitTarget::LauncherCard(at) => crate::launcher::card_at(&bands, *at)
+                            .filter(|c| c.sref() == SessionRef::Agent(AgentId("a1".into())))
+                            .map(|_| *r),
+                        _ => None,
+                    })
+                    .expect("agent-1's card was drawn");
+                term.backend().buffer()[(rect.x + 1, rect.y)]
+                    .symbol()
+                    .to_string()
+            };
+            assert_ne!(corner(&mut app), label[..1], "off: no label on the grid");
+
+            app.always_show_jump_labels = true;
+            assert_eq!(
+                corner(&mut app),
+                label[..1],
+                "on: the label sits on the card"
+            );
+
+            key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+            assert!(app.overlay.is_some(), "help is up");
+            assert_ne!(corner(&mut app), label[..1], "a modal hides them");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            assert_eq!(label_of(&app, &a1), label, "jump mode uses the same label");
+            type_label(&mut app, &label);
+            assert_eq!(selected(&app).as_deref(), Some("a1"));
+        });
+    }
 }

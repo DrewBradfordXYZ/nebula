@@ -4,11 +4,15 @@
 //! flash.nvim, EasyMotion and Vimium's link hints do. Any card on screen is
 //! two or three keys away, however far the cursor would have to walk.
 //!
-//! The labels are worked out once, when the mode opens, off what the last
-//! frame drew (`App::hits`), and held by identity — the session, the
-//! checkout, the project — never by place: a card that moves while the labels are up
-//! (a status change resorting the band) keeps its label, and the label is
-//! drawn wherever the card is now.
+//! The labels are kept from frame to frame ([`JumpLabels`], settled off
+//! what each frame drew, `App::hits`) and held by identity — the session,
+//! the checkout, the project — never by place: a target keeps its label for
+//! as long as it stays on screen, a card that moves (a status change
+//! resorting the band) takes its label with it, and a target that arrives
+//! gets a free one. So the label `'` shows is the label it showed last
+//! time, and with **Always show jump labels** on the labels sit on the grid
+//! all the time — a person driving nebula by voice reads a label and says
+//! it, with no key to bring the labels up first.
 //!
 //! This module is the model and the drawing; the keys are
 //! `event_loop::jump`'s.
@@ -75,43 +79,104 @@ pub fn labels(n: usize) -> Vec<String> {
         .collect()
 }
 
-impl JumpView {
-    /// The labels for what the last frame drew, top to bottom and left to
-    /// right. None when there is nothing to land on.
-    pub fn from_screen(app: &App) -> Option<Self> {
-        let bands = crate::launcher::bands(app);
-        let mut targets: Vec<(Rect, JumpTarget)> = Vec::new();
-        for (rect, hit) in &app.hits {
-            let target = match hit {
-                HitTarget::LauncherCard(at) => {
-                    let Some(card) = crate::launcher::card_at(&bands, *at) else {
-                        continue;
-                    };
-                    JumpTarget::Card(card.sref())
-                }
-                HitTarget::LauncherBand(index) => match bands.get(*index) {
-                    Some(band) => JumpTarget::Band(band.worktree.clone()),
-                    None => continue,
-                },
-                HitTarget::LauncherTab(id) => JumpTarget::Tab(id.clone()),
-                _ => continue,
-            };
-            // A target registered twice (a card cut by the pane's edge)
-            // gets one label.
-            if !targets.iter().any(|(_, t)| *t == target) {
-                targets.push((*rect, target));
-            }
+/// The label every target on screen holds, kept across frames.
+#[derive(Debug, Clone, Default)]
+pub struct JumpLabels {
+    /// In screen order, top to bottom and left to right.
+    pub held: Vec<(String, JumpTarget)>,
+}
+
+impl JumpLabels {
+    /// Settle the labels against `on_screen` (screen order): a target still
+    /// there keeps its label, one gone frees it, one new takes the first
+    /// free label. All labels are one letter while 26 cover the screen and
+    /// two letters past that — never a mix, so no label starts another —
+    /// and crossing between the two relabels everything once.
+    pub fn settle(&mut self, on_screen: Vec<JumpTarget>) {
+        let width = if on_screen.len() <= ALPHABET.len() {
+            1
+        } else {
+            2
+        };
+        if self
+            .held
+            .first()
+            .is_some_and(|(label, _)| label.len() != width)
+        {
+            self.held.clear();
         }
-        if targets.is_empty() {
+        let pool = labels(if width == 1 {
+            ALPHABET.len()
+        } else {
+            ALPHABET.len().pow(2)
+        });
+        let kept: Vec<(String, JumpTarget)> = std::mem::take(&mut self.held)
+            .into_iter()
+            .filter(|(_, target)| on_screen.contains(target))
+            .collect();
+        let mut free = pool
+            .into_iter()
+            .filter(|label| !kept.iter().any(|(held, _)| held == label));
+        self.held = on_screen
+            .into_iter()
+            .filter_map(|target| {
+                match kept.iter().find(|(_, held)| *held == target) {
+                    Some((label, _)) => Some(label.clone()),
+                    None => free.next(),
+                }
+                .map(|label| (label, target))
+            })
+            .collect();
+    }
+}
+
+/// What the frame just drawn put on the grid to land on, in screen order:
+/// every card, band rule and project tab, each once.
+pub fn on_screen(app: &App) -> Vec<JumpTarget> {
+    let bands = crate::launcher::bands(app);
+    let mut targets: Vec<(Rect, JumpTarget)> = Vec::new();
+    for (rect, hit) in &app.hits {
+        let target = match hit {
+            HitTarget::LauncherCard(at) => {
+                let Some(card) = crate::launcher::card_at(&bands, *at) else {
+                    continue;
+                };
+                JumpTarget::Card(card.sref())
+            }
+            HitTarget::LauncherBand(index) => match bands.get(*index) {
+                Some(band) => JumpTarget::Band(band.worktree.clone()),
+                None => continue,
+            },
+            HitTarget::LauncherTab(id) => JumpTarget::Tab(id.clone()),
+            _ => continue,
+        };
+        // A target registered twice (a card cut by the pane's edge) is
+        // one target.
+        if !targets.iter().any(|(_, t)| *t == target) {
+            targets.push((*rect, target));
+        }
+    }
+    targets.sort_by_key(|(rect, _)| (rect.y, rect.x));
+    targets.into_iter().map(|(_, target)| target).collect()
+}
+
+/// Settle the app's labels against the frame just drawn. The draw runs it
+/// after the grid, every frame, whether the labels are showing or not, so
+/// they are the same ones whenever `'` brings them up.
+pub fn settle(app: &mut App) {
+    let targets = on_screen(app);
+    app.jump_labels.settle(targets);
+}
+
+impl JumpView {
+    /// The labels the last frame settled. None when there is nothing to
+    /// land on.
+    pub fn from_screen(app: &App) -> Option<Self> {
+        if app.jump_labels.held.is_empty() {
             return None;
         }
-        targets.sort_by_key(|(rect, _)| (rect.y, rect.x));
-        let labels = labels(targets.len())
-            .into_iter()
-            .zip(targets.into_iter().map(|(_, target)| target))
-            .collect();
         Some(Self {
-            labels,
+            labels: app.jump_labels.held.clone(),
             typed: String::new(),
         })
     }
@@ -148,21 +213,30 @@ fn rect_of(app: &App, bands: &[crate::launcher::Band], target: &JumpTarget) -> O
     })
 }
 
-/// The labels over the frame just drawn: each on its target's top-left
-/// corner, the part already typed dimmed, and the labels it ruled out
-/// gone.
+/// JUMP MODE's labels over the frame just drawn: the part already typed
+/// dimmed, and the labels it ruled out gone.
 pub fn draw(f: &mut Frame, app: &App, view: &JumpView) {
+    draw_labels(f, app, &view.labels, &view.typed);
+}
+
+/// **Always show jump labels**: every label on the grid, with no mode up.
+pub fn draw_always(f: &mut Frame, app: &App) {
+    draw_labels(f, app, &app.jump_labels.held, "");
+}
+
+/// `labels` starting with `typed`, each on its target's top-left corner.
+fn draw_labels(f: &mut Frame, app: &App, labels: &[(String, JumpTarget)], typed: &str) {
     let th = app.theme;
     let bands = crate::launcher::bands(app);
     let screen = f.area();
-    let typed = Style::default().fg(th.dim).bg(th.accent);
+    let done_style = Style::default().fg(th.dim).bg(th.accent);
     let rest = Style::default()
         .fg(th.on_accent)
         .bg(th.accent)
         .add_modifier(Modifier::BOLD);
     let buf = f.buffer_mut();
-    for (label, target) in &view.labels {
-        if !label.starts_with(&view.typed) {
+    for (label, target) in labels {
+        if !label.starts_with(typed) {
             continue;
         }
         let Some(rect) = rect_of(app, &bands, target) else {
@@ -177,9 +251,9 @@ pub fn draw(f: &mut Frame, app: &App, view: &JumpView) {
         if x >= screen.right() || rect.y >= screen.bottom() {
             continue;
         }
-        let (done, todo) = label.split_at(view.typed.len());
+        let (done, todo) = label.split_at(typed.len());
         let room = usize::from(screen.right() - x);
-        buf.set_stringn(x, rect.y, done, room, typed);
+        buf.set_stringn(x, rect.y, done, room, done_style);
         let x = x.saturating_add(done.len() as u16);
         if x < screen.right() {
             buf.set_stringn(x, rect.y, todo, usize::from(screen.right() - x), rest);
@@ -244,5 +318,46 @@ mod tests {
         let mut stray = view(30);
         assert_eq!(stray.type_char('a'), Typed::Pending);
         assert_eq!(stray.type_char('1'), Typed::Missed);
+    }
+
+    fn tab(n: usize) -> JumpTarget {
+        JumpTarget::Tab(ProjectId(format!("p{n}")))
+    }
+
+    fn held(l: &JumpLabels) -> Vec<(&str, JumpTarget)> {
+        l.held
+            .iter()
+            .map(|(s, t)| (s.as_str(), t.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_target_keeps_its_label_while_it_stays_on_screen() {
+        let mut l = JumpLabels::default();
+        l.settle(vec![tab(0), tab(1), tab(2)]);
+        assert_eq!(held(&l), [("a", tab(0)), ("s", tab(1)), ("d", tab(2))]);
+
+        // p0 leaves, p3 arrives above the rest: the others keep theirs,
+        // p3 takes the first free label, and the order is the screen's.
+        l.settle(vec![tab(3), tab(1), tab(2)]);
+        assert_eq!(held(&l), [("a", tab(3)), ("s", tab(1)), ("d", tab(2))]);
+
+        // A reshuffle moves nobody's label.
+        l.settle(vec![tab(2), tab(3), tab(1)]);
+        assert_eq!(held(&l), [("d", tab(2)), ("a", tab(3)), ("s", tab(1))]);
+    }
+
+    #[test]
+    fn past_26_targets_every_label_is_two_letters_and_back() {
+        let mut l = JumpLabels::default();
+        l.settle((0..3).map(tab).collect());
+        l.settle((0..30).map(tab).collect());
+        assert!(l.held.iter().all(|(s, _)| s.len() == 2), "{:?}", l.held);
+        let mut seen: Vec<&String> = l.held.iter().map(|(s, _)| s).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 30, "unique");
+        l.settle((0..3).map(tab).collect());
+        assert_eq!(held(&l), [("a", tab(0)), ("s", tab(1)), ("d", tab(2))]);
     }
 }

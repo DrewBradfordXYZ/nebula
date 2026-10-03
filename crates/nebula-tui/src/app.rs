@@ -3795,6 +3795,14 @@ pub struct App {
     /// (`HitTarget::LauncherCardIssue`). Mirrors the config, refreshed at
     /// startup and when the settings overlay applies a change.
     pub card_issue_number: bool,
+    /// The `always_show_jump_labels` setting: JUMP MODE's labels sit on the
+    /// grid all the time, not only while `'` is up. Mirrors the config,
+    /// refreshed at startup and when the settings overlay applies a change.
+    pub always_show_jump_labels: bool,
+    /// The label each card, band rule and tab on the grid holds, settled
+    /// every frame (`jump::settle`) so a target keeps its label while it
+    /// stays on screen.
+    pub jump_labels: crate::jump::JumpLabels,
     /// The `show_all_worktrees` setting: every checkout of the project
     /// gets a BAND on the grid, one with nothing running in it too
     /// (`launcher::bands`). Mirrors the config, refreshed at startup and
@@ -3975,6 +3983,8 @@ impl App {
             welcome_on_screen: false,
             animations: true,
             card_issue_number: false,
+            always_show_jump_labels: false,
+            jump_labels: Default::default(),
             show_all_worktrees: false,
             black_background: false,
             hide_card_marks: false,
