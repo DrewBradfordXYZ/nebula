@@ -78,7 +78,7 @@
   row.
 - **Projects → worktrees → sessions.** All work happens in the main checkout or a git worktree.
   Worktrees are real (`git worktree add/remove`), created under
-  `<repo>/../<repo-name>-worktrees/<branch>` and branched from the freshly fetched `origin/HEAD`
+  `<repo>/../<repo-name>-worktrees/<branch>` (or under `git config nebula.worktreeDir`) and branched from the freshly fetched `origin/HEAD`
   unless `nebula worktree --base` names another start — a branch origin has means origin's fetched
   copy, so `--base main` is `origin/main` and never the checkout's local `main` (no `origin`, or a
   fetch that fails: the checkout's HEAD). The `worktree_base_branch` SETTING (Settings → General)
@@ -265,7 +265,7 @@
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
   it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
   `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
-  `<repo-name>-worktrees/<branch>` spot — or takes the existing one for that branch — re-homes the
+  `<repo-name>-worktrees/<branch>` spot (or the repo's `nebula.worktreeDir`) — or takes the existing one for that branch — re-homes the
   session's row under it at once, and the moment that turn ends restarts the CLI resumed inside the
   worktree, opening with a note saying where it now runs, so the conversation carries on there without
   you typing anything. Claude learns the rule from a short `--append-system-prompt` nebula passes at

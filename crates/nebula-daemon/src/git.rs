@@ -150,19 +150,46 @@ fn detached_label(head: Option<&str>) -> String {
     }
 }
 
-/// Directory a new worktree for `branch` should live in:
+/// The git config key naming where a repo's new worktrees go. Read fresh
+/// at each create, resolved the way git resolves any key, so `--global`
+/// sets every project and a repo's own `.git/config` overrides it.
+pub const WORKTREE_DIR_KEY: &str = "nebula.worktreeDir";
+
+/// Directory a new worktree for `branch` should live in, by default:
 /// `<repo>/../<repo-name>-worktrees/<branch>` (slashes in branch → dashes).
 pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
-    let repo_name = repo
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".into());
+    worktree_dir_in(repo, branch, None)
+}
+
+/// [`worktree_dir`] under a configured parent directory (the
+/// [`WORKTREE_DIR_KEY`] value): absolute as given, `~/` from the home
+/// directory, anything else relative to `repo`. `None` is the default
+/// sibling `<repo-name>-worktrees` directory.
+pub fn worktree_dir_in(repo: &Path, branch: &str, configured: Option<&str>) -> PathBuf {
     let safe_branch = branch.replace('/', "-");
-    repo.parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(format!("{repo_name}-worktrees"))
-        .join(safe_branch)
+    let parent = match configured {
+        Some(dir) => {
+            let home = dir
+                .strip_prefix("~/")
+                .and_then(|rest| nebula_core::env::home_dir().map(|h| h.join(rest)));
+            match home {
+                Some(path) => path,
+                None if Path::new(dir).is_absolute() => PathBuf::from(dir),
+                None => repo.join(dir),
+            }
+        }
+        None => {
+            let repo_name = repo
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "repo".into());
+            repo.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(format!("{repo_name}-worktrees"))
+        }
+    };
+    parent.join(safe_branch)
 }
 
 /// `git worktree add <path> -b <branch> [base]`. Falls back to checking out an
@@ -248,7 +275,8 @@ async fn add_worktree_inner(
     base: Option<&str>,
     track: bool,
 ) -> Result<PathBuf> {
-    let path = worktree_dir(repo, branch);
+    let configured = config_get(repo, WORKTREE_DIR_KEY).await;
+    let path = worktree_dir_in(repo, branch, configured.as_deref());
     if path.exists() {
         bail!("worktree path already exists: {}", path.display());
     }
@@ -762,6 +790,45 @@ mod tests {
 
     /// A same-repo PR: the branch comes from `origin` and the new checkout
     /// tracks it, so a `git push` from a PR SESSION lands on the PR.
+    #[test]
+    fn worktree_dir_in_resolves_the_configured_parent() {
+        let repo = Path::new("/code/app");
+        assert_eq!(
+            worktree_dir_in(repo, "feat/x", None),
+            PathBuf::from("/code/app-worktrees/feat-x")
+        );
+        assert_eq!(
+            worktree_dir_in(repo, "feat/x", Some("/elsewhere/trees")),
+            PathBuf::from("/elsewhere/trees/feat-x")
+        );
+        assert_eq!(
+            worktree_dir_in(repo, "feat/x", Some(".claude/worktrees")),
+            PathBuf::from("/code/app/.claude/worktrees/feat-x")
+        );
+        if let Some(home) = nebula_core::env::home_dir() {
+            assert_eq!(
+                worktree_dir_in(repo, "feat/x", Some("~/trees")),
+                home.join("trees").join("feat-x")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_worktree_lands_under_the_configured_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["config", WORKTREE_DIR_KEY, ".trees"])
+            .await
+            .unwrap();
+
+        let wt = add_worktree(&repo, "feat/x", None).await.unwrap();
+        assert_eq!(wt, repo.join(".trees").join("feat-x"));
+        let branch = git(&wt, &["branch", "--show-current"]).await.unwrap();
+        assert_eq!(branch.trim(), "feat/x");
+    }
+
     #[tokio::test]
     async fn add_pr_worktree_tracks_the_branch_on_origin() {
         let tmp = tempfile::tempdir().unwrap();

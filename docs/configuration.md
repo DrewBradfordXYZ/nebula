@@ -345,6 +345,23 @@ Unlike the WORKTREE HOOKS below, which nebula runs on its own and so never takes
 nothing in the PROJECT FILE runs until you press its key on that worktree — the same trust as typing the
 command into a shell there.
 
+## Worktree directory
+
+A new WORKTREE goes in a sibling of the repo by default: `<repo>/../<repo>-worktrees/<branch>`. A
+repo that keeps its worktrees somewhere else — inside itself, where its other tools already put
+them, or on another disk — names that directory in git config, read fresh at each create:
+
+```sh
+git config nebula.worktreeDir .claude/worktrees
+```
+
+A relative value is taken from the main checkout, `~/` from your home directory, and an absolute
+path as given; the branch name (slashes as dashes) is the folder inside it. Like the hooks below it
+is per repository, so `git config --global` sets every project and a repo's own `.git/config`
+overrides it. Only new worktrees move: nebula finds existing ones through `git worktree list`,
+wherever they are. A directory inside the checkout should be gitignored, or each worktree shows up
+in the main checkout's status.
+
 ## Worktree hooks
 
 A checkout often owns things outside its own directory — a dev-server port, a Caddy or nginx route, a

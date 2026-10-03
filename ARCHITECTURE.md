@@ -21,7 +21,7 @@ Everything is nested:
 
 Every project is in one list — there is no grouping above it. One repo is one project: adding a path that resolves to a repo already registered (its root or any checkout of it) is refused. The TUI shows one project's sessions at a time and moves between projects with its PROJECT TABS; every other project's sessions keep running (and keep receiving status updates) in the background. Databases through 0.33 grouped projects into named workspaces; migration 28 folds the groups away, merging a repo that sat in two of them into its older row.
 
-Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees/<branch>`. The daemon also polls git metadata so worktrees created outside Nebula still show up.
+Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees/<branch>`, or under the directory a repo names in `git config nebula.worktreeDir`. The daemon also polls git metadata so worktrees created outside Nebula still show up.
 
 An agent is a PTY running `claude`, `codex`, `cursor-agent`, `pi`, `muse`, `grok`, or `opencode` in that worktree. Restart resumes the stored session id when there is one, the way each CLI takes it (`--resume <id>` for Claude, Cursor and Grok; `codex resume <id>`, `pi --session-id <id>`, `opencode --session <id>`; muse always boots fresh: no resume flag mapped yet).
 
