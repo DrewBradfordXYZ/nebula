@@ -9063,6 +9063,10 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
             ratatui::layout::Position::new(mouse.column, mouse.row),
         )
     });
+    // The LABEL BAR's labels underline as the header's counts do.
+    let crumb = crumb.or_else(|| {
+        crate::issues::bar_item_under(app, ratatui::layout::Position::new(mouse.column, mouse.row))
+    });
     if app.hover_crumb != crumb {
         app.hover_crumb = crumb;
         app.dirty = true;
@@ -9725,7 +9729,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 }
                 // Never in the hit map: the ISSUES and PULL REQUESTS MODALS route
                 // the click on their button themselves, before this is reached.
-                Some(HitTarget::ModalBrowser) => {}
+                Some(
+                    HitTarget::ModalBrowser | HitTarget::IssueLabel(_) | HitTarget::IssueLabelsMore,
+                ) => {}
                 Some(HitTarget::PanelBg(focus)) => {
                     // The LAUNCHER VIEW's GRID lies on the same
                     // background, and a click on the air between its
