@@ -271,6 +271,10 @@ fn draw_screen(f: &mut Frame, app: &mut App) {
             ));
         }
         launcher_view::draw(f, app, view_a);
+        crate::jump::settle(app);
+        if app.launcher.always_show_jump_labels && app.modals.overlay.is_none() {
+            crate::jump::draw_always(f, app);
+        }
         if let Some(pane_a) = pane_a {
             draw_terminal(f, app, crate::launcher::pane_content(side, pane_a));
             if app.nav.focus == Focus::Terminal {

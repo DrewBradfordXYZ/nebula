@@ -408,6 +408,7 @@ pub(crate) fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.chrome.animations = cfg.animations;
     app.chrome.black_background = cfg.black_background;
     app.launcher.card_issue_number = cfg.card_issue_number;
+    app.launcher.always_show_jump_labels = cfg.always_show_jump_labels;
     app.launcher.show_all_worktrees = cfg.show_all_worktrees;
     app.launcher.auto_cleanup_merged = cfg.auto_cleanup_merged;
     app.launcher.hide_card_marks = cfg.hide_card_marks;

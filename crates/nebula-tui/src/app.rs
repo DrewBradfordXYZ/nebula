@@ -3788,6 +3788,14 @@ pub struct LauncherState {
     /// (`HitTarget::LauncherCardIssue`). Mirrors the config, refreshed at
     /// startup and when the settings overlay applies a change.
     pub card_issue_number: bool,
+    /// The `always_show_jump_labels` setting: JUMP MODE's labels sit on the
+    /// grid all the time, not only while `'` is up. Mirrors the config,
+    /// refreshed at startup and when the settings overlay applies a change.
+    pub always_show_jump_labels: bool,
+    /// The label each card, band rule and tab on the grid holds, settled
+    /// every frame (`jump::settle`) so a target keeps its label while it
+    /// stays on screen.
+    pub jump_labels: crate::jump::JumpLabels,
     /// The `hide_card_marks` setting: a terminal card's name goes without
     /// the `▶`/`❯` in front of it (`launcher_view::draw_chip`), a session
     /// card's prompt without its `›` (`launcher_view::prompt_lines`).
