@@ -559,7 +559,14 @@ best first, the cursor on the best with its comments asked for as any move asks 
 letters lit in each row and the title's count reading `2/14`. A `label:` term keeps only the issues
 carrying a matching label — part of the name is enough, any case, and every term must match:
 `label:bug login` is the bug-labelled issues matching `login`, and `label:"good first issue"` quotes
-a label with spaces. There is no negation: `-label:bug` is text like any other. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
+a label with spaces. While the caret ends a `label:` word, LABEL COMPLETION hangs the labels that
+could finish it under the filter, with how many of the listed issues carry each — names that start
+with what you typed first; a bare `label:` lists every label, eight at a time, the frame saying
+`↓ 5 more` for the rest as `↓` scrolls to them. `Tab` (or `Enter`, or a click) finishes the word with
+the highlighted one, `↑`/`↓` choose, and `Esc` closes the suggestions before it clears anything. A
+word that already names a label in full offers nothing, so `label:p1` beside a `p1-blocker` label
+leaves `Enter` and `↑`/`↓` to the rows. There is no negation:
+`-label:bug` is text like any other. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
 matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` (or `Ctrl+y`) and `Ctrl+o` act on the issue you found. `Esc`
 clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every
 fuzzy overlay; a filter nothing matches says `no issues match` and leaves the cursor where it was for

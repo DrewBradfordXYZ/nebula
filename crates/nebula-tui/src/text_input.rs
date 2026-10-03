@@ -193,7 +193,7 @@ impl TextInput {
     }
 
     /// Park the caret `at` chars in, clamped to the end of the text.
-    fn set_cursor_chars(&mut self, at: usize) {
+    pub fn set_cursor_chars(&mut self, at: usize) {
         self.cursor = self
             .text
             .char_indices()

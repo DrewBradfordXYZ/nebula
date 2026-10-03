@@ -163,16 +163,7 @@ impl<T> FilterList<T> {
         label: impl Fn(&T) -> String,
         keeps: impl Fn(&T, &QueryTerms) -> bool,
     ) {
-        let terms = QueryTerms::parse(self.query.as_str(), keys);
-        let labels: Vec<String> = self.items.iter().map(label).collect();
-        // `apply_filter`'s ranking, ties kept in list order, over the rows
-        // the terms leave.
-        let matches =
-            crate::fuzzy::rank_by(&terms.text, labels.iter().map(String::as_str), |i, _| i)
-                .into_iter()
-                .filter(|(item, _)| keeps(&self.items[*item], &terms))
-                .map(|(item, positions)| FilterMatch { item, positions })
-                .collect();
+        let matches = rank_where(self.query.as_str(), keys, &self.items, label, keeps);
         self.replace_matches(matches);
     }
 
@@ -220,6 +211,29 @@ impl<T> FilterList<T> {
             }
         }
     }
+}
+
+/// The rows of `items` that `query` leaves, best first: its `key:value`
+/// terms for `keys` filter through `keeps`, and the text left over
+/// fuzzy-ranks and lights `label`. What
+/// [`FilterList::apply_filter_where`] runs, for a caller that needs the
+/// answer for a query other than the typed one.
+pub fn rank_where<T>(
+    query: &str,
+    keys: &[&'static str],
+    items: &[T],
+    label: impl Fn(&T) -> String,
+    keeps: impl Fn(&T, &QueryTerms) -> bool,
+) -> Vec<FilterMatch> {
+    let terms = QueryTerms::parse(query, keys);
+    let labels: Vec<String> = items.iter().map(label).collect();
+    // `apply_filter`'s ranking, ties kept in list order, over the rows the
+    // terms leave.
+    crate::fuzzy::rank_by(&terms.text, labels.iter().map(String::as_str), |i, _| i)
+        .into_iter()
+        .filter(|(item, _)| keeps(&items[*item], &terms))
+        .map(|(item, positions)| FilterMatch { item, positions })
+        .collect()
 }
 
 /// A modal query split into the `key:value` terms that modal knows and the
