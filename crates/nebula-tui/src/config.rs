@@ -403,6 +403,7 @@ pub enum SettingKind {
     WorktreeLayout,
     ExpandAllWorktrees,
     CardIssueNumber,
+    AlwaysShowJumpLabels,
     HideDraftPrs,
     QuickPromptKind,
     QuickPromptFocus,
@@ -503,6 +504,7 @@ impl SettingKind {
             | SettingKind::CardIssueNumber => (2026, 9, 24),
             SettingKind::ExpandAllWorktrees | SettingKind::FollowNewSession => (2026, 9, 26),
             SettingKind::HighlightCurrentCard => (2026, 9, 28),
+            SettingKind::AlwaysShowJumpLabels => (2026, 10, 3),
         }
     }
 
@@ -674,6 +676,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::CardIssueNumber,
                 label: "Card issue number",
                 hint: "Show the #number of the GitHub issue a session was started from on its card; click it to open the issue",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::AlwaysShowJumpLabels,
+                label: "Always show jump labels",
+                hint: "Keep jump mode's labels on every card, worktree and tab all the time, so a label can be read and typed after ' (or said, driving nebula by voice) without bringing them up first",
                 group: "",
             },
             SettingSpec {
@@ -1093,6 +1101,10 @@ pub struct Config {
     /// (the very `⇧I` the card runs). On by default, a config predating
     /// the key too.
     pub card_issue_number: bool,
+    /// Keep JUMP MODE's labels on the grid all the time rather than only
+    /// while `'` is up — for a person who reads a label and types or says
+    /// it without a key to bring them up. Off by default.
+    pub always_show_jump_labels: bool,
     /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE's pull-request rows, so browsing what's open shows only
     /// the rows asking for a reviewer. A view filter, not a fetch filter:
@@ -1428,6 +1440,7 @@ impl Default for Config {
             expand_all_worktrees: false,
             hide_card_prompt: false,
             card_issue_number: true,
+            always_show_jump_labels: false,
             hide_draft_prs: false,
             card_line_changes: false,
             skip_session_naming: false,
@@ -2236,6 +2249,7 @@ impl Config {
             SettingKind::WorktreeLayout => WORKTREE_LAYOUTS[usize::from(self.list_layout())].into(),
             SettingKind::ExpandAllWorktrees => on_off(self.expand_all_worktrees).into(),
             SettingKind::CardIssueNumber => on_off(self.card_issue_number).into(),
+            SettingKind::AlwaysShowJumpLabels => on_off(self.always_show_jump_labels).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             // A project row with no project to speak of: what one without
             // an entry would show.
@@ -2349,6 +2363,9 @@ impl Config {
             }
             SettingKind::CardIssueNumber => {
                 self.card_issue_number = !self.card_issue_number;
+            }
+            SettingKind::AlwaysShowJumpLabels => {
+                self.always_show_jump_labels = !self.always_show_jump_labels;
             }
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
@@ -3585,6 +3602,31 @@ mod tests {
             }),
             "no tab shows the row"
         );
+    }
+
+    /// ALWAYS SHOW JUMP LABELS: an Appearance row, off by default (a config
+    /// that predates the key too), persisted under `always_show_jump_labels`.
+    #[test]
+    fn always_show_jump_labels_default_off_toggle_on_the_appearance_tab_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.always_show_jump_labels, "off by default");
+        assert_eq!(cfg.value_label(SettingKind::AlwaysShowJumpLabels), "off");
+
+        let (tab, row) = locate(SettingKind::AlwaysShowJumpLabels).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.always_show_jump_labels);
+        assert_eq!(cfg.value_label(SettingKind::AlwaysShowJumpLabels), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""always_show_jump_labels": true"#), "{raw}");
+        assert!(load_from(&path).always_show_jump_labels);
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.always_show_jump_labels);
     }
 
     /// CARD ISSUE NUMBER: an Appearance row that reads `on` / `off`, on
