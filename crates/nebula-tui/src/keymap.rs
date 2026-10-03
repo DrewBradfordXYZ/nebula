@@ -50,6 +50,9 @@ pub enum Action {
     HalfPageUp,
     Activate,
     Palette,
+    /// `'`: a label on every card and project tab on the grid; typing one
+    /// lands there (JUMP MODE).
+    Jump,
     /// `.`: the next session in the PALETTE's attention order, no modal.
     NextAttention,
     /// `,`: the same walk backwards.
@@ -276,6 +279,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["/"],
+    },
+    ActionSpec {
+        action: Action::Jump,
+        id: "jump",
+        label: "Jump to a label",
+        hint: "Put a label on every card and project tab on screen; type one to land there",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["'"],
     },
     ActionSpec {
         action: Action::NextAttention,

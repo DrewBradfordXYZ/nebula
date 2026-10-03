@@ -1894,6 +1894,8 @@ pub enum Overlay {
     BranchSwitch(crate::branch_switch::BranchSwitchView),
     /// `^P` in the LAUNCHER VIEW's box: the PROJECT PICKER.
     ProjectPicker(crate::launcher::ProjectPicker),
+    /// `'` on the grid: JUMP MODE's labels over the cards and tabs.
+    Jump(crate::jump::JumpView),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
