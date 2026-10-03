@@ -37,6 +37,8 @@ impl Daemon {
             starting_prompt,
             pr_url,
             issue_url,
+            issue_id,
+            issue_source,
             role,
         } = spec;
         let cloud_prompt = match cloud_prompt {
@@ -63,9 +65,28 @@ impl Daemon {
             Some(url) => Some(crate::pr_scope::validate_pr_url(&url)?),
             None => None,
         };
+        let issue_id = match issue_id {
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("issue launch context is not supported for Claude Cloud")
+            }
+            Some(id) => Some(crate::pr_scope::validate_issue_id(&id)?),
+            None => None,
+        };
+        // A source issue names its source, and only a source issue does.
+        let issue_source = match (&issue_id, issue_source) {
+            (Some(_), Some(program)) => Some(program),
+            (Some(_), None) => bail!("an issue id needs the issue source it came from"),
+            (None, Some(_)) => bail!("an issue source needs the issue id it lists"),
+            (None, None) => None,
+        };
         let issue_url = match issue_url {
             Some(_) if cloud_prompt.is_some() => {
                 bail!("issue launch context is not supported for Claude Cloud")
+            }
+            // An ISSUE SOURCE's issue may live at any page; only a GitHub
+            // issue, named by its URL alone, must be one.
+            Some(url) if issue_id.is_some() => {
+                Some(crate::pr_scope::validate_source_issue_url(&url)?)
             }
             Some(url) => Some(crate::pr_scope::validate_issue_url(&url)?),
             None => None,
@@ -84,7 +105,7 @@ impl Daemon {
         let optimistic_run = Self::launch_submits_first_prompt(
             &harness,
             starting_prompt.as_deref(),
-            pr_url.is_some() || issue_url.is_some(),
+            pr_url.is_some() || issue_url.is_some() || issue_id.is_some(),
         ) && cloud_prompt.is_none();
         let worktree_lookup = worktree_id.clone();
         let worktree = self
@@ -94,6 +115,18 @@ impl Daemon {
                     .context("worktree not found")
             })
             .await?;
+        // The source is persisted and named to the agent on every spawn:
+        // it must be one the repository itself configures, never just what
+        // the client said.
+        if let Some(program) = &issue_source {
+            let configured = crate::git::issue_sources(&worktree.path).await;
+            if !configured.programs.contains(program) {
+                bail!(
+                    "{program} is not one of this repository's issue sources (git config {})",
+                    nebula_core::issue_source::KEY
+                );
+            }
+        }
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. A starting prompt rides the
@@ -102,6 +135,7 @@ impl Daemon {
         let adopted = (cloud_prompt.is_none()
             && pr_url.is_none()
             && issue_url.is_none()
+            && issue_id.is_none()
             && starting_prompt.is_none())
         .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
         .flatten();
@@ -145,6 +179,9 @@ impl Daemon {
             status_changed_at: nebula_core::clock::now_ms(),
             alive: false,
             issue_url: issue_url.clone(),
+            source_issue: issue_id
+                .zip(issue_source)
+                .map(|(id, source)| Box::new(nebula_core::SourceIssue { id, source })),
             role,
             recent_prompts: Vec::new(),
         };
@@ -479,13 +516,15 @@ impl Daemon {
         // prompt (see `pr_scope`). Rebuilt from the row's *current*
         // worktree on every spawn, so a relocated session is told where it
         // now works.
-        let (pr_url, issue_url) = if cloud_task.is_none() {
+        let (pr_url, issue_url, issue_id, issue_program) = if cloud_task.is_none() {
             (
                 self.store.agent_pr_url(&agent.id)?,
                 self.store.agent_issue_url(&agent.id)?,
+                self.store.agent_issue_id(&agent.id)?,
+                self.store.agent_issue_source(&agent.id)?,
             )
         } else {
-            (None, None)
+            (None, None, None, None)
         };
         let root = match &pr_url {
             Some(_) if !worktree.is_main => self
@@ -500,8 +539,19 @@ impl Daemon {
             branch: &worktree.branch,
             root: root.as_deref(),
         });
-        let issue_scope = issue_url.as_deref().map(|url| crate::pr_scope::IssueScope {
-            url,
+        // The id and its source are persisted together (the create refuses
+        // one without the other), so a row with an id always has both.
+        let issue = match (&issue_id, &issue_program, &issue_url) {
+            (Some(id), Some(program), url) => Some(crate::pr_scope::IssueOf::Source {
+                id,
+                url: url.as_deref(),
+                program,
+            }),
+            (_, _, Some(url)) => Some(crate::pr_scope::IssueOf::GitHub(url)),
+            _ => None,
+        };
+        let issue_scope = issue.map(|issue| crate::pr_scope::IssueScope {
+            issue,
             worktree: &worktree.path,
             branch: &worktree.branch,
         });

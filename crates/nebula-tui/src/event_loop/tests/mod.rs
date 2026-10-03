@@ -30,6 +30,7 @@ fn seed_agent_in(app: &mut App, id: &str, worktree: &nebula_core::WorktreeId) {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -60,6 +61,7 @@ fn seed_second_agent(app: &mut App, status: nebula_core::AgentStatus) {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -854,6 +856,7 @@ pub(super) fn seed_tree(app: &mut App) {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -1864,7 +1867,10 @@ pub(super) fn seed_issues(app: &mut App, issues: &[(u64, &str)]) {
             list: issues
                 .iter()
                 .map(|(number, title)| crate::issues::Issue {
-                    number: *number,
+                    key: format!("https://github.com/o/r/issues/{number}"),
+                    id: number.to_string(),
+                    origin: crate::issues::Origin::GitHub,
+                    source: String::new(),
                     url: format!("https://github.com/o/r/issues/{number}"),
                     title: (*title).into(),
                     author: "webdevcody".into(),
@@ -1928,7 +1934,7 @@ fn a_checkout_on_a_pull_requests_head_branch_nests_under_its_row() {
                 WorktreeRow::Checkout(w) => w.branch.clone(),
                 WorktreeRow::Pr(pr) => format!("#{}", pr.number),
                 WorktreeRow::PrCheckout(worktree) => format!("└ {}", worktree.branch),
-                WorktreeRow::Issue(issue) => format!("issue #{}", issue.number),
+                WorktreeRow::Issue(issue) => format!("issue {}", issue.tag()),
             })
             .collect()
     };
@@ -5195,6 +5201,7 @@ fn working_sessions_head_the_list_regardless_of_age() {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -5250,6 +5257,7 @@ fn sessions_order_by_last_interaction() {
             alive: true,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            source_issue: None,
             recent_prompts: Vec::new(),
         }),
     };
@@ -5333,6 +5341,7 @@ fn a_session_created_running_leads_the_working_ones() {
             alive: true,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            source_issue: None,
             recent_prompts: Vec::new(),
         }),
     };
@@ -5394,6 +5403,7 @@ fn status_change_resorts_and_selection_follows() {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -5463,6 +5473,7 @@ fn worktree_delete_is_optimistic_and_rolls_back_on_error() {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -7748,6 +7759,7 @@ fn walking_onto_a_reaped_session_still_waits_out_the_debounce() {
                 alive: false,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -8352,6 +8364,7 @@ fn archived_agent(id: &str, name: &str, archived_at: i64, sort: i64) -> nebula_c
         alive: false,
         issue_url: None,
         role: nebula_core::AgentRole::Worker,
+        source_issue: None,
         recent_prompts: Vec::new(),
     })
 }
@@ -9952,6 +9965,7 @@ fn selection_follows_the_selected_agent_when_the_daemon_rehomes_it() {
         alive: true,
         issue_url: None,
         role: nebula_core::AgentRole::Worker,
+        source_issue: None,
         recent_prompts: Vec::new(),
     };
 
@@ -10147,6 +10161,7 @@ fn agent_stamped(id: &str, wt: &str, at: i64) -> nebula_core::Entity {
         alive: true,
         issue_url: None,
         role: nebula_core::AgentRole::Worker,
+        source_issue: None,
         recent_prompts: Vec::new(),
     })
 }
@@ -11899,6 +11914,7 @@ fn seed_second_project(app: &mut App) {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -11925,6 +11941,7 @@ fn seed_second_project(app: &mut App) {
                 alive: false,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -12256,6 +12273,7 @@ fn seed_attention_ring(app: &mut App) {
         alive: true,
         issue_url: None,
         role: nebula_core::AgentRole::Worker,
+        source_issue: None,
         recent_prompts: Vec::new(),
     };
     for a in [
@@ -12721,6 +12739,7 @@ fn palette_rows_take_their_status_color_and_sweep() {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -14995,6 +15014,7 @@ fn shift_d_bulk_deletes_the_visible_sessions() {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -15069,6 +15089,7 @@ fn agent_entity(id: &str, wt: &str, name: &str, archived: bool) -> nebula_core::
         alive: true,
         issue_url: None,
         role: nebula_core::AgentRole::Worker,
+        source_issue: None,
         recent_prompts: Vec::new(),
     })
 }
@@ -15765,6 +15786,7 @@ fn a_cross_project_session_jump_attaches_only_the_session_picked() {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -15833,6 +15855,7 @@ fn seed_background_run(app: &mut App) {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -16387,7 +16410,10 @@ fn the_issue_comment_box_comes_back_to_the_modal_on_its_row() {
         "/nonexistent/nebula-issue-comment-box".into(),
     )));
     let issue = |number: u64| crate::issues::Issue {
-        number,
+        key: format!("https://github.com/o/r/issues/{number}"),
+        id: number.to_string(),
+        origin: crate::issues::Origin::GitHub,
+        source: String::new(),
         url: format!("https://github.com/o/r/issues/{number}"),
         title: format!("issue {number}"),
         author: "webdevcody".into(),
@@ -16400,7 +16426,10 @@ fn the_issue_comment_box_comes_back_to_the_modal_on_its_row() {
         &mut app,
         crate::issues::IssuesAnswer::List {
             project,
-            list: Some(vec![issue(15), issue(14)]),
+            lists: vec![(
+                crate::issues::IssueSource::GitHub,
+                Ok(vec![issue(15), issue(14)]),
+            )],
         },
     );
     press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -16498,16 +16527,22 @@ fn the_issue_quick_prompt_starts_on_the_root_branch_or_a_fresh_worktree() {
                 &mut app,
                 crate::issues::IssuesAnswer::List {
                     project,
-                    list: Some(vec![crate::issues::Issue {
-                        number: 15,
-                        url: "https://github.com/o/r/issues/15".into(),
-                        title: "Login fails".into(),
-                        author: "webdevcody".into(),
-                        created_at: "2026-09-10T12:00:00Z".into(),
-                        updated_at: "2026-09-11T12:00:00Z".into(),
-                        labels: vec![],
-                        body: String::new(),
-                    }]),
+                    lists: vec![(
+                        crate::issues::IssueSource::GitHub,
+                        Ok(vec![crate::issues::Issue {
+                            key: "https://github.com/o/r/issues/15".into(),
+                            id: "15".into(),
+                            origin: crate::issues::Origin::GitHub,
+                            source: String::new(),
+                            url: "https://github.com/o/r/issues/15".into(),
+                            title: "Login fails".into(),
+                            author: "webdevcody".into(),
+                            created_at: "2026-09-10T12:00:00Z".into(),
+                            updated_at: "2026-09-11T12:00:00Z".into(),
+                            labels: vec![],
+                            body: String::new(),
+                        }]),
+                    )],
                 },
             );
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -16552,7 +16587,10 @@ fn the_issue_quick_prompt_stands_on_the_modal() {
             "/tmp/demo".into(),
         )));
         let issue = |number: u64| crate::issues::Issue {
-            number,
+            key: format!("https://github.com/o/r/issues/{number}"),
+            id: number.to_string(),
+            origin: crate::issues::Origin::GitHub,
+            source: String::new(),
             url: format!("https://github.com/o/r/issues/{number}"),
             title: format!("issue {number}"),
             author: "webdevcody".into(),
@@ -16565,7 +16603,10 @@ fn the_issue_quick_prompt_stands_on_the_modal() {
             &mut app,
             crate::issues::IssuesAnswer::List {
                 project,
-                list: Some(vec![issue(15), issue(14)]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Ok(vec![issue(15), issue(14)]),
+                )],
             },
         );
         press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -16655,6 +16696,7 @@ fn the_issue_quick_prompt_stands_on_the_modal() {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -16695,7 +16737,10 @@ fn the_issue_preset_picker_stands_on_the_modal() {
             "/tmp/demo".into(),
         )));
         let issue = |number: u64| crate::issues::Issue {
-            number,
+            key: format!("https://github.com/o/r/issues/{number}"),
+            id: number.to_string(),
+            origin: crate::issues::Origin::GitHub,
+            source: String::new(),
             url: format!("https://github.com/o/r/issues/{number}"),
             title: format!("issue {number}"),
             author: "webdevcody".into(),
@@ -16708,7 +16753,10 @@ fn the_issue_preset_picker_stands_on_the_modal() {
             &mut app,
             crate::issues::IssuesAnswer::List {
                 project,
-                list: Some(vec![issue(15), issue(14)]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Ok(vec![issue(15), issue(14)]),
+                )],
             },
         );
         press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -16874,16 +16922,22 @@ fn the_issue_preset_picker_tab_flips_a_new_worktree() {
             &mut app,
             crate::issues::IssuesAnswer::List {
                 project,
-                list: Some(vec![crate::issues::Issue {
-                    number: 15,
-                    url: "https://github.com/o/r/issues/15".into(),
-                    title: "Fix login redirect".into(),
-                    author: "webdevcody".into(),
-                    created_at: "2026-09-10T12:00:00Z".into(),
-                    updated_at: "2026-09-11T12:00:00Z".into(),
-                    labels: vec![],
-                    body: String::new(),
-                }]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Ok(vec![crate::issues::Issue {
+                        key: "https://github.com/o/r/issues/15".into(),
+                        id: "15".into(),
+                        origin: crate::issues::Origin::GitHub,
+                        source: String::new(),
+                        url: "https://github.com/o/r/issues/15".into(),
+                        title: "Fix login redirect".into(),
+                        author: "webdevcody".into(),
+                        created_at: "2026-09-10T12:00:00Z".into(),
+                        updated_at: "2026-09-11T12:00:00Z".into(),
+                        labels: vec![],
+                        body: String::new(),
+                    }]),
+                )],
             },
         );
         let fresh = |app: &App| match &app.modals.overlay {
@@ -16913,7 +16967,7 @@ fn the_issue_preset_picker_tab_flips_a_new_worktree() {
             "{:?}",
             launch.target
         );
-        assert_eq!(launch.issue.as_ref().map(|i| i.number), Some(15));
+        assert_eq!(launch.issue.as_ref().map(|i| i.id.as_str()), Some("15"));
         assert!(matches!(
             &launch.under,
             Some(crate::quick_prompt::ModalUnder::Issues(_))
@@ -18125,6 +18179,7 @@ fn a_quick_prompt_lands_the_row_without_taking_the_pane() {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -20117,6 +20172,7 @@ fn parity_tree() -> App {
                 alive: true,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         },
@@ -21943,4 +21999,83 @@ fn archived_sessions_keep_the_question_with_show_all_worktrees_on() {
             c.action
         );
     });
+}
+
+/// Two pageless issues from an ISSUE SOURCE on the selected project — the
+/// PROJECT ISSUES GROUP's rows — and their keys.
+fn seed_source_issues(app: &mut App) -> Vec<String> {
+    let id = app.selected_project().expect("a project").id.clone();
+    let list: Vec<crate::issues::Issue> = ["ENG-1", "ENG-2"]
+        .iter()
+        .map(|id| crate::issues::Issue {
+            key: crate::issues::source_key(
+                std::path::Path::new("/tmp/demo"),
+                "/opt/bin/issues",
+                id,
+            ),
+            id: (*id).into(),
+            origin: crate::issues::Origin::Source,
+            source: "/opt/bin/issues".into(),
+            url: String::new(),
+            title: format!("Crash {id}"),
+            author: "alice".into(),
+            created_at: "2026-09-20T12:00:00Z".into(),
+            updated_at: "2026-09-21T12:00:00Z".into(),
+            labels: Vec::new(),
+            body: format!("Body of {id}"),
+        })
+        .collect();
+    let keys = list.iter().map(|i| i.key.clone()).collect();
+    app.github.issues.insert(
+        id,
+        crate::issues::IssueList {
+            list,
+            at: std::time::Instant::now(),
+        },
+    );
+    keys
+}
+
+/// A source issue with no page is read, commented and followed by its key,
+/// never its empty URL: the pane shows its comments, Enter on its row says
+/// it has no page instead of trying to open "", and the cursor follows it
+/// when a checkout above it comes and shifts the rows.
+#[test]
+fn a_pageless_source_issue_row_reads_follows_and_opens_nothing() {
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let keys = seed_source_issues(&mut app);
+    app.nav.focus = Focus::Worktrees;
+    app.nav.sel_worktree = app.issue_row_of(&keys[1]).expect("listed");
+    app.github.issue_detail.insert(
+        keys[1].clone(),
+        crate::issues::IssueDetail {
+            body: None,
+            comments: vec![crate::issues::IssueComment {
+                author: "bob".into(),
+                at: "2026-09-22T12:00:00Z".into(),
+                body: "Seen it too".into(),
+            }],
+        },
+    );
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("Seen it too"), "the comments, by key: {text}");
+    assert!(!text.contains("reading the comments"), "{text}");
+
+    // Enter on the row — and a double-click on it — in the WORKTREES PANEL.
+    let mut out = Vec::new();
+    let focus = app.nav.focus;
+    super::activate::worktrees_row(&mut app, &mut out);
+    assert_eq!(app.chrome.flash.as_deref(), Some("ENG-2 has no web page"));
+    assert_eq!(app.nav.focus, focus, "the cursor stays put");
+    assert!(out.is_empty(), "{out:?}");
+
+    seed_feat_worktree(&mut app, "w2", "feat");
+    assert_eq!(
+        app.selected_worktree_issue().map(|i| i.id.as_str()),
+        Some("ENG-2"),
+        "the cursor follows its issue past the new row"
+    );
 }

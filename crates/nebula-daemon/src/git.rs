@@ -533,6 +533,16 @@ async fn track_pr_ref(repo: &Path, branch: &str, pr_ref: &str) {
     }
 }
 
+/// The ISSUE SOURCES `repo` configures (`git config nebula.issueSource`),
+/// read as the TUI reads them — empty when the key is unset or git is
+/// missing.
+pub async fn issue_sources(repo: &Path) -> nebula_core::issue_source::Configured {
+    git(repo, &nebula_core::issue_source::GIT_ARGS)
+        .await
+        .map(|out| nebula_core::issue_source::Configured::parse(&out))
+        .unwrap_or_default()
+}
+
 /// One git config value for `repo`, resolved the way git resolves it —
 /// the repo's own `.git/config`, then the user's global file, then the
 /// system's — or None when the key is unset (git exits 1 with nothing on

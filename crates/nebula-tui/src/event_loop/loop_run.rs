@@ -7,6 +7,7 @@ macro_rules! main_loop_body {
 
     let mut app = App::new();
     app.chrome.conn = ConnState::Connected;
+    app.chrome.daemon_protocol = Some($channels.daemon_protocol);
     // The repo nebula was started in, for the first run's "open this
     // folder" — looked up once, off the tree the snapshot has not sent yet.
     app.launcher.launch_repo = crate::app::launch_repo();

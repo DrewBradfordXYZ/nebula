@@ -276,7 +276,8 @@ pub(crate) struct SelectionSnapshot {
     /// launch with no box (`n`, a `skip`-task preset) then ran against a
     /// pull request nobody picked.
     pr: Option<String>,
-    /// The ISSUES row under it, the same way.
+    /// The ISSUES row under it, the same way, by `Issue::key` (a source
+    /// issue may have no URL).
     issue: Option<String>,
     session: Option<SessionRef>,
     /// The Sessions panel row the cursor was on, and the group that row
@@ -313,7 +314,7 @@ pub(crate) fn selection_snapshot(app: &App) -> SelectionSnapshot {
         project: app.selected_project().map(|p| p.id.clone()),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         pr: app.selected_worktree_pr().map(|pr| pr.url.clone()),
-        issue: app.selected_worktree_issue().map(|i| i.url.clone()),
+        issue: app.selected_worktree_issue().map(|i| i.key.clone()),
         session_index: app.nav.sel_session,
         session_group: row.as_ref().map(session_group),
         session: row.and_then(|r| r.sref()),
@@ -383,9 +384,9 @@ pub(crate) fn reconcile_selection_inner(
                 app.nav.sel_worktree = i;
             }
         }
-    } else if let Some(url) = &before.issue {
-        if app.selected_worktree_issue().map(|i| &i.url) != Some(url) {
-            if let Some(i) = app.issue_row_of(url) {
+    } else if let Some(key) = &before.issue {
+        if app.selected_worktree_issue().map(|i| &i.key) != Some(key) {
+            if let Some(i) = app.issue_row_of(key) {
                 app.nav.sel_worktree = i;
             }
         }

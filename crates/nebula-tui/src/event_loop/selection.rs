@@ -1072,7 +1072,31 @@ pub(crate) fn project_of_worktree(app: &App, worktree: &WorktreeId) -> Option<Pr
         .map(|w| w.project_id.clone())
 }
 
+/// A DAEMON older than `ISSUE_SOURCES_PROTOCOL` can't decode a source
+/// issue's id; sent without it, the session would start with no issue at
+/// all. True — the footer saying so — when a launch carrying one must not
+/// go out. Asked before anything is made for the launch: a fresh worktree
+/// cut for an issue the daemon then can't take would be left behind.
+pub(crate) fn daemon_refuses_source_issue(app: &mut App, source_issue: bool) -> bool {
+    let refuses = source_issue
+        && app
+            .chrome
+            .daemon_protocol
+            .is_some_and(|v| v < nebula_core::ISSUE_SOURCES_PROTOCOL);
+    if refuses {
+        app.chrome.flash = Some(
+            "the running daemon predates issue sources — restart it (nebula reload) to launch this issue"
+                .into(),
+        );
+        app.chrome.dirty = true;
+    }
+    refuses
+}
+
 pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
+    if daemon_refuses_source_issue(app, draft.issue_id.is_some()) {
+        return;
+    }
     // Every launch is work in its project, whose tab goes to the far left
     // — a BACKGROUND LAUNCH's too, though nothing else it does moves. Not
     // a create that already carries its stand-in row: that is the second
@@ -1101,6 +1125,8 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
         reopen_on_error,
         pr,
         issue_url,
+        issue_id,
+        issue_source,
         focus_pane,
         placeholder,
         follow,
@@ -1239,6 +1265,8 @@ pub(crate) fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec
             cloud_prompt,
             starting_prompt,
             issue_url,
+            issue_id,
+            issue_source,
             role: nebula_core::AgentRole::Worker,
         },
     });

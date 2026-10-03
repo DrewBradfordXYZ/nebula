@@ -34,6 +34,14 @@ pub(super) fn submit(
     text: String,
     out: &mut Vec<ClientRequest>,
 ) {
+    // Before a row goes up or a worktree is cut for it.
+    let source_issue = launch
+        .issue
+        .as_ref()
+        .is_some_and(|issue| issue.launch_id().is_some());
+    if super::selection::daemon_refuses_source_issue(app, source_issue) {
+        return;
+    }
     // REMEMBER HARNESS (Settings → Experimental): a box fired on a harness
     // — or a MODEL / EFFORT — picked through `Tab` makes that the next
     // launch's default. A preset's harness is the preset's own, not a
@@ -261,7 +269,12 @@ pub(super) fn draft(
         starting_prompt: Some(launch.compose(&text))
             .filter(|prompt| !launch.cloud && !prompt.is_empty()),
         // An ISSUE SESSION's context, persisted by the DAEMON with the row.
-        issue_url: launch.issue.as_ref().map(|issue| issue.url.clone()),
+        issue_url: launch.issue.as_ref().and_then(|issue| issue.launch_url()),
+        issue_id: launch.issue.as_ref().and_then(|issue| issue.launch_id()),
+        issue_source: launch
+            .issue
+            .as_ref()
+            .and_then(|issue| issue.launch_source()),
         // A PR SESSION's: the create goes to the PROJECT as a
         // `CreatePrAgent`, and `worktree` only names which.
         pr: launch.pr.clone(),
@@ -359,6 +372,7 @@ mod tests {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -725,6 +739,63 @@ mod tests {
             );
             assert_ne!(pane(&app), new_session());
             assert_eq!(app.nav.focus, Focus::Sessions);
+        });
+    }
+
+    /// A launch for an ISSUE SOURCE's issue that the running daemon is too
+    /// old to take is refused before anything is made for it: no stand-in
+    /// rows, and above all no fresh worktree cut for an issue that then
+    /// never launches. A current daemon gets the worktree, then the issue.
+    #[test]
+    fn an_old_daemon_refuses_a_source_issue_before_a_worktree_is_cut() {
+        with_config_json(FOLLOW_OFF, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let rows = (app.tree.worktrees.len(), app.tree.agents.len());
+            let issue = crate::issues::IssueRef {
+                key: "/tmp/demo#/opt/bin/issues#ENG-1".into(),
+                id: "ENG-1".into(),
+                origin: crate::issues::Origin::Source,
+                source: "/opt/bin/issues".into(),
+                url: String::new(),
+                title: "Crash on start".into(),
+            };
+            let launch = || {
+                crate::quick_prompt::QuickLaunch::of_kind(
+                    crate::quick_prompt::QuickTarget::NewWorktree {
+                        project: nebula_core::ProjectId("p1".into()),
+                        branch: "issue-eng-1-crash-on-start".into(),
+                    },
+                    AgentKind::Claude,
+                    None,
+                    None,
+                    None,
+                    &crate::config::Config::default(),
+                )
+                .with_issue(Some(issue.clone()))
+            };
+
+            app.chrome.daemon_protocol = Some(nebula_core::ISSUE_SOURCES_PROTOCOL - 1);
+            let mut out = Vec::new();
+            super::submit(&mut app, launch(), String::new(), &mut out);
+            assert!(out.is_empty(), "nothing goes out: {out:?}");
+            assert!(app
+                .chrome
+                .flash
+                .as_deref()
+                .is_some_and(|f| f.contains("predates issue sources")));
+            assert_eq!(
+                (app.tree.worktrees.len(), app.tree.agents.len()),
+                rows,
+                "no stand-in rows"
+            );
+
+            app.chrome.daemon_protocol = Some(nebula_core::ISSUE_SOURCES_PROTOCOL);
+            super::submit(&mut app, launch(), String::new(), &mut out);
+            assert!(
+                matches!(out.as_slice(), [ClientRequest::CreateWorktree { .. }]),
+                "{out:?}"
+            );
         });
     }
 }

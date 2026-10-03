@@ -198,6 +198,8 @@ impl Daemon {
             starting_prompt: Some(starting_prompt),
             pr_url: None,
             issue_url: None,
+            issue_id: None,
+            issue_source: None,
             role: AgentRole::Worker,
         })
         .await
@@ -338,6 +340,7 @@ mod tests {
             sort_order: 0,
             alive: false,
             recent_prompts: Vec::new(),
+            source_issue: None,
         }
     }
 

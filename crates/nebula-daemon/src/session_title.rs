@@ -398,6 +398,7 @@ mod tests {
                     alive: false,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 },
                 true,

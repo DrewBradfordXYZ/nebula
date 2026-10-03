@@ -687,12 +687,15 @@ pub(crate) fn open_pr_agent_picker(app: &mut App) {
 }
 
 /// The CONTEXT MENU for a PROJECT ISSUES GROUP row: the browser. The
-/// launches are the row's keys (`p`, `e`), as the footer says.
-pub(crate) fn issue_row_menu_items(issue: &crate::issues::Issue) -> Vec<MenuItem> {
-    vec![MenuItem::new(
-        "Open in browser",
-        MenuAction::OpenLink(issue.url.clone()),
-    )]
+/// launches are the row's keys (`p`, `e`), as the footer says. None for a
+/// source issue with no web page: there is nothing to offer.
+pub(crate) fn issue_row_menu_items(issue: &crate::issues::Issue) -> Option<Vec<MenuItem>> {
+    (!issue.url.is_empty()).then(|| {
+        vec![MenuItem::new(
+            "Open in browser",
+            MenuAction::OpenLink(issue.url.clone()),
+        )]
+    })
 }
 
 /// The CONTEXT MENU for a PROJECT OPEN PRS GROUP row: a PR SESSION row per
@@ -869,7 +872,7 @@ pub(crate) fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem
         Focus::Worktrees => match app.selected_worktree_pr() {
             Some(pr) => Some(pr_row_menu_items(app, pr)),
             None => match app.selected_worktree_issue() {
-                Some(issue) => Some(issue_row_menu_items(issue)),
+                Some(issue) => issue_row_menu_items(issue),
                 None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
             },
         },

@@ -141,6 +141,8 @@ impl Daemon {
             pr_url: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         })
     }
 
@@ -258,6 +260,7 @@ mod tests {
             alive: false,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            source_issue: None,
             recent_prompts: Vec::new(),
         }
     }

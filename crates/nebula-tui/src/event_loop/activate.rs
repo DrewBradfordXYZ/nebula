@@ -169,15 +169,17 @@ pub(super) fn settings_row_cmd(hotkeys: bool, selected: usize) -> SettingsCmd {
 
 /// Enter on the WORKTREES PANEL's row — and a double-click on it: a pull
 /// request or an issue leads out of nebula, so it is handed to the browser
-/// and the cursor stays put; a checkout hands FOCUS one column right, to
-/// its sessions.
+/// and the cursor stays put (a source issue with no page says so, as the
+/// ISSUES MODAL's `Ctrl+o` does); a checkout hands FOCUS one column right,
+/// to its sessions.
 pub(super) fn worktrees_row(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let link = app
-        .selected_worktree_pr()
-        .map(|pr| pr.url.clone())
-        .or_else(|| app.selected_worktree_issue().map(|i| i.url.clone()));
-    match link {
-        Some(url) => open_link(app, &url, out),
+    if let Some(url) = app.selected_worktree_pr().map(|pr| pr.url.clone()) {
+        open_link(app, &url, out);
+        return;
+    }
+    match app.selected_worktree_issue().cloned() {
+        Some(issue) if !issue.url.is_empty() => open_link(app, &issue.url, out),
+        Some(issue) => app.chrome.flash = Some(crate::issues::no_page(&issue)),
         None => app.nav.focus = Focus::Sessions,
     }
 }

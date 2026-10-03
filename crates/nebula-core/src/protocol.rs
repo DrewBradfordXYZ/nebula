@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -18,6 +18,14 @@ pub const PROTOCOL_VERSION: u32 = 50;
 /// `[MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION]` range includes at least one
 /// version the other peer also supports.
 pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
+
+/// The first protocol with ISSUE SOURCES: `CreateAgent`'s `issue_id` and
+/// `issue_source`, and `Agent::source_issue`. Compact MessagePack frames
+/// are arrays, so a peer older than this cannot decode a message carrying
+/// either one: the fields are trailing and stay off the wire when empty,
+/// the TUI sends them only to a daemon at least this new, and the daemon
+/// strips `source_issue` from what it sends a client that is older.
+pub const ISSUE_SOURCES_PROTOCOL: u32 = 51;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -177,6 +185,18 @@ pub enum ClientRequest {
         /// privileged orchestrator command surface.
         #[serde(default)]
         role: AgentRole,
+        /// The issue's id when it comes from an ISSUE SOURCE other than
+        /// GitHub (`git config nebula.issueSource`): the session is an
+        /// ISSUE SESSION for it, with or without an `issue_url` (a source's
+        /// issue may have no web page). None for a GitHub issue, which
+        /// `issue_url` alone names. Since [`ISSUE_SOURCES_PROTOCOL`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issue_id: Option<String>,
+        /// The ISSUE SOURCE program `issue_id` came from — one of the
+        /// values of the repository's `nebula.issueSource`, which the
+        /// DAEMON checks. Set exactly when `issue_id` is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issue_source: Option<String>,
     },
     /// Create a local AGENT of any kind from an OPEN PRS row — a PR
     /// SESSION. It never runs in the ROOT WORKTREE: the daemon finds the
@@ -767,9 +787,262 @@ pub enum ServerEvent {
     },
 }
 
+impl ServerEvent {
+    /// Fit the event to a client that speaks `peer_protocol`: one older
+    /// than [`ISSUE_SOURCES_PROTOCOL`] cannot decode an agent row carrying
+    /// `source_issue`, so the rows it gets go without it (the session still
+    /// shows, minus the issue's id).
+    pub fn for_peer(&mut self, peer_protocol: u32) {
+        if peer_protocol >= ISSUE_SOURCES_PROTOCOL {
+            return;
+        }
+        match self {
+            ServerEvent::Snapshot { agents, .. } | ServerEvent::OrchestratorList { agents, .. } => {
+                for agent in agents {
+                    agent.source_issue = None;
+                }
+            }
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(agent),
+            } => agent.source_issue = None,
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent row from an ISSUE SOURCE reaches a client older than
+    /// ISSUE_SOURCES_PROTOCOL without the field it cannot decode, and a
+    /// current one keeps it.
+    #[test]
+    fn an_older_client_gets_agent_rows_without_their_source_issue() {
+        let event = |source_issue| ServerEvent::EntityUpserted {
+            entity: Entity::Agent(Agent {
+                id: AgentId("a".into()),
+                worktree_id: WorktreeId("w".into()),
+                name: "issue".into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                status_changed_at: 0,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                issue_url: None,
+                role: AgentRole::Worker,
+                sort_order: 0,
+                alive: false,
+                recent_prompts: Vec::new(),
+                source_issue,
+            }),
+        };
+        let issue = Some(Box::new(crate::SourceIssue {
+            id: "ENG-1".into(),
+            source: "/opt/bin/issues".into(),
+        }));
+        let mut old = event(issue.clone());
+        old.for_peer(ISSUE_SOURCES_PROTOCOL - 1);
+        assert!(
+            matches!(&old, ServerEvent::EntityUpserted { entity: Entity::Agent(a) } if a.source_issue.is_none())
+        );
+        let mut new = event(issue);
+        new.for_peer(ISSUE_SOURCES_PROTOCOL);
+        assert!(
+            matches!(&new, ServerEvent::EntityUpserted { entity: Entity::Agent(a) } if a.source_issue.is_some())
+        );
+    }
+
+    /// The bytes themselves, both ways, against protocol 50's shapes copied
+    /// here: compact MessagePack frames are arrays, so an extra trailing
+    /// element is a LengthMismatch for the older peer — `#[serde(default)]`
+    /// alone covers only the newer peer reading an older frame.
+    #[test]
+    fn issue_source_fields_decode_across_protocol_50_and_51() {
+        use serde::{Deserialize, Serialize};
+        #[derive(Debug, Serialize, Deserialize)]
+        struct AgentV50 {
+            id: AgentId,
+            worktree_id: WorktreeId,
+            name: String,
+            status: AgentStatus,
+            archived: bool,
+            #[serde(default)]
+            archived_at: i64,
+            #[serde(default)]
+            unseen: bool,
+            #[serde(default)]
+            status_changed_at: i64,
+            #[serde(default)]
+            kind: AgentKind,
+            #[serde(default)]
+            custom_harness: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            effort: Option<String>,
+            session_id: Option<String>,
+            #[serde(default)]
+            cloud_session_id: Option<String>,
+            #[serde(default)]
+            issue_url: Option<String>,
+            #[serde(default)]
+            role: AgentRole,
+            sort_order: i64,
+            alive: bool,
+            #[serde(default)]
+            recent_prompts: Vec<crate::PromptEntry>,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        enum EntityV50 {
+            Agent(AgentV50),
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        enum EventV50 {
+            EntityUpserted { entity: EntityV50 },
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        enum RequestV50 {
+            CreateAgent {
+                req_id: u64,
+                worktree: WorktreeId,
+                name: String,
+                kind: AgentKind,
+                #[serde(default)]
+                custom_harness: Option<String>,
+                model: Option<String>,
+                effort: Option<String>,
+                auto_title: bool,
+                #[serde(default)]
+                cloud_prompt: Option<String>,
+                #[serde(default)]
+                starting_prompt: Option<String>,
+                #[serde(default)]
+                issue_url: Option<String>,
+                #[serde(default)]
+                role: AgentRole,
+            },
+        }
+        let agent = |source_issue| Agent {
+            id: AgentId("a".into()),
+            worktree_id: WorktreeId("w".into()),
+            name: "issue".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            status_changed_at: 0,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            issue_url: Some("https://tracker.example/ENG-1".into()),
+            role: AgentRole::Worker,
+            sort_order: 0,
+            alive: false,
+            recent_prompts: Vec::new(),
+            source_issue,
+        };
+        let issue = Some(Box::new(crate::SourceIssue {
+            id: "ENG-1".into(),
+            source: "/opt/bin/issues".into(),
+        }));
+        let upserted = |agent| ServerEvent::EntityUpserted {
+            entity: Entity::Agent(agent),
+        };
+
+        // 51 → 50: a row with an issue doesn't decode as sent, and does
+        // once `for_peer` has fitted it to that client.
+        let as_sent = rmp_serde::to_vec(&upserted(agent(issue.clone()))).unwrap();
+        assert!(rmp_serde::from_slice::<EventV50>(&as_sent).is_err());
+        let mut fitted = upserted(agent(issue.clone()));
+        fitted.for_peer(ISSUE_SOURCES_PROTOCOL - 1);
+        let fitted = rmp_serde::to_vec(&fitted).unwrap();
+        let EventV50::EntityUpserted {
+            entity: EntityV50::Agent(old),
+        } = rmp_serde::from_slice(&fitted).unwrap();
+        assert_eq!(
+            old.issue_url.as_deref(),
+            Some("https://tracker.example/ENG-1")
+        );
+        // A row with no issue was always decodable.
+        let plain = rmp_serde::to_vec(&upserted(agent(None))).unwrap();
+        rmp_serde::from_slice::<EventV50>(&plain).unwrap();
+
+        // 50 → 51: an older daemon's row decodes with no issue.
+        let ServerEvent::EntityUpserted {
+            entity: Entity::Agent(new),
+        } = rmp_serde::from_slice(&fitted).unwrap()
+        else {
+            panic!("an agent upsert");
+        };
+        assert!(new.source_issue.is_none());
+        // And a 51 row keeps it, end to end.
+        let ServerEvent::EntityUpserted {
+            entity: Entity::Agent(new),
+        } = rmp_serde::from_slice(&as_sent).unwrap()
+        else {
+            panic!("an agent upsert");
+        };
+        assert_eq!(new.source_issue, issue);
+
+        let create = |issue_id: Option<&str>| ClientRequest::CreateAgent {
+            req_id: 1,
+            worktree: WorktreeId("w".into()),
+            name: "issue".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: true,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+            role: AgentRole::Worker,
+            issue_id: issue_id.map(String::from),
+            issue_source: issue_id.map(|_| "/opt/bin/issues".to_string()),
+        };
+        // A create with no source issue is protocol 50's frame, byte for
+        // byte; one with an issue is not (the TUI holds it back from such a
+        // daemon instead).
+        let plain = rmp_serde::to_vec(&create(None)).unwrap();
+        let old = RequestV50::CreateAgent {
+            req_id: 1,
+            worktree: WorktreeId("w".into()),
+            name: "issue".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: true,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+            role: AgentRole::Worker,
+        };
+        assert_eq!(plain, rmp_serde::to_vec(&old).unwrap());
+        rmp_serde::from_slice::<RequestV50>(&plain).unwrap();
+        let with_issue = rmp_serde::to_vec(&create(Some("ENG-1"))).unwrap();
+        assert!(rmp_serde::from_slice::<RequestV50>(&with_issue).is_err());
+        // An older TUI's create decodes here with no issue.
+        let ClientRequest::CreateAgent {
+            issue_id,
+            issue_source,
+            ..
+        } = rmp_serde::from_slice(&rmp_serde::to_vec(&old).unwrap()).unwrap()
+        else {
+            panic!("a create");
+        };
+        assert_eq!((issue_id, issue_source), (None, None));
+    }
 
     #[test]
     fn protocol_ranges_overlap_when_either_side_is_additive() {
