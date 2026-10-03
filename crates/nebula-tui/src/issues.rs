@@ -301,6 +301,19 @@ pub struct IssuesView {
     /// view rides a `Comment` answer, and two text fields would make that
     /// variant several times the others' size.
     pub editor: Option<Box<IssueEditor>>,
+    /// LABEL COMPLETION: which suggestion is highlighted while the caret
+    /// ends a `label:` word ([`label_completion`]), back to the first on
+    /// every edit.
+    pub suggestion: usize,
+    /// Esc closed the suggestions for the word being typed; the next edit
+    /// opens them again.
+    pub suggestions_closed: bool,
+    /// The suggestions' rows as last drawn, for clicks; `Rect::default()`
+    /// while none are up.
+    pub suggestions_area: Rect,
+    /// Whether suggestions were up at the last draw, so the footer can
+    /// name their keys.
+    pub completing: bool,
 }
 
 impl IssuesView {
@@ -320,6 +333,10 @@ impl IssuesView {
             query: TextInput::new(),
             cursor_row: 0,
             editor: None,
+            suggestion: 0,
+            suggestions_closed: false,
+            suggestions_area: Rect::default(),
+            completing: false,
         }
     }
 
@@ -1313,6 +1330,153 @@ fn step(app: &mut App, delta: i64) {
     }
 }
 
+// ---- label completion ----
+
+/// The most suggestions shown at once.
+const MAX_SUGGESTIONS: usize = 8;
+
+/// What LABEL COMPLETION offers for the word the caret ends: the byte
+/// range of that `label:` word in the query, and the labels that could
+/// finish it, with how many of the rows the rest of the filter leaves
+/// carry each.
+#[derive(Debug, PartialEq, Eq)]
+struct Completion {
+    word: std::ops::Range<usize>,
+    labels: Vec<(String, usize)>,
+}
+
+/// LABEL COMPLETION for `query` with the caret `caret` chars in: when the
+/// caret ends a word that starts `label:` (any case; `label:"` for a
+/// quoted name), the labels on the rows the rest of the filter leaves
+/// whose name contains what follows the colon — names that start with it
+/// first, then the most used, then by name — leaving out a name already
+/// typed in full. None anywhere else, so ordinary typing never sees it.
+fn label_completion(query: &str, caret: usize, list: &[Issue]) -> Option<Completion> {
+    const KEY: &str = "label:";
+    let end = query
+        .char_indices()
+        .nth(caret)
+        .map_or(query.len(), |(i, _)| i);
+    if query[end..]
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace())
+    {
+        return None;
+    }
+    // An unclosed `label:"` reaches back past the spaces in its name;
+    // anything else is the word since the last space.
+    let before = &query[..end];
+    let quoted = before
+        .to_ascii_lowercase()
+        .rfind("label:\"")
+        .filter(|&i| !before[i + KEY.len() + 1..].contains('"'));
+    let start = quoted.unwrap_or_else(|| {
+        before.rfind(char::is_whitespace).map_or(0, |i| {
+            i + before[i..].chars().next().map_or(1, char::len_utf8)
+        })
+    });
+    let word = &query[start..end];
+    let head = word.get(..KEY.len())?;
+    if !head.eq_ignore_ascii_case(KEY) {
+        return None;
+    }
+    let typed = word[KEY.len()..].trim_start_matches('"').to_lowercase();
+    let rest = format!("{} {}", &query[..start], &query[end..]);
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (i, _) in visible_rows(&rest, list) {
+        for label in &list[i].labels {
+            match counts.iter_mut().find(|(name, _)| name == label) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((label.clone(), 1)),
+            }
+        }
+    }
+    counts.retain(|(name, _)| {
+        let name = name.to_lowercase();
+        name.contains(&typed) && name != typed
+    });
+    counts.sort_by(|a, b| {
+        let starts = |n: &str| !n.to_lowercase().starts_with(&typed);
+        starts(&a.0)
+            .cmp(&starts(&b.0))
+            .then(b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    counts.truncate(MAX_SUGGESTIONS);
+    (!counts.is_empty()).then_some(Completion {
+        word: start..end,
+        labels: counts,
+    })
+}
+
+/// The suggestions the modal shows right now — None when the caret ends no
+/// `label:` word, nothing matches, or Esc closed them.
+fn current_completion(app: &App) -> Option<Completion> {
+    let Some(Overlay::Issues(view)) = &app.overlay else {
+        return None;
+    };
+    if view.suggestions_closed || view.editor.is_some() {
+        return None;
+    }
+    let list = app
+        .issues
+        .get(&view.project)
+        .map_or(&[][..], |l| l.list.as_slice());
+    label_completion(&view.query, view.query.cursor_chars(), list)
+}
+
+/// Finish the `label:` word with the highlighted suggestion — quoted when
+/// the name has a space — and a space after it, ready for the next word.
+fn complete_label(app: &mut App, completion: &Completion) {
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return;
+    };
+    let index = view.suggestion.min(completion.labels.len() - 1);
+    let name = &completion.labels[index].0;
+    let term = if name.contains(char::is_whitespace) {
+        format!("label:\"{name}\" ")
+    } else {
+        format!("label:{name} ")
+    };
+    let query = view.query.as_str();
+    let after = query[completion.word.end..].trim_start();
+    let text = format!("{}{term}{after}", &query[..completion.word.start]);
+    let caret = query[..completion.word.start].chars().count() + term.chars().count();
+    view.query.set_text(text);
+    view.query.set_cursor_chars(caret);
+    view.suggestion = 0;
+    query_changed(app);
+}
+
+/// Keys LABEL COMPLETION takes while its suggestions are up: Tab or Enter
+/// finishes the word (Enter would otherwise launch an agent on whatever
+/// row the half-typed filter left), ↑/↓ and Ctrl+n/p choose, Esc closes
+/// them. False for every other key, which the filter handles as ever.
+fn handle_completion_key(app: &mut App, key: &KeyEvent) -> bool {
+    let Some(completion) = current_completion(app) else {
+        return false;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let last = completion.labels.len() - 1;
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Tab if !shift => complete_label(app, &completion),
+        KeyCode::Enter => complete_label(app, &completion),
+        KeyCode::Down => view.suggestion = (view.suggestion + 1).min(last),
+        KeyCode::Up => view.suggestion = view.suggestion.saturating_sub(1),
+        KeyCode::Char('n') if ctrl => view.suggestion = (view.suggestion + 1).min(last),
+        KeyCode::Char('p') if ctrl => view.suggestion = view.suggestion.saturating_sub(1),
+        KeyCode::Esc => view.suggestions_closed = true,
+        _ => return false,
+    }
+    app.dirty = true;
+    true
+}
+
 /// The filter's text changed: the cursor goes to its best match — the
 /// pane rewinds onto it and its comments are asked for, as any move does
 /// — or stays where it is once nothing is typed, so the row just found
@@ -1320,6 +1484,10 @@ fn step(app: &mut App, delta: i64) {
 /// filter nothing matches moves nothing: the list says so, the pane has
 /// no row to read, and the next letter or Backspace decides.
 fn query_changed(app: &mut App) {
+    if let Some(Overlay::Issues(view)) = &mut app.overlay {
+        view.suggestion = 0;
+        view.suggestions_closed = false;
+    }
     let Some(Overlay::Issues(view)) = &app.overlay else {
         return;
     };
@@ -1489,6 +1657,8 @@ pub(crate) fn paste(app: &mut App, text: &str) -> bool {
 pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
     if view.editor.is_some() {
         "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
+    } else if view.completing {
+        "Tab/Enter: complete the label  ↑/↓ ^n/^p: choose  Esc: close the suggestions"
     } else {
         "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c/^y: comment  ^o: browser  ^r: refresh  Esc: clear / close"
     }
@@ -1605,6 +1775,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         handle_editor_key(app, key);
         return;
     }
+    if handle_completion_key(app, &key) {
+        return;
+    }
     let Some(Overlay::Issues(view)) = &mut app.overlay else {
         return;
     };
@@ -1685,6 +1858,24 @@ pub(crate) fn handle_mouse(
         }
         app.dirty = true;
         return;
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        let over = match &app.overlay {
+            Some(Overlay::Issues(v)) if v.suggestions_area.contains(mouse_pos) => {
+                Some((mouse_pos.y - v.suggestions_area.y) as usize)
+            }
+            _ => None,
+        };
+        if let (Some(row), Some(completion)) = (over, current_completion(app)) {
+            if row < completion.labels.len() {
+                if let Some(Overlay::Issues(v)) = &mut app.overlay {
+                    v.suggestion = row;
+                }
+                complete_label(app, &completion);
+            }
+            app.dirty = true;
+            return;
+        }
     }
     let Some(Overlay::Issues(view)) = &mut app.overlay else {
         return;
@@ -1964,6 +2155,28 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         render_row(f, row_area, spans, Some(*index) == cursor, list_focused, th);
     }
 
+    // LABEL COMPLETION over the rows, under the word it would finish.
+    let completion = if view.suggestions_closed || view.editor.is_some() {
+        None
+    } else {
+        label_completion(&view.query, view.query.cursor_chars(), &rows)
+    };
+    let suggestions_area = match &completion {
+        Some(completion) => draw_suggestions(
+            f,
+            list_inner,
+            view.query.as_str()[..completion.word.start].chars().count(),
+            completion,
+            view.suggestion,
+            th,
+        ),
+        None => Rect::default(),
+    };
+    if let Some(Overlay::Issues(v)) = &mut app.overlay {
+        v.suggestions_area = suggestions_area;
+        v.completing = completion.is_some();
+    }
+
     // ---- right: the editor, while it is up ----
     if let Some(editor) = &view.editor {
         let (title_area, body_area, body_view) = draw_editor(f, body_a, editor, th);
@@ -2050,6 +2263,68 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         }
         v.scroll = scroll;
     }
+}
+
+/// LABEL COMPLETION's suggestions: a box hung under the filter row, its
+/// left edge under the `label:` word (pulled in to fit), one label per
+/// row with how many of the listed issues carry it, the highlighted one
+/// lit. Returns the rows' rect for clicks.
+fn draw_suggestions(
+    f: &mut Frame,
+    list_inner: Rect,
+    word_col: usize,
+    completion: &Completion,
+    selected: usize,
+    th: Theme,
+) -> Rect {
+    let widest = completion
+        .labels
+        .iter()
+        .map(|(name, n)| name.chars().count() + n.to_string().len() + 3)
+        .max()
+        .unwrap_or(0);
+    let w = (widest as u16 + 2).clamp(18, list_inner.width.max(1));
+    let h = (completion.labels.len() as u16 + 2).min(list_inner.height.saturating_sub(1));
+    if h < 3 {
+        return Rect::default();
+    }
+    let x = (list_inner.x + word_col as u16).min(list_inner.right().saturating_sub(w));
+    let area = Rect {
+        x,
+        y: list_inner.y + 1,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.accent));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let budget = inner.width as usize;
+    for (i, (name, count)) in completion.labels.iter().enumerate() {
+        let Some(row_area) = row_rect(inner, i) else {
+            break;
+        };
+        let count = count.to_string();
+        let shown = truncate(name, budget.saturating_sub(count.len() + 2));
+        let used = shown.chars().count();
+        let spans = vec![
+            Span::raw(format!(" {shown}")),
+            Span::raw(" ".repeat(budget.saturating_sub(used + count.len() + 2))),
+            Span::styled(count, Style::default().fg(th.dim)),
+        ];
+        render_row(
+            f,
+            row_area,
+            spans,
+            i == selected.min(completion.labels.len() - 1),
+            true,
+            th,
+        );
+    }
+    inner
 }
 
 /// The reading pane as the form: the title on the first row, the
@@ -3722,5 +3997,169 @@ mod tests {
             .map(|&p| list[*i].label().chars().nth(p).unwrap())
             .collect();
         assert_eq!(lit.to_lowercase(), "linux", "the text part is what lights");
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_key(
+                app,
+                key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+    }
+
+    fn tagged_rows() -> Vec<Issue> {
+        let tagged = |n: u64, title: &str, labels: &[&str]| Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, title)
+        };
+        vec![
+            tagged(15, "Fix login redirect", &["bug", "browser-plugin", "plan"]),
+            tagged(14, "Docs pass", &["documentation", "plan"]),
+            tagged(13, "Login on Linux", &["bug", "plugin-sdk", "plan"]),
+            tagged(12, "Good first one", &["good first issue"]),
+        ]
+    }
+
+    fn names(c: &Option<Completion>) -> Vec<String> {
+        c.as_ref()
+            .map(|c| c.labels.iter().map(|(n, k)| format!("{n} {k}")).collect())
+            .unwrap_or_default()
+    }
+
+    fn at_end(q: &str) -> usize {
+        q.chars().count()
+    }
+
+    /// Suggestions come only while the caret ends a `label:` word: names
+    /// containing what is typed, those starting with it first, counted
+    /// over the rows the rest of the filter leaves, a name typed in full
+    /// left out.
+    #[test]
+    fn completion_offers_labels_for_the_word_the_caret_ends() {
+        let rows = tagged_rows();
+        let q = "label:pl";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            ["plan 3", "plugin-sdk 1", "browser-plugin 1"]
+        );
+        let q = "linux LABEL:pl";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            ["plan 1", "plugin-sdk 1"],
+            "counted over what the rest of the filter leaves"
+        );
+        let q = "label:";
+        assert_eq!(
+            label_completion(q, at_end(q), &rows).unwrap().labels.len(),
+            6
+        );
+        let q = "label:plan";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            Vec::<String>::new()
+        );
+        let q = "label:\"good f";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            ["good first issue 1"]
+        );
+        // Nowhere else: plain text, a caret inside a word, after a space.
+        assert!(label_completion("plan", 4, &rows).is_none());
+        assert!(label_completion("label:pl", 7, &rows).is_none());
+        assert!(label_completion("label:pl ", 9, &rows).is_none());
+        let q = "label:pl login";
+        let c = label_completion(q, 8, &rows).expect("the caret ends the label word");
+        assert_eq!(c.word, 0..8);
+    }
+
+    /// Tab finishes the word and leaves a space for the next; ↓ chooses;
+    /// Enter finishes too instead of launching an agent; text after the
+    /// word is kept.
+    #[test]
+    fn tab_and_enter_finish_the_label_word() {
+        let (mut app, _) = modal_with(tagged_rows());
+        typed(&mut app, "label:pl");
+        assert!(current_completion(&app).is_some());
+        handle_key(
+            &mut app,
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(issues_view(&app).query.as_str(), "label:plan ");
+        assert!(current_completion(&app).is_none(), "the word is done");
+
+        typed(&mut app, "label:pl");
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).query.as_str(),
+            "label:plan label:plugin-sdk "
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Issues(_))),
+            "Enter completed rather than launching: {:?}",
+            app.overlay
+        );
+        assert_eq!(cursor_number(&app), Some(13));
+
+        if let Some(Overlay::Issues(view)) = &mut app.overlay {
+            view.query.set_text("label:goo first");
+            view.query.set_cursor_chars(9);
+        }
+        handle_key(
+            &mut app,
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).query.as_str(),
+            "label:\"good first issue\" first"
+        );
+    }
+
+    /// Esc closes the suggestions without touching the filter; the next
+    /// letter brings them back, and with none up Esc clears as before.
+    #[test]
+    fn esc_closes_the_suggestions_first() {
+        let (mut app, _) = modal_with(tagged_rows());
+        typed(&mut app, "label:b");
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc, &mut Vec::new());
+        assert!(current_completion(&app).is_none());
+        assert_eq!(issues_view(&app).query.as_str(), "label:b");
+        typed(&mut app, "u");
+        assert_eq!(names(&current_completion(&app)), ["bug 2"]);
+        handle_key(&mut app, esc, &mut Vec::new());
+        handle_key(&mut app, esc, &mut Vec::new());
+        assert_eq!(issues_view(&app).query.as_str(), "", "the filter's own Esc");
+    }
+
+    /// A click on a suggestion finishes the word with it, as Tab does.
+    #[test]
+    fn clicking_a_suggestion_finishes_the_word() {
+        let (mut app, _) = modal_with(tagged_rows());
+        typed(&mut app, "label:pl");
+        if let Some(Overlay::Issues(view)) = &mut app.overlay {
+            view.suggestions_area = Rect::new(10, 4, 20, 3);
+        }
+        let at = Position::new(12, 5);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(issues_view(&app).query.as_str(), "label:plugin-sdk ");
     }
 }
