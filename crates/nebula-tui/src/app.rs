@@ -171,6 +171,11 @@ pub enum HitTarget {
     /// map: it is what `hover_crumb` holds while the pointer rests on the
     /// button (`ui::browser_button_under`), so the draw can underline it.
     ModalBrowser,
+    /// A label on the ISSUES MODAL's LABEL BAR (the label, or a chip's
+    /// term as typed): what `hover_crumb` holds while the pointer rests on
+    /// it (`issues::bar_item_under`), so the draw can underline it. Like
+    /// `ModalBrowser`, never in the hit map.
+    IssueLabel(String),
 }
 
 /// Default outer width of the diff modal's file-list panel.
