@@ -19812,6 +19812,11 @@ fn drawn_modal_area(app: &mut App) -> ratatui::layout::Rect {
     terminal.draw(|f| ui::draw(f, app)).unwrap();
     let overlay = app.modals.overlay.as_ref().expect("no modal open");
     let area = crate::overlay_close::overlay_area(overlay);
+    // JUMP MODE has no box: its labels lie over the whole frame, and
+    // any press puts them away (`handle_mouse`).
+    if matches!(overlay, Overlay::Jump(_)) {
+        return area;
+    }
     assert!(area.width > 0 && area.x > 0 && area.y > 0, "{area:?}");
     area
 }
@@ -20809,6 +20814,24 @@ fn every_overlay() -> Vec<(&'static str, fn(&mut App), Option<&'static str>)> {
             },
             Some("Prompt"),
         ),
+        (
+            // Labels over the frame the grid last drew, so the opener
+            // draws one first.
+            "Jump",
+            |app| {
+                seed_tree(app);
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 34)).unwrap();
+                term.draw(|f| crate::ui::draw(f, app)).unwrap();
+                press(
+                    app,
+                    KeyCode::Char('\''),
+                    KeyModifiers::NONE,
+                    &mut Vec::new(),
+                );
+            },
+            None,
+        ),
     ]
 }
 
@@ -20947,6 +20970,7 @@ fn overlay_label(overlay: &Overlay) -> &'static str {
         Overlay::BranchSwitch(_) => "BranchSwitch",
         Overlay::Review(_) => "Review",
         Overlay::ProjectPicker(_) => "ProjectPicker",
+        Overlay::Jump(_) => "Jump",
     }
 }
 
@@ -20976,7 +21000,7 @@ fn the_overlay_table_covers_every_variant_exactly_once() {
         let mut unique = seen.clone();
         unique.dedup();
         assert_eq!(unique, seen, "two rows for the same variant");
-        assert_eq!(seen.len(), 19, "a variant came or went: {seen:?}");
+        assert_eq!(seen.len(), 20, "a variant came or went: {seen:?}");
     });
 }
 

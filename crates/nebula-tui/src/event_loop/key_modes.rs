@@ -294,6 +294,7 @@ fn handle_global_action(
         | Action::ToggleFullScreen
         | Action::PaneTabs
         | Action::ProjectDropdown
+        | Action::Jump
         | Action::NextProjectTab
         | Action::PrevProjectTab
         | Action::CloseProjectTab
@@ -410,6 +411,12 @@ fn handle_navigation_action(
         | Action::CloseProjectTab
         | Action::SelectProjectTab(_)
         | Action::ProjectDropdown => app.chrome.flash = Some(launcher::NO_TABS_HERE.into()),
+        // JUMP MODE labels the grid. The cards take the key themselves
+        // (`launcher::handle_action`); the COLUMNS layout, which skips that,
+        // has its rows labelled here. Over a full-screen session there is
+        // no grid to label.
+        Action::Jump if app.launcher_grid() => jump::open(app),
+        Action::Jump => app.chrome.flash = Some("jump labels the grid — ^q back to it".into()),
         Action::MoveDown => move_selection(app, 1, out),
         Action::MoveUp => move_selection(app, -1, out),
         // Ctrl+d / Ctrl+u jump the cursor half a panel at a time in the
