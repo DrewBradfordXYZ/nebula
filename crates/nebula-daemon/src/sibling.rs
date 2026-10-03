@@ -86,6 +86,8 @@ impl Daemon {
             starting_prompt: Some(starting_prompt.to_string()),
             pr_url: None,
             issue_url: None,
+            issue_id: None,
+            issue_source: None,
         })
     }
 
@@ -163,6 +165,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         }
     }

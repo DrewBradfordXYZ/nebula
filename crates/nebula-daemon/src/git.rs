@@ -516,6 +516,22 @@ async fn track_pr_ref(repo: &Path, branch: &str, pr_ref: &str) {
     }
 }
 
+/// Every value of a multi-valued git config key for `repo`, in git's
+/// order (system, global, then the repo's own) — empty when the key is
+/// unset or git is missing. Blank values are dropped.
+pub async fn config_get_all(repo: &Path, key: &str) -> Vec<String> {
+    git(repo, &["config", "--get-all", key])
+        .await
+        .map(|v| {
+            v.lines()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One git config value for `repo`, resolved the way git resolves it —
 /// the repo's own `.git/config`, then the user's global file, then the
 /// system's — or None when the key is unset (git exits 1 with nothing on

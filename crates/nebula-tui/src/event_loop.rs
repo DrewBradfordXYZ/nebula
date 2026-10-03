@@ -3603,21 +3603,21 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
 
         PromptKind::IssueComment { issue, .. } => {
             let title = if issue.title.trim().is_empty() {
-                format!("Comment on issue #{}", issue.number)
+                format!("Comment on issue {}", issue.tag())
             } else {
                 format!(
-                    "Comment on issue #{} · {}",
-                    issue.number,
+                    "Comment on issue {} · {}",
+                    issue.tag(),
                     crate::ui::truncate(issue.title.trim(), 40)
                 )
             };
+            let how = match issue.origin {
+                crate::issues::Origin::GitHub => "posted as you, with gh issue comment",
+                crate::issues::Origin::Source => "posted with the issue source's comment",
+            };
             (
                 title.into(),
-                format!(
-                    "what do you want to say on #{}? (posted as you, with gh issue comment)",
-                    issue.number
-                )
-                .into(),
+                format!("what do you want to say on {}? ({how})", issue.tag()).into(),
                 String::new(),
             )
         }
@@ -5125,11 +5125,14 @@ pub(super) fn open_pr_agent_picker(app: &mut App) {
 
 /// The CONTEXT MENU for a PROJECT ISSUES GROUP row: the browser. The
 /// launches are the row's keys (`p`, `e`), as the footer says.
-fn issue_row_menu_items(issue: &crate::issues::Issue) -> Vec<MenuItem> {
-    vec![MenuItem::new(
-        "Open in browser",
-        MenuAction::OpenLink(issue.url.clone()),
-    )]
+/// None for a source issue with no web page: there is nothing to offer.
+fn issue_row_menu_items(issue: &crate::issues::Issue) -> Option<Vec<MenuItem>> {
+    (!issue.url.is_empty()).then(|| {
+        vec![MenuItem::new(
+            "Open in browser",
+            MenuAction::OpenLink(issue.url.clone()),
+        )]
+    })
 }
 
 /// The CONTEXT MENU for a PROJECT OPEN PRS GROUP row: a PR SESSION row per
@@ -5306,7 +5309,7 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
         Focus::Worktrees => match app.selected_worktree_pr() {
             Some(pr) => Some(pr_row_menu_items(app, pr)),
             None => match app.selected_worktree_issue() {
-                Some(issue) => Some(issue_row_menu_items(issue)),
+                Some(issue) => issue_row_menu_items(issue),
                 None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
             },
         },
@@ -8306,6 +8309,8 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         reopen_on_error,
         pr,
         issue_url,
+        issue_id,
+        issue_source,
         focus_pane,
         placeholder,
         follow,
@@ -8444,6 +8449,8 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
             cloud_prompt,
             starting_prompt,
             issue_url,
+            issue_id,
+            issue_source,
         },
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
@@ -10949,6 +10956,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -10978,6 +10986,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -11734,6 +11743,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -12569,7 +12579,10 @@ mod tests {
                 list: issues
                     .iter()
                     .map(|(number, title)| crate::issues::Issue {
-                        number: *number,
+                        key: format!("https://github.com/o/r/issues/{number}"),
+                        id: number.to_string(),
+                        origin: crate::issues::Origin::GitHub,
+                        source: String::new(),
                         url: format!("https://github.com/o/r/issues/{number}"),
                         title: (*title).into(),
                         author: "webdevcody".into(),
@@ -12633,7 +12646,7 @@ mod tests {
                     WorktreeRow::Checkout(w) => w.branch.clone(),
                     WorktreeRow::Pr(pr) => format!("#{}", pr.number),
                     WorktreeRow::PrCheckout(worktree) => format!("└ {}", worktree.branch),
-                    WorktreeRow::Issue(issue) => format!("issue #{}", issue.number),
+                    WorktreeRow::Issue(issue) => format!("issue {}", issue.tag()),
                 })
                 .collect()
         };
@@ -15720,6 +15733,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: changed_at,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             }
@@ -15775,6 +15789,7 @@ diff --git a/src/c.rs b/src/c.rs
                 status_changed_at: at,
                 alive: true,
                 issue_url: None,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -15857,6 +15872,7 @@ diff --git a/src/c.rs b/src/c.rs
                 status_changed_at: at,
                 alive: true,
                 issue_url: None,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -15917,6 +15933,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -15985,6 +16002,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -18188,6 +18206,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -18713,6 +18732,7 @@ diff --git a/src/c.rs b/src/c.rs
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         })
     }
@@ -20200,6 +20220,7 @@ diff --git a/src/c.rs b/src/c.rs
             status_changed_at: 0,
             alive: true,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         };
 
@@ -20391,6 +20412,7 @@ diff --git a/src/c.rs b/src/c.rs
             status_changed_at: at,
             alive: true,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         })
     }
@@ -22120,6 +22142,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -22145,6 +22168,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -22458,6 +22482,7 @@ diff --git a/src/c.rs b/src/c.rs
             status_changed_at: 500,
             alive: true,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         };
         for a in [
@@ -22915,6 +22940,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -25129,6 +25155,7 @@ diff --git a/src/c.rs b/src/c.rs
                         status_changed_at: 0,
                         alive: true,
                         issue_url: None,
+                        source_issue: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -25202,6 +25229,7 @@ diff --git a/src/c.rs b/src/c.rs
             status_changed_at: 0,
             alive: true,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         })
     }
@@ -25824,6 +25852,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -25891,6 +25920,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 0,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -26445,7 +26475,10 @@ diff --git a/src/c.rs b/src/c.rs
             "/nonexistent/nebula-issue-comment-box".into(),
         )));
         let issue = |number: u64| crate::issues::Issue {
-            number,
+            key: format!("https://github.com/o/r/issues/{number}"),
+            id: number.to_string(),
+            origin: crate::issues::Origin::GitHub,
+            source: String::new(),
             url: format!("https://github.com/o/r/issues/{number}"),
             title: format!("issue {number}"),
             author: "webdevcody".into(),
@@ -26458,7 +26491,10 @@ diff --git a/src/c.rs b/src/c.rs
             &mut app,
             crate::issues::IssuesAnswer::List {
                 project,
-                list: Some(vec![issue(15), issue(14)]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Some(vec![issue(15), issue(14)]),
+                )],
             },
         );
         press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -26544,16 +26580,22 @@ diff --git a/src/c.rs b/src/c.rs
                     &mut app,
                     crate::issues::IssuesAnswer::List {
                         project,
-                        list: Some(vec![crate::issues::Issue {
-                            number: 15,
-                            url: "https://github.com/o/r/issues/15".into(),
-                            title: "Login fails".into(),
-                            author: "webdevcody".into(),
-                            created_at: "2026-09-10T12:00:00Z".into(),
-                            updated_at: "2026-09-11T12:00:00Z".into(),
-                            labels: vec![],
-                            body: String::new(),
-                        }]),
+                        lists: vec![(
+                            crate::issues::IssueSource::GitHub,
+                            Some(vec![crate::issues::Issue {
+                                key: "https://github.com/o/r/issues/15".into(),
+                                id: "15".into(),
+                                origin: crate::issues::Origin::GitHub,
+                                source: String::new(),
+                                url: "https://github.com/o/r/issues/15".into(),
+                                title: "Login fails".into(),
+                                author: "webdevcody".into(),
+                                created_at: "2026-09-10T12:00:00Z".into(),
+                                updated_at: "2026-09-11T12:00:00Z".into(),
+                                labels: vec![],
+                                body: String::new(),
+                            }]),
+                        )],
                     },
                 );
                 press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -26598,7 +26640,10 @@ diff --git a/src/c.rs b/src/c.rs
                 "/tmp/demo".into(),
             )));
             let issue = |number: u64| crate::issues::Issue {
-                number,
+                key: format!("https://github.com/o/r/issues/{number}"),
+                id: number.to_string(),
+                origin: crate::issues::Origin::GitHub,
+                source: String::new(),
                 url: format!("https://github.com/o/r/issues/{number}"),
                 title: format!("issue {number}"),
                 author: "webdevcody".into(),
@@ -26611,7 +26656,10 @@ diff --git a/src/c.rs b/src/c.rs
                 &mut app,
                 crate::issues::IssuesAnswer::List {
                     project,
-                    list: Some(vec![issue(15), issue(14)]),
+                    lists: vec![(
+                        crate::issues::IssueSource::GitHub,
+                        Some(vec![issue(15), issue(14)]),
+                    )],
                 },
             );
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -26696,6 +26744,7 @@ diff --git a/src/c.rs b/src/c.rs
                         status_changed_at: crate::app::now_ms(),
                         alive: true,
                         issue_url: None,
+                        source_issue: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -26736,7 +26785,10 @@ diff --git a/src/c.rs b/src/c.rs
                 "/tmp/demo".into(),
             )));
             let issue = |number: u64| crate::issues::Issue {
-                number,
+                key: format!("https://github.com/o/r/issues/{number}"),
+                id: number.to_string(),
+                origin: crate::issues::Origin::GitHub,
+                source: String::new(),
                 url: format!("https://github.com/o/r/issues/{number}"),
                 title: format!("issue {number}"),
                 author: "webdevcody".into(),
@@ -26749,7 +26801,10 @@ diff --git a/src/c.rs b/src/c.rs
                 &mut app,
                 crate::issues::IssuesAnswer::List {
                     project,
-                    list: Some(vec![issue(15), issue(14)]),
+                    lists: vec![(
+                        crate::issues::IssueSource::GitHub,
+                        Some(vec![issue(15), issue(14)]),
+                    )],
                 },
             );
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -26912,16 +26967,22 @@ diff --git a/src/c.rs b/src/c.rs
                 &mut app,
                 crate::issues::IssuesAnswer::List {
                     project,
-                    list: Some(vec![crate::issues::Issue {
-                        number: 15,
-                        url: "https://github.com/o/r/issues/15".into(),
-                        title: "Fix login redirect".into(),
-                        author: "webdevcody".into(),
-                        created_at: "2026-09-10T12:00:00Z".into(),
-                        updated_at: "2026-09-11T12:00:00Z".into(),
-                        labels: vec![],
-                        body: String::new(),
-                    }]),
+                    lists: vec![(
+                        crate::issues::IssueSource::GitHub,
+                        Some(vec![crate::issues::Issue {
+                            key: "https://github.com/o/r/issues/15".into(),
+                            id: "15".into(),
+                            origin: crate::issues::Origin::GitHub,
+                            source: String::new(),
+                            url: "https://github.com/o/r/issues/15".into(),
+                            title: "Fix login redirect".into(),
+                            author: "webdevcody".into(),
+                            created_at: "2026-09-10T12:00:00Z".into(),
+                            updated_at: "2026-09-11T12:00:00Z".into(),
+                            labels: vec![],
+                            body: String::new(),
+                        }]),
+                    )],
                 },
             );
             let fresh = |app: &App| match &app.overlay {
@@ -26951,7 +27012,7 @@ diff --git a/src/c.rs b/src/c.rs
                 "{:?}",
                 launch.target
             );
-            assert_eq!(launch.issue.as_ref().map(|i| i.number), Some(15));
+            assert_eq!(launch.issue.as_ref().map(|i| i.id.as_str()), Some("15"));
             assert!(matches!(
                 &launch.under,
                 Some(crate::quick_prompt::ModalUnder::Issues(_))
@@ -28125,6 +28186,7 @@ diff --git a/src/c.rs b/src/c.rs
                         status_changed_at: 0,
                         alive: true,
                         issue_url: None,
+                        source_issue: None,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -28998,6 +29060,8 @@ diff --git a/src/c.rs b/src/c.rs
                             cloud_prompt: None,
                             starting_prompt: None,
                             issue_url: None,
+                            issue_id: None,
+                            issue_source: None,
                             ..
                         },
                         ClientRequest::PrewarmAgent { .. }
@@ -30047,6 +30111,7 @@ diff --git a/src/c.rs b/src/c.rs
                     status_changed_at: 1,
                     alive: true,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },

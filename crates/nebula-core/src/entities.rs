@@ -178,6 +178,17 @@ pub struct Worktree {
     pub sort_order: i64,
 }
 
+/// An issue from one of a project's ISSUE SOURCES (`git config
+/// nebula.issueSource`), as an ISSUE SESSION carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceIssue {
+    /// Its id there: `ENG-123`, `e6c61bf`.
+    pub id: String,
+    /// The source program that listed it, as git config named it at
+    /// launch — so a project with several sources knows which to ask.
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: AgentId,
@@ -232,6 +243,13 @@ pub struct Agent {
     /// issue in the browser.
     #[serde(default)]
     pub issue_url: Option<String>,
+    /// The issue when the session was started from an ISSUE SOURCE beside
+    /// GitHub — None for a GitHub issue, whose number rides `issue_url`,
+    /// and for every other row. A source's issue may have no web page, so
+    /// `issue_url` can be None while this is set. Boxed: most rows have
+    /// none, and every row is an [`Entity`].
+    #[serde(default)]
+    pub source_issue: Option<Box<SourceIssue>>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
@@ -257,6 +275,16 @@ impl Agent {
     /// path) — None for every other row.
     pub fn issue_number(&self) -> Option<u64> {
         url_number_after(self.issue_url.as_deref()?, "/issues/")
+    }
+
+    /// How the card names the issue this ISSUE SESSION was started from:
+    /// `#15` for a GitHub issue, the source's own id (`ENG-123`) for any
+    /// other ISSUE SOURCE's — None for every other row.
+    pub fn issue_label(&self) -> Option<String> {
+        match &self.source_issue {
+            Some(issue) => Some(issue.id.clone()),
+            None => self.issue_number().map(|n| format!("#{n}")),
+        }
     }
 }
 

@@ -17,11 +17,13 @@
 //! nothing added.
 //!
 //! The ISSUE SESSION — an AGENT launched from the ISSUES MODAL — rides the
-//! same plumbing with a different rule ([`issue_rule`]): the GitHub issue
-//! the work is for, named so the harness knows what it is fixing, in
+//! same plumbing with a different rule ([`issue_rule`]): the issue the
+//! work is for, named so the harness knows what it is fixing, in
 //! whichever checkout the launch picked (the selected worktree, or a fresh
-//! one cut for the issue). Its URL is persisted beside the PR URL and
-//! folded into the same launch prompts on every spawn.
+//! one cut for the issue). A GitHub issue is persisted as its URL beside
+//! the PR URL; an issue from any other ISSUE SOURCE (`git config
+//! nebula.issueSource`) as its id, with its URL when it has one. Either
+//! is folded into the same launch prompts on every spawn.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -76,24 +78,45 @@ pub(crate) fn rule(scope: &PrScope<'_>) -> String {
 /// SESSION works in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IssueScope<'a> {
-    pub url: &'a str,
+    pub issue: IssueOf<'a>,
     /// The worktree the session runs in.
     pub worktree: &'a Path,
     /// That worktree's branch.
     pub branch: &'a str,
 }
 
+/// Which issue an ISSUE SESSION is for, as its row persists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IssueOf<'a> {
+    /// A GitHub issue, named by its URL (`…/issues/15`).
+    GitHub(&'a str),
+    /// An issue from one of the project's ISSUE SOURCES: its id there, its
+    /// page when it has one, and the source program it came from — None
+    /// only for a row persisted without one.
+    Source {
+        id: &'a str,
+        url: Option<&'a str>,
+        program: Option<&'a str>,
+    },
+}
+
 /// The context attached to an AGENT created from the ISSUES MODAL: which
-/// GitHub issue the session exists for, so the harness reads it before
-/// acting and keeps its work — and the pull request it ends in — tied to
-/// it. Unlike the PR rule this scopes nothing else: the issue has no
-/// branch of its own yet, and the checkout is whatever the launch picked.
+/// issue the session exists for, so the harness reads it before acting
+/// and keeps its work — and the pull request it ends in — tied to it.
+/// Unlike the PR rule this scopes nothing else: the issue has no branch
+/// of its own yet, and the checkout is whatever the launch picked.
 pub(crate) fn issue_rule(scope: &IssueScope<'_>) -> String {
     let IssueScope {
-        url,
+        issue,
         worktree,
         branch,
     } = scope;
+    let url = match issue {
+        IssueOf::GitHub(url) => url,
+        IssueOf::Source { id, url, program } => {
+            return source_issue_rule(id, *url, *program, worktree, branch)
+        }
+    };
     let number = issue_number(url)
         .map(|n| format!("#{n}"))
         .unwrap_or_default();
@@ -105,6 +128,50 @@ pub(crate) fn issue_rule(scope: &IssueScope<'_>) -> String {
          commit messages, and close it from the pull request (`Closes {number}`).",
         wt = worktree.display(),
     )
+}
+
+/// [`issue_rule`] for an ISSUE SOURCE's issue. The agent reads it the way
+/// nebula does — the source program's `view` — since a tracker other than
+/// GitHub has no CLI every machine can be assumed to carry; with the key
+/// unset since the launch, the rule can only name the issue.
+fn source_issue_rule(
+    id: &str,
+    url: Option<&str>,
+    program: Option<&str>,
+    worktree: &Path,
+    branch: &str,
+) -> String {
+    let page = url.map(|url| format!(" ({url})")).unwrap_or_default();
+    let read = match program {
+        Some(program) => format!(
+            "read it first (`{} view {id}` prints it as JSON, comments included)",
+            shell_word(program)
+        ),
+        None => "read it first in the project's issue tracker".to_string(),
+    };
+    format!(
+        "[nebula] This session was created for the issue {id}{page} from the project's issue \
+         tracker. The user wants that issue investigated and fixed: {read}, then keep the work \
+         in this session to what resolves it. The session runs in the worktree at {wt} on \
+         branch `{branch}`: do every edit, test and commit there. Reference the issue ({id}) in \
+         commit messages.",
+        wt = worktree.display(),
+    )
+}
+
+/// `word` as one shell word: as is when it needs no quoting (the usual
+/// absolute path), single-quoted otherwise, so a program path with a
+/// space in it is still one command the agent can paste.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+~=:,@%".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 /// The rule as the first prompt of a CLI with no system-prompt flag: the
@@ -220,6 +287,42 @@ pub(crate) fn validate_issue_url(raw: &str) -> Result<String> {
     Ok(url)
 }
 
+/// The git config key naming a repository's ISSUE SOURCE programs — one
+/// value per source, beside GitHub.
+pub(crate) const ISSUE_SOURCE_KEY: &str = "nebula.issueSource";
+
+/// Validate an ISSUE SOURCE issue's id before it is persisted and folded
+/// into a CLI's launch prompt on every spawn: one bounded token — the
+/// TUI passes it to the source program as one argument, so it can't open
+/// with `-` and read as a flag there — with no whitespace or control
+/// characters.
+pub(crate) fn validate_issue_id(raw: &str) -> Result<String> {
+    const MAX_ISSUE_ID_BYTES: usize = 256;
+    let id = raw.trim();
+    if id.is_empty() {
+        bail!("the issue id is empty");
+    }
+    if id.len() > MAX_ISSUE_ID_BYTES {
+        bail!("issue id is too long (max {MAX_ISSUE_ID_BYTES} bytes)");
+    }
+    if id.starts_with('-') || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("not an issue id: {id:?}");
+    }
+    Ok(id.to_string())
+}
+
+/// Validate an ISSUE SOURCE issue's page: HTTP(S) and bounded like a
+/// GitHub issue's, but any path — Linear, Jira and the rest don't share
+/// GitHub's `/issues/N`.
+pub(crate) fn validate_source_issue_url(raw: &str) -> Result<String> {
+    const MAX_ISSUE_URL_BYTES: usize = 4 * 1024;
+    let url = crate::registry::normalize_url(raw)?;
+    if url.len() > MAX_ISSUE_URL_BYTES {
+        bail!("issue URL is too long (max 4 KiB)");
+    }
+    Ok(url)
+}
+
 /// The issue's number, read off its URL (`…/issues/15`, with or without a
 /// trailing path).
 pub(crate) fn issue_number(url: &str) -> Option<u64> {
@@ -303,6 +406,8 @@ impl Daemon {
             starting_prompt,
             pr_url: Some(pr_url),
             issue_url: None,
+            issue_id: None,
+            issue_source: None,
         })
         .await
     }
@@ -410,7 +515,7 @@ mod tests {
     #[test]
     fn the_issue_rule_names_the_issue_and_the_worktree() {
         let scope = IssueScope {
-            url: ISSUE_URL,
+            issue: IssueOf::GitHub(ISSUE_URL),
             worktree: Path::new("/w/nebula-worktrees/issue-15-fix-login"),
             branch: "issue-15-fix-login",
         };
@@ -433,7 +538,7 @@ mod tests {
     fn combined_rule_joins_whatever_the_row_carries() {
         let pr = scope(None);
         let issue = IssueScope {
-            url: ISSUE_URL,
+            issue: IssueOf::GitHub(ISSUE_URL),
             worktree: Path::new("/w/nebula-worktrees/fix-login"),
             branch: "fix-login",
         };
@@ -448,6 +553,79 @@ mod tests {
         );
         let both = combined_rule(Some(&pr), Some(&issue)).unwrap();
         assert_eq!(both, format!("{}\n\n{}", rule(&pr), issue_rule(&issue)));
+    }
+
+    /// An ISSUE SOURCE's issue is named by its id, read through the source
+    /// program (quoted when its path needs it), and never pointed at `gh`
+    /// or a GitHub `Closes #N`.
+    #[test]
+    fn the_source_issue_rule_reads_the_issue_through_its_program() {
+        let scope = IssueScope {
+            issue: IssueOf::Source {
+                id: "ENG-123",
+                url: Some("https://linear.app/acme/issue/ENG-123/fix-login"),
+                program: Some("/Users/me/bin/issue source"),
+            },
+            worktree: Path::new("/w/acme-worktrees/issue-eng-123-fix-login"),
+            branch: "issue-eng-123-fix-login",
+        };
+        let text = issue_rule(&scope);
+        assert!(
+            text.contains("the issue ENG-123 (https://linear.app/acme/issue/ENG-123/fix-login)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`'/Users/me/bin/issue source' view ENG-123`"),
+            "{text}"
+        );
+        assert!(text.contains("`issue-eng-123-fix-login`"), "{text}");
+        assert!(!text.contains("gh issue"), "{text}");
+        assert!(!text.contains("Closes"), "{text}");
+
+        let bare = issue_rule(&IssueScope {
+            issue: IssueOf::Source {
+                id: "e6c61bf",
+                url: None,
+                program: Some("/usr/local/bin/nebula-git-bug"),
+            },
+            ..scope.clone()
+        });
+        assert!(bare.contains("the issue e6c61bf from"), "{bare}");
+        assert!(
+            bare.contains("`/usr/local/bin/nebula-git-bug view e6c61bf`"),
+            "{bare}"
+        );
+
+        let unset = issue_rule(&IssueScope {
+            issue: IssueOf::Source {
+                id: "e6c61bf",
+                url: None,
+                program: None,
+            },
+            ..scope
+        });
+        assert!(unset.contains("in the project's issue tracker"), "{unset}");
+    }
+
+    #[test]
+    fn validate_issue_id_takes_one_token() {
+        assert_eq!(validate_issue_id(" ENG-123 ").unwrap(), "ENG-123");
+        assert_eq!(validate_issue_id("e6c61bf").unwrap(), "e6c61bf");
+        assert!(validate_issue_id("").is_err());
+        assert!(validate_issue_id("--help").is_err());
+        assert!(validate_issue_id("a b").is_err());
+        assert!(validate_issue_id("a\nb").is_err());
+        assert!(validate_issue_id(&"x".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn validate_source_issue_url_takes_any_web_page() {
+        assert_eq!(
+            validate_source_issue_url("linear.app/acme/issue/ENG-123").unwrap(),
+            "https://linear.app/acme/issue/ENG-123"
+        );
+        assert!(validate_source_issue_url("javascript:alert(1)").is_err());
+        assert!(validate_source_issue_url("file:///etc/passwd").is_err());
     }
 
     #[test]

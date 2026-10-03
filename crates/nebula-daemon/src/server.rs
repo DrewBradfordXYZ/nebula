@@ -320,14 +320,17 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     cloud_prompt,
                     starting_prompt,
                     issue_url,
+                    issue_id,
+                    issue_source,
                 } => {
                     // Logged by mode only — never the task, prompt text or
                     // issue URL.
-                    let launch_mode = match (&cloud_prompt, &starting_prompt, &issue_url) {
+                    let issue = issue_url.is_some() || issue_id.is_some();
+                    let launch_mode = match (&cloud_prompt, &starting_prompt, issue) {
                         (Some(_), _, _) => Some("cloud"),
-                        (None, _, Some(_)) => Some("issue"),
-                        (None, Some(_), None) => Some("preset"),
-                        (None, None, None) => None,
+                        (None, _, true) => Some("issue"),
+                        (None, Some(_), false) => Some("preset"),
+                        (None, None, false) => None,
                     };
                     let result = daemon
                         .create_agent(CreateAgentSpec {
@@ -342,6 +345,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             starting_prompt,
                             pr_url: None,
                             issue_url,
+                            issue_id,
+                            issue_source,
                         })
                         .await;
                     if let Some(launch_mode) = launch_mode {
