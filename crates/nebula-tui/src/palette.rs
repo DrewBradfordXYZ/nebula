@@ -436,6 +436,7 @@ mod tests {
             status_changed_at: stamp,
             alive: true,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         }
     }

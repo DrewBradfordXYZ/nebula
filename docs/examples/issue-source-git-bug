@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# A nebula ISSUE SOURCE for git-bug (https://github.com/git-bug/git-bug),
+# whose issues live in the repository itself, under refs/bugs/.
+#
+#   git config --add nebula.issueSource /path/to/issue-source-git-bug
+#
+# Needs git-bug and jq on PATH. See "Issue sources" in docs/configuration.md
+# for the protocol: list, view <id>, comment <id>, edit <id>.
+set -euo pipefail
+
+err=$(mktemp)
+input=$(mktemp)
+trap 'rm -f "$err" "$input" "$input".*' EXIT
+
+# git-bug admits one process to a repository at a time and turns the next
+# away ("already locked"). nebula asks in the background, so wait a moment
+# for whoever holds it instead of failing them or us.
+gb() {
+  local tries=0
+  until git bug "$@" 2>"$err"; do
+    if grep -q lock "$err" && [ "$tries" -lt 20 ]; then
+      tries=$((tries + 1))
+      sleep 0.25
+      continue
+    fi
+    cat "$err" >&2
+    return 1
+  done
+}
+
+case "${1:-}" in
+list)
+  # Newest first. The description is each issue's first comment, which
+  # the list doesn't carry: `view` hands it over.
+  gb bug status:open --format json | jq '
+    sort_by(.create_time.timestamp) | reverse | map({
+      id: .human_id,
+      title,
+      author: .author.name,
+      created_at: .create_time.time,
+      updated_at: .edit_time.time,
+      labels
+    })'
+  ;;
+view)
+  gb bug show "$2" --format json | jq '{
+    body: (.comments[0].message // ""),
+    comments: ((.comments[1:] // []) | map({author: .author.name, body: .message}))
+  }'
+  ;;
+comment)
+  cat >"$input"
+  gb bug comment new "$2" --file "$input" --non-interactive >/dev/null
+  ;;
+edit)
+  # {"title": …, "body": …} on stdin; only what changed is written.
+  cat >"$input"
+  current=$(gb bug show "$2" --format json)
+  if [ "$(jq -r .title "$input")" != "$(jq -r .title <<<"$current")" ]; then
+    gb bug title edit "$2" --title="$(jq -r .title "$input")" --non-interactive >/dev/null
+  fi
+  # git-bug keeps a description without its trailing blank lines, so
+  # compare without them too.
+  jq -j '.body | sub("\\s+$"; "")' "$input" >"$input.body"
+  jq -j '.comments[0].message // "" | sub("\\s+$"; "")' <<<"$current" >"$input.was"
+  if ! cmp -s "$input.body" "$input.was"; then
+    gb bug comment edit "$(jq -r '.comments[0].human_id' <<<"$current")" \
+      --file "$input.body" --non-interactive >/dev/null
+  fi
+  ;;
+*)
+  echo "usage: $0 list | view <id> | comment <id> | edit <id>" >&2
+  exit 2
+  ;;
+esac

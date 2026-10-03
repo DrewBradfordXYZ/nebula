@@ -429,6 +429,57 @@ rm -f "$HOME/.config/dev-slots/$name" "/etc/caddy/sites/$name.caddy"
 caddy reload --config /etc/caddy/Caddyfile
 ```
 
+## Issue sources
+
+The ISSUES MODAL (`i`), the PROJECT ISSUES GROUP and ISSUE SESSIONS read GitHub through `gh`. A
+repository whose issues also live somewhere else — Linear, Jira, GitLab, a tracker inside the repo
+like git-bug — adds an ISSUE SOURCE in git config: a program that speaks a small JSON protocol. Its
+issues join GitHub's in the same list, and add as many as you like, one value each:
+
+```sh
+git config --add nebula.issueSource /absolute/path/to/program
+```
+
+The list reads GitHub's issues first, then each source's in the order git config gives them. Each
+row remembers where it came from, so reading, commenting, editing and launching an agent on it all go
+back to that source. A source that can't answer keeps the rows it last had while the others refresh;
+the pane says which didn't answer only when none did. Like the worktree hooks the key is per
+repository — `--global` values serve every project and a repo's own add to them — read fresh at every
+ask, and never taken from a file in the checkout, since nebula runs it on its own in the background.
+Each value is an executable path, spawned directly (no shell) from the project's main checkout, with
+your `PATH` and environment. `git config --unset-all nebula.issueSource` leaves GitHub alone again.
+
+nebula calls a source with a verb and, for all but `list`, the issue's id:
+
+| Call | stdin | stdout on exit 0 |
+|---|---|---|
+| `program list` | — | A JSON array of the open issues, in the order to list them |
+| `program view <id>` | — | A JSON object: the issue's `comments`, and its `body` if `list` left it out |
+| `program comment <id>` | the comment, as text | ignored |
+| `program edit <id>` | `{"title": "…", "body": "…"}` | ignored |
+
+An issue in `list` is an object with an `id` (a string, or a number) and whatever else the source
+knows — `title`, `url`, `author`, `created_at`, `updated_at` (RFC 3339), `labels` (an array of
+names), `body` (markdown). A comment in `view` is an `author`, a `created_at` and a `body`, in the
+order to show them. An id is one token: no whitespace, not starting with `-`. A non-zero exit is a
+failure, and its first line on stderr is what nebula shows — on the form, for an `edit` the tracker
+refused. A program that doesn't support commenting or editing just exits non-zero for those verbs.
+Each call has the same budget as `gh`'s.
+
+Everything else works as it does for GitHub's issues: the list prefetches and refreshes on the same
+beats and filters as you type, `Enter` and `Shift+Tab` start an agent on the issue (a fresh worktree
+is named `issue-eng-123-fix-login` after the id and title), `Ctrl+c` comments, `Ctrl+e` edits, and
+`Ctrl+o` and the card's `Shift+I` open the issue's `url` when it has one. Rows and titles name a
+source's issue by its id (`ENG-123`) where GitHub's say `#15`, and the reading pane names the source.
+The ISSUE SESSION carries the id and the source — persisted with the row like a GitHub issue's URL,
+and checked against the repository's git config when it is created — and every spawn tells the agent
+which issue it is for and how to read it: the same `program view <id>`, run from its worktree.
+
+An example for [git-bug](https://github.com/git-bug/git-bug), whose issues live under `refs/bugs/` in
+the repository itself, is [`docs/examples/issue-source-git-bug`](examples/issue-source-git-bug): about
+seventy lines of bash and `jq`. A source for a hosted tracker is the same four verbs around its CLI or
+API.
+
 ## Logs
 
 `daemon.log` and `tui.log` live in the state dir, which is not the DATA DIR on Linux and *is* on

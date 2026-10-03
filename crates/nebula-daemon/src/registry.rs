@@ -93,8 +93,15 @@ pub(crate) struct CreateAgentSpec {
     pub starting_prompt: Option<String>,
     pub pr_url: Option<String>,
     /// The GitHub issue an ISSUE SESSION was launched for (see
-    /// `pr_scope::issue_rule`). Persisted like `pr_url`.
+    /// `pr_scope::issue_rule`) — or, beside `issue_id`, the page of an
+    /// ISSUE SOURCE's issue. Persisted like `pr_url`.
     pub issue_url: Option<String>,
+    /// The issue's id when it comes from an ISSUE SOURCE beside GitHub.
+    /// Persisted like `issue_url`.
+    pub issue_id: Option<String>,
+    /// The ISSUE SOURCE program `issue_id` came from: one of the values of
+    /// the worktree's `nebula.issueSource`. Persisted with it.
+    pub issue_source: Option<String>,
 }
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
@@ -1000,6 +1007,8 @@ impl Daemon {
             starting_prompt,
             pr_url,
             issue_url,
+            issue_id,
+            issue_source,
         } = spec;
         let cloud_prompt = match cloud_prompt {
             Some(_) if kind != AgentKind::Claude => {
@@ -1025,9 +1034,28 @@ impl Daemon {
             Some(url) => Some(crate::pr_scope::validate_pr_url(&url)?),
             None => None,
         };
+        let issue_id = match issue_id {
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("issue launch context is not supported for Claude Cloud")
+            }
+            Some(id) => Some(crate::pr_scope::validate_issue_id(&id)?),
+            None => None,
+        };
+        // A source issue names its source, and only a source issue does.
+        let issue_source = match (&issue_id, issue_source) {
+            (Some(_), Some(program)) => Some(program),
+            (Some(_), None) => bail!("an issue id needs the issue source it came from"),
+            (None, Some(_)) => bail!("an issue source needs the issue id it lists"),
+            (None, None) => None,
+        };
         let issue_url = match issue_url {
             Some(_) if cloud_prompt.is_some() => {
                 bail!("issue launch context is not supported for Claude Cloud")
+            }
+            // An ISSUE SOURCE's issue may live at any page; only a GitHub
+            // issue, named by its URL alone, must be one.
+            Some(url) if issue_id.is_some() => {
+                Some(crate::pr_scope::validate_source_issue_url(&url)?)
             }
             Some(url) => Some(crate::pr_scope::validate_issue_url(&url)?),
             None => None,
@@ -1046,12 +1074,25 @@ impl Daemon {
         let optimistic_run = Self::launch_submits_first_prompt(
             &harness,
             starting_prompt.as_deref(),
-            pr_url.is_some() || issue_url.is_some(),
+            pr_url.is_some() || issue_url.is_some() || issue_id.is_some(),
         ) && cloud_prompt.is_none();
         let worktree = self
             .store
             .get_worktree(&worktree_id)?
             .context("worktree not found")?;
+        // The source is persisted and named to the agent on every spawn:
+        // it must be one the repository itself configures, never just what
+        // the client said.
+        if let Some(program) = &issue_source {
+            let configured =
+                crate::git::config_get_all(&worktree.path, crate::pr_scope::ISSUE_SOURCE_KEY).await;
+            if !configured.contains(program) {
+                bail!(
+                    "{program} is not one of this repository's issue sources (git config {})",
+                    crate::pr_scope::ISSUE_SOURCE_KEY
+                );
+            }
+        }
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. A starting prompt rides the
@@ -1060,6 +1101,7 @@ impl Daemon {
         let adopted = (cloud_prompt.is_none()
             && pr_url.is_none()
             && issue_url.is_none()
+            && issue_id.is_none()
             && starting_prompt.is_none())
         .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
         .flatten();
@@ -1103,6 +1145,9 @@ impl Daemon {
             status_changed_at: nebula_core::clock::now_ms(),
             alive: false,
             issue_url: issue_url.clone(),
+            source_issue: issue_id
+                .zip(issue_source)
+                .map(|(id, source)| Box::new(nebula_core::SourceIssue { id, source })),
             recent_prompts: Vec::new(),
         };
         self.store.insert_agent_with_launch_context(
@@ -1274,6 +1319,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            source_issue: None,
             recent_prompts: Vec::new(),
         };
         self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
@@ -2436,13 +2482,15 @@ impl Daemon {
         // prompt (see `pr_scope`). Rebuilt from the row's *current*
         // worktree on every spawn, so a relocated session is told where it
         // now works.
-        let (pr_url, issue_url) = if cloud_task.is_none() {
+        let (pr_url, issue_url, issue_id, issue_program) = if cloud_task.is_none() {
             (
                 self.store.agent_pr_url(&agent.id)?,
                 self.store.agent_issue_url(&agent.id)?,
+                self.store.agent_issue_id(&agent.id)?,
+                self.store.agent_issue_source(&agent.id)?,
             )
         } else {
-            (None, None)
+            (None, None, None, None)
         };
         let root = match &pr_url {
             Some(_) if !worktree.is_main => self
@@ -2457,8 +2505,17 @@ impl Daemon {
             branch: &worktree.branch,
             root: root.as_deref(),
         });
-        let issue_scope = issue_url.as_deref().map(|url| crate::pr_scope::IssueScope {
-            url,
+        let issue = match (&issue_id, &issue_url) {
+            (Some(id), url) => Some(crate::pr_scope::IssueOf::Source {
+                id,
+                url: url.as_deref(),
+                program: issue_program.as_deref(),
+            }),
+            (None, Some(url)) => Some(crate::pr_scope::IssueOf::GitHub(url)),
+            (None, None) => None,
+        };
+        let issue_scope = issue.map(|issue| crate::pr_scope::IssueScope {
+            issue,
             worktree: &worktree.path,
             branch: &worktree.branch,
         });
@@ -4844,6 +4901,8 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -4862,6 +4921,8 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -4880,6 +4941,8 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -4898,6 +4961,8 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap_err();
@@ -4919,6 +4984,8 @@ mod tests {
             starting_prompt: None,
             pr_url: Some("https://github.com/o/r/pull/7".into()),
             issue_url: None,
+            issue_id: None,
+            issue_source: None,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -5083,6 +5150,8 @@ mod tests {
             starting_prompt: Some("Fix it".into()),
             pr_url: None,
             issue_url: Some("https://github.com/o/r/issues/15".into()),
+            issue_id: None,
+            issue_source: None,
         };
         for kind in AgentKind::ALL {
             if kind == AgentKind::Custom {
@@ -5110,6 +5179,59 @@ mod tests {
         };
         let err = daemon.create_agent(not_an_issue).await.unwrap_err();
         assert!(err.to_string().contains("not an issue URL"), "{err}");
+
+        // An ISSUE SOURCE's issue is named by its id, with any page or none:
+        // both reach the worktree lookup, and a bad id never does.
+        for url in [
+            Some("https://linear.app/acme/issue/ENG-123/fix-login"),
+            None,
+        ] {
+            let from_source = CreateAgentSpec {
+                issue_url: url.map(String::from),
+                issue_id: Some("ENG-123".into()),
+                issue_source: Some("/opt/bin/linear-issues".into()),
+                ..spec(AgentKind::Claude, None)
+            };
+            let err = daemon.create_agent(from_source).await.unwrap_err();
+            assert!(
+                err.to_string().contains("worktree not found"),
+                "{url:?}: {err}"
+            );
+        }
+        let bad_id = CreateAgentSpec {
+            issue_url: None,
+            issue_id: Some("--help".into()),
+            issue_source: Some("/opt/bin/linear-issues".into()),
+            ..spec(AgentKind::Claude, None)
+        };
+        let err = daemon.create_agent(bad_id).await.unwrap_err();
+        assert!(err.to_string().contains("not an issue id"), "{err}");
+        // An id names its source, and a source comes with an id.
+        let no_source = CreateAgentSpec {
+            issue_url: None,
+            issue_id: Some("ENG-123".into()),
+            ..spec(AgentKind::Claude, None)
+        };
+        let err = daemon.create_agent(no_source).await.unwrap_err();
+        assert!(err.to_string().contains("needs the issue source"), "{err}");
+        let no_id = CreateAgentSpec {
+            issue_source: Some("/opt/bin/linear-issues".into()),
+            ..spec(AgentKind::Claude, None)
+        };
+        let err = daemon.create_agent(no_id).await.unwrap_err();
+        assert!(err.to_string().contains("needs the issue id"), "{err}");
+        let source_in_cloud = CreateAgentSpec {
+            starting_prompt: None,
+            issue_url: None,
+            issue_id: Some("ENG-123".into()),
+            issue_source: Some("/opt/bin/linear-issues".into()),
+            ..spec(AgentKind::Claude, Some("Fix auth"))
+        };
+        let err = daemon.create_agent(source_in_cloud).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not supported for Claude Cloud"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -5127,6 +5249,8 @@ mod tests {
             starting_prompt: starting.map(String::from),
             pr_url: None,
             issue_url: None,
+            issue_id: None,
+            issue_source: None,
         };
         // Validation runs before the worktree lookup, so an unknown
         // worktree is fine here and every failure is the prompt's own.
@@ -5235,6 +5359,8 @@ mod tests {
             starting_prompt: task.map(String::from),
             pr_url: None,
             issue_url: None,
+            issue_id: None,
+            issue_source: None,
         };
 
         let created = |mut events: broadcast::Receiver<ServerEvent>| {
@@ -5365,6 +5491,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                source_issue: None,
                 recent_prompts: Vec::new(),
             })
             .unwrap();
@@ -5498,6 +5625,8 @@ mod tests {
                 starting_prompt: None,
                 pr_url: None,
                 issue_url: None,
+                issue_id: None,
+                issue_source: None,
             })
             .await
             .unwrap()
@@ -5644,6 +5773,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 },
                 true,
@@ -6279,6 +6409,66 @@ mod tests {
 
         assert!(!wt.exists());
         assert!(drain_warnings(&mut events).is_empty());
+    }
+
+    /// The source a launch names is persisted and told to the agent on
+    /// every spawn, so it must be one the repository configures — any of
+    /// several — never whatever the client sent.
+    #[tokio::test]
+    async fn an_issue_source_must_be_one_the_repository_configures() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "nebula.issueSource",
+                "/opt/bin/git-bug-issues",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "nebula.issueSource",
+                "/opt/bin/linear-issues",
+            ],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        let spec = |source: &str| CreateAgentSpec {
+            worktree: WorktreeId("rt".into()),
+            name: "issue".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: true,
+            cloud_prompt: None,
+            starting_prompt: None,
+            pr_url: None,
+            issue_url: None,
+            issue_id: Some("ENG-123".into()),
+            issue_source: Some(source.into()),
+        };
+        let err = daemon.create_agent(spec("/tmp/evil")).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not one of this repository's issue sources"),
+            "{err}"
+        );
+        for configured in ["/opt/bin/git-bug-issues", "/opt/bin/linear-issues"] {
+            if let Err(err) = daemon.create_agent(spec(configured)).await {
+                assert!(
+                    !err.to_string().contains("issue sources"),
+                    "{configured}: {err}"
+                );
+            }
+        }
     }
 
     fn git_in(repo: &Path, args: &[&str]) {
