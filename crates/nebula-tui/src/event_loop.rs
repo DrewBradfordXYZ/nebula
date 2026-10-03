@@ -32,6 +32,7 @@ mod activate;
 mod alerts;
 mod focus_walk;
 mod host_terminal;
+mod jump;
 mod launcher;
 mod optimistic;
 mod pacing;
@@ -3224,6 +3225,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         | Action::CloseProjectTab
         | Action::SelectProjectTab(_)
         | Action::ProjectDropdown => app.flash = Some(launcher::NO_TABS_HERE.into()),
+        // JUMP MODE labels the grid, which takes the key itself; over a
+        // full-screen session there is no grid to label.
+        Action::Jump => app.flash = Some("jump labels the grid — ^q back to it".into()),
         Action::MoveDown => move_selection(app, 1, out),
         Action::MoveUp => move_selection(app, -1, out),
         // Ctrl+d / Ctrl+u jump the cursor half a panel at a time in the
@@ -5510,6 +5514,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::PullRequests(_) => crate::pr_modal::handle_key(app, key, out),
         Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
         Overlay::ProjectPicker(_) => launcher::handle_picker_key(app, key),
+        Overlay::Jump(_) => jump::handle_key(app, key, out),
         Overlay::Menu(menu) => match key.code {
             // `?` (and `s` where no filter eats letters) on a row that
             // starts a session jumps to that harness's Agents section,
@@ -9070,6 +9075,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // way out lives in `overlay_close`, and where focus goes after in
     // `land_click_focus`. Dismissing can put another modal up (a confirm
     // backs out to the settings it came from); focus stays put under that.
+    // JUMP MODE's labels are over the whole frame, not in a box: any
+    // press puts them away and goes on to what it landed on.
+    if matches!(mouse.kind, MouseEventKind::Down(_))
+        && matches!(app.overlay, Some(Overlay::Jump(_)))
+    {
+        app.overlay = None;
+        app.dirty = true;
+    }
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
         if let Some(overlay) = &app.overlay {
             if crate::overlay_close::click_is_outside(overlay, mouse_pos) {
@@ -29748,6 +29761,11 @@ diff --git a/src/c.rs b/src/c.rs
         terminal.draw(|f| ui::draw(f, app)).unwrap();
         let overlay = app.overlay.as_ref().expect("no modal open");
         let area = crate::overlay_close::overlay_area(overlay);
+        // JUMP MODE has no box: its labels lie over the whole frame, and
+        // any press puts them away (`handle_mouse`).
+        if matches!(overlay, Overlay::Jump(_)) {
+            return area;
+        }
         assert!(area.width > 0 && area.x > 0 && area.y > 0, "{area:?}");
         area
     }
@@ -30732,6 +30750,25 @@ diff --git a/src/c.rs b/src/c.rs
                 },
                 Some("Prompt"),
             ),
+            (
+                // Labels over the frame the grid last drew, so the opener
+                // draws one first.
+                "Jump",
+                |app| {
+                    seed_tree(app);
+                    let mut term =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 34))
+                            .unwrap();
+                    term.draw(|f| crate::ui::draw(f, app)).unwrap();
+                    press(
+                        app,
+                        KeyCode::Char('\''),
+                        KeyModifiers::NONE,
+                        &mut Vec::new(),
+                    );
+                },
+                None,
+            ),
         ]
     }
 
@@ -30869,6 +30906,7 @@ diff --git a/src/c.rs b/src/c.rs
             Overlay::PullRequests(_) => "PullRequests",
             Overlay::BranchSwitch(_) => "BranchSwitch",
             Overlay::ProjectPicker(_) => "ProjectPicker",
+            Overlay::Jump(_) => "Jump",
         }
     }
 
@@ -30897,7 +30935,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut unique = seen.clone();
             unique.dedup();
             assert_eq!(unique, seen, "two rows for the same variant");
-            assert_eq!(seen.len(), 19, "a variant came or went: {seen:?}");
+            assert_eq!(seen.len(), 20, "a variant came or went: {seen:?}");
         });
     }
 

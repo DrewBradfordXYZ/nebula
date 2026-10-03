@@ -647,6 +647,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             launcher_view::draw_project_picker(f, app, &picker)
         }
+        Overlay::Jump(view) => crate::jump::draw(f, app, &view),
         Overlay::Menu(menu) => {
             // `Tab` (the harness) and `^O` (the model) layer their list
             // over the box rather than taking the box away, as `^P` does:

@@ -710,6 +710,8 @@ pub(super) fn handle_action(
         // `+` (or `⌘P`): the list the header's `+` drops, the click's own
         // [`open_project_menu`].
         Action::ProjectDropdown => open_project_menu(app),
+        // `'`: JUMP MODE, a label on every card and tab.
+        Action::Jump => super::jump::open(app),
         _ => return false,
     }
     true
@@ -10275,6 +10277,195 @@ mod tests {
             let hint = app.hit_rect(&HitTarget::LauncherBandMore(0)).unwrap();
             click_at(&mut app, hint.x + 1, hint.y);
             assert_eq!(app.launcher_expanded.as_ref(), Some(&bands[0].worktree));
+        });
+    }
+
+    /// JUMP MODE's labels, as the frame drew them.
+    fn jump_labels(app: &App) -> Vec<(String, crate::jump::JumpTarget)> {
+        match &app.overlay {
+            Some(Overlay::Jump(view)) => view.labels.clone(),
+            other => panic!("expected jump mode, got {other:?}"),
+        }
+    }
+
+    fn label_of(app: &App, target: &crate::jump::JumpTarget) -> String {
+        jump_labels(app)
+            .into_iter()
+            .find(|(_, t)| t == target)
+            .unwrap_or_else(|| panic!("{target:?} has no label"))
+            .0
+    }
+
+    fn type_label(app: &mut App, label: &str) {
+        for c in label.chars() {
+            key(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    /// `'` labels every card and tab the frame drew, each label on its
+    /// target's top-left corner, and typing a card's label puts the
+    /// cursor on it with the pane following — the landing `h`/`l` make.
+    #[test]
+    fn a_jump_label_lands_on_its_card() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            key(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            let labels = jump_labels(&app);
+            let targets: Vec<_> = labels.iter().map(|(_, t)| t.clone()).collect();
+            use crate::jump::JumpTarget;
+            let a1 = JumpTarget::Card(SessionRef::Agent(AgentId("a1".into())));
+            let a2 = JumpTarget::Card(SessionRef::Agent(AgentId("a2".into())));
+            let web = JumpTarget::Tab(ProjectId("p2".into()));
+            for want in [&a1, &a2, &web] {
+                assert!(targets.contains(want), "{want:?} unlabelled: {labels:?}");
+            }
+            // Read top to bottom: the header's tabs before the cards.
+            let first_card = targets
+                .iter()
+                .position(|t| matches!(t, JumpTarget::Card(_)))
+                .unwrap();
+            assert!(targets[..first_card].contains(&web), "{labels:?}");
+
+            let label = label_of(&app, &a1);
+            let term = draw(&mut app);
+            let bands = crate::launcher::bands(&app);
+            let rect = app
+                .hits
+                .iter()
+                .find_map(|(r, h)| match h {
+                    HitTarget::LauncherCard(at) => crate::launcher::card_at(&bands, *at)
+                        .filter(|c| c.sref() == SessionRef::Agent(AgentId("a1".into())))
+                        .map(|_| *r),
+                    _ => None,
+                })
+                .expect("agent-1's card was drawn");
+            let cell = term.backend().buffer()[(rect.x + 1, rect.y)]
+                .symbol()
+                .to_string();
+            assert_eq!(cell, label[..1], "the label sits on the card's corner");
+
+            type_label(&mut app, &label);
+            assert!(app.overlay.is_none(), "landing closes the mode");
+            assert_eq!(selected(&app).as_deref(), Some("a1"));
+            assert_eq!(pane(&app), Some(SessionRef::Agent(AgentId("a1".into()))));
+            // The default landing opens it, as `/` Enter and `.` do.
+            assert_eq!(app.focus, Focus::Terminal);
+            assert!(app.term_locked, "the jump attaches");
+        });
+    }
+
+    /// INPUT PARITY: a tab's label opens its project exactly as a click
+    /// on the tab does.
+    #[test]
+    fn a_jump_label_on_a_tab_is_a_click_on_it() {
+        with_default_config(|| {
+            let mut by_jump = two_tabs();
+            let mut by_click = two_tabs();
+            key(&mut by_jump, KeyCode::Char('\''), KeyModifiers::NONE);
+            let label = label_of(
+                &by_jump,
+                &crate::jump::JumpTarget::Tab(ProjectId("p2".into())),
+            );
+            type_label(&mut by_jump, &label);
+
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherTab(ProjectId("p2".into())));
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_eq!(tab_state(&by_jump), tab_state(&by_click));
+            assert_eq!(tab_state(&by_jump).0.as_deref(), Some("web"));
+        });
+    }
+
+    /// Esc, a key no label starts with, and a click each put the labels
+    /// away; only the click goes on to act. Backspace takes back a typed
+    /// letter without closing.
+    #[test]
+    fn jump_mode_closes_without_moving_the_cursor() {
+        with_default_config(|| {
+            let mut app = two_tabs();
+            let before = (selected(&app), tab_state(&app));
+
+            key(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "Esc closes");
+            assert_eq!((selected(&app), tab_state(&app)), before);
+
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            assert!(app.overlay.is_none(), "a stray key closes");
+            assert_eq!((selected(&app), tab_state(&app)), before);
+            assert_eq!(app.flash.as_deref(), Some("no label there"));
+
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Jump(_))),
+                "Backspace keeps it open"
+            );
+
+            draw(&mut app);
+            let (x, y) = crumb_cell(&app, HitTarget::LauncherTab(ProjectId("p2".into())));
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+            assert!(app.overlay.is_none(), "a click closes");
+            assert_eq!(tab_state(&app).0.as_deref(), Some("web"), "and lands");
+        });
+    }
+
+    /// INPUT PARITY: a band's label puts the cursor on the band exactly
+    /// as a click on its rule does — the way onto a checkout whose cards
+    /// are not on screen.
+    #[test]
+    fn a_jump_label_on_a_band_is_a_click_on_its_rule() {
+        with_default_config(|| {
+            let mut by_jump = two_tabs();
+            let mut by_click = two_tabs();
+            let feat = WorktreeId("w2".into());
+            key(&mut by_jump, KeyCode::Char('\''), KeyModifiers::NONE);
+            let label = label_of(&by_jump, &crate::jump::JumpTarget::Band(feat.clone()));
+            type_label(&mut by_jump, &label);
+
+            let bands = crate::launcher::bands(&by_click);
+            let index = bands.iter().position(|b| b.worktree == feat).unwrap();
+            let (x, y) = crumb_cell(&by_click, HitTarget::LauncherBand(index));
+            mouse(&mut by_click, MouseEventKind::Down(MouseButton::Left), x, y);
+
+            let worktree = |app: &App| app.selected_worktree().map(|w| w.id.clone());
+            assert_eq!(worktree(&by_jump), Some(feat));
+            assert_eq!(worktree(&by_jump), worktree(&by_click));
+            assert_eq!(selected(&by_jump), selected(&by_click));
+            assert_eq!(pane(&by_jump), pane(&by_click));
+        });
+    }
+
+    /// With **Search Enter attaches** off a card's label only lands, the
+    /// pane previewing it — the quieter landing `/` Enter and `.` make —
+    /// and a session waiting on you opens anyway.
+    #[test]
+    fn a_jump_label_follows_search_enter_attaches() {
+        with_config_json(r#"{"palette_enter_attaches": false}"#, || {
+            let mut app = two_tabs();
+            let a1 = crate::jump::JumpTarget::Card(SessionRef::Agent(AgentId("a1".into())));
+            key(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            let label = label_of(&app, &a1);
+            type_label(&mut app, &label);
+            assert_eq!(selected(&app).as_deref(), Some("a1"));
+            assert_eq!(pane(&app), Some(SessionRef::Agent(AgentId("a1".into()))));
+            assert_ne!(app.focus, Focus::Terminal, "only lands");
+            assert!(!app.term_locked, "no input lock");
+
+            let mut app = two_tabs();
+            for agent in &mut app.tree.agents {
+                if agent.id.0 == "a1" {
+                    agent.status = AgentStatus::NeedsFeedback;
+                }
+            }
+            draw(&mut app);
+            key(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            let label = label_of(&app, &a1);
+            type_label(&mut app, &label);
+            assert_eq!(app.focus, Focus::Terminal, "the red card opens anyway");
+            assert!(app.term_locked);
         });
     }
 }

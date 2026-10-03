@@ -42,6 +42,10 @@ pub(crate) fn overlay_area(overlay: &Overlay) -> Rect {
         Overlay::PullRequests(v) => v.area,
         Overlay::BranchSwitch(v) => v.area,
         Overlay::ProjectPicker(v) => v.area,
+        // Drawn over the whole frame rather than in a box: a click goes
+        // through to what it lands on, and closes the mode on the way
+        // (`event_loop::handle_mouse`).
+        Overlay::Jump(_) => Rect::default(),
     }
 }
 
@@ -89,7 +93,8 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
             | Overlay::FileTabs(_)
             | Overlay::Metrics(_)
             | Overlay::Hosts(_)
-            | Overlay::BranchSwitch(_),
+            | Overlay::BranchSwitch(_)
+            | Overlay::Jump(_),
         ) => app.overlay = None,
         // Confirm, Prompt, the AGENT PRESETS list and the PRESET EDITOR each
         // have a side effect on the way out that their own Esc already
