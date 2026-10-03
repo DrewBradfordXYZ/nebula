@@ -328,6 +328,13 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE temp.worktree_home;
     DROP TABLE temp.worktree_merge;
     ",
+    // 29: the id of an ISSUE SESSION's issue in an ISSUE SOURCE other
+    // than GitHub (`git config nebula.issueSource`). Nullable: a GitHub
+    // ISSUE SESSION keeps naming its issue by `issue_url` alone, and every
+    // other row stays an ordinary session.
+    "
+    ALTER TABLE agents ADD COLUMN issue_id TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -495,8 +502,9 @@ impl Store {
     /// Persist an AGENT plus the launch context that must be rebuilt on
     /// every process spawn. `pr_url` is intentionally not part of the
     /// shared Agent entity: it constrains the CLI's launch, not row
-    /// display. `issue_url` is launch context too, and also rides the
-    /// entity (`Agent::issue_url`) so the TUI's `⇧I` can open the issue.
+    /// display. `issue_url` and `issue_id` are launch context too, read off
+    /// the entity (`Agent::issue_url`, `Agent::issue_id`) so the TUI's `⇧I`
+    /// can open the issue and its card can name it.
     pub fn insert_agent_with_launch_context(
         &self,
         a: &Agent,
@@ -505,8 +513,8 @@ impl Store {
         issue_url: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness, issue_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -527,6 +535,7 @@ impl Store {
                 pr_url,
                 issue_url,
                 a.custom_harness,
+                a.issue_id,
             ],
         )?;
         Ok(())
@@ -542,6 +551,12 @@ impl Store {
     /// Issue launch context for an AGENT (an ISSUE SESSION), or None.
     pub fn agent_issue_url(&self, id: &AgentId) -> Result<Option<String>> {
         self.agent_text_column(id, "issue_url")
+    }
+
+    /// The ISSUE SOURCE id of an ISSUE SESSION's issue, or None — for a
+    /// GitHub issue, and for every other row.
+    pub fn agent_issue_id(&self, id: &AgentId) -> Result<Option<String>> {
+        self.agent_text_column(id, "issue_id")
     }
 
     fn agent_text_column(&self, id: &AgentId, column: &str) -> Result<Option<String>> {
@@ -1032,7 +1047,7 @@ const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_orde
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
                              archived_at, unseen, cloud_session_id, recent_prompts, custom_harness, \
-                             issue_url";
+                             issue_url, issue_id";
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order, run_command";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
@@ -1076,6 +1091,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         cloud_session_id: r.get(13)?,
         alive: false,
         issue_url: r.get(16)?,
+        issue_id: r.get(17)?,
         recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
         custom_harness: r.get(15)?,
     })
@@ -1174,6 +1190,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
@@ -1198,6 +1215,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1219,6 +1237,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1241,6 +1260,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
         store
@@ -1283,6 +1303,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&custom).unwrap();
@@ -1305,6 +1326,38 @@ mod tests {
         // …and the loaded row carries the issue to the TUI (`⇧I` opens it).
         assert_eq!(agents[0].issue_url, None);
         assert_eq!(agents[3].issue_url.as_deref(), Some(issue_url));
+        assert_eq!(
+            store.agent_issue_id(&agents[3].id).unwrap(),
+            None,
+            "GitHub's"
+        );
+
+        // An ISSUE SOURCE's issue round-trips its id beside its page, or
+        // with none (migration 29).
+        for (name, page) in [
+            ("eng", Some("https://linear.app/acme/issue/ENG-123")),
+            ("bug", None),
+        ] {
+            let sourced = Agent {
+                id: AgentId::generate(),
+                name: name.into(),
+                issue_url: page.map(String::from),
+                issue_id: Some(format!("{name}-1")),
+                ..issue_agent.clone()
+            };
+            store
+                .insert_agent_with_launch_context(&sourced, true, None, page)
+                .unwrap();
+            assert_eq!(
+                store.agent_issue_id(&sourced.id).unwrap(),
+                Some(format!("{name}-1"))
+            );
+            assert_eq!(store.agent_issue_url(&sourced.id).unwrap().as_deref(), page);
+            let (_, _, reloaded, _) = store.load_tree().unwrap();
+            let back = reloaded.iter().find(|a| a.id == sourced.id).unwrap();
+            assert_eq!(back.issue_id, Some(format!("{name}-1")));
+            assert_eq!(back.issue_url.as_deref(), page);
+        }
     }
 
     /// Read marks are keyed by PR URL and outlive the worktree they were
@@ -1792,6 +1845,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         };
 
@@ -1880,6 +1934,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    issue_id: None,
                     recent_prompts: Vec::new(),
                 },
                 true,
@@ -2009,6 +2064,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     issue_url: None,
+                    issue_id: None,
                     recent_prompts: Vec::new(),
                 })
                 .unwrap();
@@ -2075,6 +2131,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                issue_id: None,
                 recent_prompts: Vec::new(),
             };
             store.insert_agent(&agent).unwrap();
@@ -2175,6 +2232,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 issue_url: None,
+                issue_id: None,
                 recent_prompts: Vec::new(),
             })
             .unwrap();

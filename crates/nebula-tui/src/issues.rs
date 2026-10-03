@@ -1,4 +1,8 @@
-//! The ISSUES MODAL: the selected project's open GitHub issues, listed
+//! The ISSUES MODAL: the selected project's open GitHub issues — or, when
+//! its repository names an ISSUE SOURCE in git config
+//! (`nebula.issueSource`), the open issues that program lists, asked the
+//! same way through a small JSON protocol ([`list`], [`detail`],
+//! [`comment`], [`edit`]) — listed
 //! newest first down the left, the one under the cursor read on the right,
 //! and two ways to put an agent on it — a QUICK PROMPT (`Enter`) or one
 //! of the saved AGENT PRESETS (`Shift+Tab`), the QUICK PROMPT box's own
@@ -124,12 +128,64 @@ const LIST_PCT: u16 = crate::pr_modal::LIST_PCT;
 const MIN_LIST_W: u16 = crate::pr_modal::MIN_LIST_W;
 const WHEEL_LINES: i32 = crate::pr_modal::WHEEL_LINES;
 
-/// One open issue, as `gh issue list` reports it. The body rides the list
-/// — one call paints the whole reading pane — and only the comments are a
-/// second, per-row call ([`detail`]).
+/// Where a project's issues come from: GitHub through `gh`, unless the
+/// repository names an ISSUE SOURCE program in git config
+/// (`nebula.issueSource`) — read fresh at every ask ([`source_of`]), as the
+/// worktree hooks are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueSource {
+    GitHub,
+    /// The program's path, as git config gives it.
+    Program(String),
+}
+
+/// Which kind of source an [`Issue`] came from: what names it on a row
+/// (`#15` or `ENG-123`), and what a launch tells the DAEMON (a GitHub
+/// issue's URL, a source issue's id).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Origin {
+    #[default]
+    GitHub,
+    Source,
+}
+
+impl Origin {
+    /// How a row, a title or a message names the issue: `#15` on GitHub,
+    /// the source's own id elsewhere.
+    pub fn tag(self, id: &str) -> String {
+        match self {
+            Origin::GitHub => format!("#{id}"),
+            Origin::Source => id.to_string(),
+        }
+    }
+
+    /// What did the asking, for a message saying it failed.
+    pub fn asker(self) -> &'static str {
+        match self {
+            Origin::GitHub => "gh",
+            Origin::Source => "the issue source",
+        }
+    }
+}
+
+/// One open issue, as `gh issue list` — or the ISSUE SOURCE's `list` —
+/// reports it. The body rides the list — one call paints the whole
+/// reading pane — and only the comments are a second, per-row call
+/// ([`detail`]); a source that leaves the body out of its list hands it
+/// over there instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
-    pub number: u64,
+    /// What tells this issue from every other the TUI holds, across
+    /// projects: a GitHub issue's URL, or a source issue's checkout and id
+    /// ([`source_key`]) — its page may be missing, or another project's
+    /// too.
+    pub key: String,
+    /// What the source calls it, and what is passed back to ask about it:
+    /// GitHub's number, a tracker's key (`ENG-123`), an id (`e6c61bf`).
+    pub id: String,
+    #[serde(default)]
+    pub origin: Origin,
+    /// Its web page — empty for a source issue that has none.
     pub url: String,
     pub title: String,
     pub author: String,
@@ -144,44 +200,90 @@ pub struct Issue {
 }
 
 impl Issue {
+    /// `#15` or `ENG-123`.
+    pub fn tag(&self) -> String {
+        self.origin.tag(&self.id)
+    }
+
     /// Row text: `#15 title`, the shape the OPEN PRS rows use.
     pub fn label(&self) -> String {
-        crate::pull_request::numbered_label(self.number, &self.title)
+        tagged_label(&self.tag(), &self.title)
     }
 
     /// What a launch carries from the row to the DAEMON.
     pub fn launch_ref(&self) -> IssueRef {
         IssueRef {
+            key: self.key.clone(),
+            id: self.id.clone(),
+            origin: self.origin,
             url: self.url.clone(),
-            number: self.number,
             title: self.title.clone(),
         }
     }
 }
 
+/// `tag title`, or the tag alone for an untitled issue.
+fn tagged_label(tag: &str, title: &str) -> String {
+    if title.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{tag} {title}")
+    }
+}
+
+/// A source issue's [`Issue::key`]: the checkout it was listed from and
+/// its id, so two projects' trackers can't collide on `1`.
+pub fn source_key(dir: &Path, id: &str) -> String {
+    format!("{}#{id}", dir.display())
+}
+
 /// The issue a QUICK PROMPT or AGENT PRESET launch is for: enough to name
 /// it in the box's title, cut a branch for it, write the default task, and
-/// send the URL the DAEMON persists.
+/// send what the DAEMON persists — a GitHub issue's URL, a source issue's
+/// id (and its page, when it has one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueRef {
+    pub key: String,
+    pub id: String,
+    pub origin: Origin,
     pub url: String,
-    pub number: u64,
     pub title: String,
 }
 
 impl IssueRef {
+    /// `#15` or `ENG-123`.
+    pub fn tag(&self) -> String {
+        self.origin.tag(&self.id)
+    }
+
     /// The task sent when the box is submitted empty: the issue itself.
     pub fn default_task(&self) -> String {
-        if self.title.trim().is_empty() {
-            format!("Fix GitHub issue #{} ({})", self.number, self.url)
+        let (what, tag) = match self.origin {
+            Origin::GitHub => ("GitHub issue", self.tag()),
+            Origin::Source => ("issue", self.tag()),
+        };
+        let page = if self.url.is_empty() {
+            String::new()
         } else {
-            format!(
-                "Fix GitHub issue #{}: {} ({})",
-                self.number,
-                self.title.trim(),
-                self.url
-            )
+            format!(" ({})", self.url)
+        };
+        if self.title.trim().is_empty() {
+            format!("Fix {what} {tag}{page}")
+        } else {
+            format!("Fix {what} {tag}: {}{page}", self.title.trim())
         }
+    }
+
+    /// `CreateAgent::issue_url`: a GitHub issue's URL, or a source issue's
+    /// page when it has one.
+    pub fn launch_url(&self) -> Option<String> {
+        (!self.url.is_empty()).then(|| self.url.clone())
+    }
+
+    /// `CreateAgent::issue_id`: a source issue's id; None on GitHub, whose
+    /// URL alone names the issue.
+    pub fn launch_id(&self) -> Option<String> {
+        (self.origin == Origin::Source).then(|| self.id.clone())
     }
 }
 
@@ -194,10 +296,11 @@ pub struct IssueComment {
     pub body: String,
 }
 
-/// The per-row second call: the issue's conversation.
+/// The per-row second call: the issue's conversation — and, from a source
+/// whose list leaves descriptions out, the description.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueDetail {
-    pub url: String,
+    pub body: Option<String>,
     pub comments: Vec<IssueComment>,
 }
 
@@ -224,8 +327,9 @@ pub struct IssuesBeat {
 /// run `gh` from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingIssueDetail {
-    pub url: String,
-    pub number: u64,
+    pub key: String,
+    pub id: String,
+    pub origin: Origin,
     pub dir: PathBuf,
 }
 
@@ -234,10 +338,13 @@ pub struct PendingIssueDetail {
 pub enum IssuesAnswer {
     List {
         project: ProjectId,
+        /// Where the list was asked of, for the pane to name when it
+        /// couldn't be.
+        source: IssueSource,
         list: Option<Vec<Issue>>,
     },
     Detail {
-        url: String,
+        key: String,
         detail: Option<IssueDetail>,
     },
     /// `gh issue comment` finished; `posted` false is "couldn't post". The
@@ -253,8 +360,8 @@ pub enum IssuesAnswer {
     /// refused — the first line `gh` printed.
     Edited {
         project: ProjectId,
-        url: String,
-        number: u64,
+        key: String,
+        tag: String,
         outcome: Result<IssueText, String>,
     },
 }
@@ -372,8 +479,9 @@ pub struct IssueText {
 /// Shift+Enter / Ctrl+J for a line in the description, Enter to save.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueEditor {
-    pub url: String,
-    pub number: u64,
+    pub key: String,
+    pub id: String,
+    pub origin: Origin,
     pub title: TextInput,
     pub body: TextInput,
     pub field: EditField,
@@ -396,8 +504,9 @@ impl IssueEditor {
     /// The form prefilled from the row, caret at the end of the title.
     pub fn new(issue: &Issue) -> Self {
         Self {
-            url: issue.url.clone(),
-            number: issue.number,
+            key: issue.key.clone(),
+            id: issue.id.clone(),
+            origin: issue.origin,
             title: TextInput::with_text(issue.title.clone()),
             body: TextInput::multiline_with_text(issue.body.clone()),
             field: EditField::Title,
@@ -437,13 +546,53 @@ impl IssueEditor {
     }
 }
 
-// ---- gh ----
+// ---- gh, or the ISSUE SOURCE ----
 
-/// Ask `gh` for every open issue on `dir`'s repo, newest first. `None` is
+/// The git config key naming a repository's ISSUE SOURCE program.
+pub const SOURCE_KEY: &str = "nebula.issueSource";
+
+/// Where `dir`'s repository keeps its issues: the program its git config
+/// names under [`SOURCE_KEY`] — resolved the way git resolves any key, so
+/// a `--global` value serves every project and a repo's own config
+/// overrides it — or GitHub when it names none. Read at every ask, so a
+/// change applies on the next one.
+pub async fn source_of(dir: &Path) -> IssueSource {
+    let ask = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", SOURCE_KEY])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(TIMEOUT, ask).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let program = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if program.is_empty() {
+                IssueSource::GitHub
+            } else {
+                IssueSource::Program(program)
+            }
+        }
+        _ => IssueSource::GitHub,
+    }
+}
+
+/// Every open issue on `dir`'s repo, as `source` lists them: GitHub's
+/// newest first, a program's in the order it printed them. `None` is
 /// "couldn't ask" and is kept apart from `Some(vec![])`, the real answer
 /// "nothing is open": the caller keeps the last good list over a failed
 /// call. `gh issue list` leaves pull requests out on its own.
-pub async fn list(dir: &Path) -> Option<Vec<Issue>> {
+pub async fn list(source: &IssueSource, dir: &Path) -> Option<Vec<Issue>> {
+    let program = match source {
+        IssueSource::GitHub => return gh_list(dir).await,
+        IssueSource::Program(program) => program,
+    };
+    let out = run_source(program, dir, &["list"], None).await.ok()?;
+    parse_source_list(&out, dir)
+}
+
+async fn gh_list(dir: &Path) -> Option<Vec<Issue>> {
     let limit = LIST_LIMIT.to_string();
     let out = gh(
         Some(dir),
@@ -463,27 +612,50 @@ pub async fn list(dir: &Path) -> Option<Vec<Issue>> {
     parse_list(&out)
 }
 
-/// Ask `gh` for one issue's conversation. `number` picks it, so any
-/// checkout of the repo will do.
-pub async fn detail(dir: &Path, number: u64) -> Option<IssueDetail> {
-    let number = number.to_string();
-    let out = gh(
-        Some(dir),
-        &["issue", "view", &number, "--json", "url,comments"],
-        TIMEOUT,
-    )
-    .await?;
-    parse_detail(&out)
+/// One issue's conversation, asked of where it came from: `gh` for a
+/// GitHub issue (`id` picks it, so any checkout of the repo will do), the
+/// repository's ISSUE SOURCE for any other — None when the key has since
+/// been unset, as for any "couldn't ask".
+pub async fn detail(dir: &Path, origin: Origin, id: &str) -> Option<IssueDetail> {
+    match origin {
+        Origin::GitHub => {
+            let out = gh(
+                Some(dir),
+                &["issue", "view", id, "--json", "url,comments"],
+                TIMEOUT,
+            )
+            .await?;
+            parse_detail(&out)
+        }
+        Origin::Source => {
+            let IssueSource::Program(program) = source_of(dir).await else {
+                return None;
+            };
+            let out = run_source(&program, dir, &["view", id], None).await.ok()?;
+            parse_source_detail(&out)
+        }
+    }
 }
 
-/// Post `body` as a comment on issue `number`, as the `gh` user. The body
-/// goes down stdin (`--body-file -`), never argv: a comment can be long,
-/// and one opening with `-` must not read as a flag. True when `gh` exited
-/// clean; anything else — no `gh`, not logged in, a network that stalled
-/// past [`TIMEOUT`] — is "couldn't post". A `gh` still running at the
-/// timeout is killed with the future, not left behind.
-pub async fn comment(dir: &Path, number: u64, body: &str) -> bool {
-    comment_via("gh", dir, number, body).await
+/// Post `body` as a comment on the issue, as the `gh` user — or through
+/// the ISSUE SOURCE's `comment`. The body goes down stdin, never argv: a
+/// comment can be long, and one opening with `-` must not read as a flag.
+/// True when the program exited clean; anything else — no program, not
+/// logged in, a network that stalled past [`TIMEOUT`] — is "couldn't
+/// post". A program still running at the timeout is killed with the
+/// future, not left behind.
+pub async fn comment(dir: &Path, origin: Origin, id: &str, body: &str) -> bool {
+    match origin {
+        Origin::GitHub => comment_via("gh", dir, id, body).await,
+        Origin::Source => match source_of(dir).await {
+            IssueSource::Program(program) => {
+                run_source(&program, dir, &["comment", id], Some(body.as_bytes()))
+                    .await
+                    .is_ok()
+            }
+            IssueSource::GitHub => false,
+        },
+    }
 }
 
 /// [`comment`] through `program`: `gh` in the app, a script on disk in the
@@ -491,13 +663,12 @@ pub async fn comment(dir: &Path, number: u64, body: &str) -> bool {
 async fn comment_via(
     program: impl AsRef<std::ffi::OsStr>,
     dir: &Path,
-    number: u64,
+    id: &str,
     body: &str,
 ) -> bool {
     use tokio::io::AsyncWriteExt;
-    let number = number.to_string();
     let mut child = match tokio::process::Command::new(program)
-        .args(["issue", "comment", &number, "--body-file", "-"])
+        .args(["issue", "comment", id, "--body-file", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -525,14 +696,27 @@ async fn comment_via(
     tokio::time::timeout(TIMEOUT, run).await.unwrap_or(false)
 }
 
-/// Send one issue a new title and description, as the `gh` user. Unlike
-/// the reads this wants `gh`'s complaint, not just its silence: the first
-/// line it printed is what the form shows when GitHub refuses. The
-/// description goes down stdin (`--body-file -`) as a comment's does; the
-/// title rides argv as `--title=…`, one token, so one opening with `-`
-/// can't read as a flag either.
-pub async fn edit(dir: &Path, number: u64, text: &IssueText) -> Result<(), String> {
-    edit_via("gh", dir, number, text).await
+/// Send one issue a new title and description, as the `gh` user — or
+/// through the ISSUE SOURCE's `edit`, which reads both as one JSON object
+/// on stdin. Unlike the reads this wants the program's complaint, not
+/// just its silence: the first line it printed is what the form shows
+/// when the tracker refuses. On GitHub the description goes down stdin
+/// (`--body-file -`) as a comment's does; the title rides argv as
+/// `--title=…`, one token, so one opening with `-` can't read as a flag
+/// either.
+pub async fn edit(dir: &Path, origin: Origin, id: &str, text: &IssueText) -> Result<(), String> {
+    match origin {
+        Origin::GitHub => edit_via("gh", dir, id, text).await,
+        Origin::Source => {
+            let IssueSource::Program(program) = source_of(dir).await else {
+                return Err(format!("git config {SOURCE_KEY} is no longer set"));
+            };
+            let input = serde_json::json!({ "title": text.title, "body": text.body }).to_string();
+            run_source(&program, dir, &["edit", id], Some(input.as_bytes()))
+                .await
+                .map(|_| ())
+        }
+    }
 }
 
 /// [`edit`] through `program`: `gh` in the app, a script on disk in the
@@ -540,14 +724,13 @@ pub async fn edit(dir: &Path, number: u64, text: &IssueText) -> Result<(), Strin
 async fn edit_via(
     program: impl AsRef<std::ffi::OsStr>,
     dir: &Path,
-    number: u64,
+    id: &str,
     text: &IssueText,
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
-    let number = number.to_string();
     let title = format!("--title={}", text.title);
     let mut child = tokio::process::Command::new(program)
-        .args(["issue", "edit", &number, &title, "--body-file", "-"])
+        .args(["issue", "edit", id, &title, "--body-file", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -570,7 +753,7 @@ async fn edit_via(
         let (_, out) = tokio::join!(feed, child.wait_with_output());
         match out {
             Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(complaint(&out.stderr)),
+            Ok(out) => Err(complaint(&out.stderr, "gh refused the edit")),
             Err(e) => Err(format!("gh failed: {e}")),
         }
     };
@@ -579,14 +762,69 @@ async fn edit_via(
         .unwrap_or_else(|_| Err("gh timed out".into()))
 }
 
-/// The first line `gh` printed that says anything, as a shell would have
-/// shown it; a silent refusal gets a stock one.
-fn complaint(stderr: &[u8]) -> String {
+/// Run the ISSUE SOURCE `program` with `args` from `dir`, with `input` on
+/// its stdin (or none), under [`TIMEOUT`]: its stdout when it exits 0,
+/// else the first line it printed to stderr, as [`complaint`] reads it.
+/// Spawned directly, with no shell, as the worktree hooks are — a path
+/// with a space in it is still one program.
+async fn run_source(
+    program: &str,
+    dir: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    let verb = args.first().copied().unwrap_or_default();
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("couldn't run {program}: {e}"))?;
+    let stdin = child.stdin.take();
+    let input = input.map(<[u8]>::to_vec);
+    let feed = async move {
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await?;
+        }
+        std::io::Result::Ok(())
+    };
+    // Feed and wait together, as `gh`'s comment does: a program that
+    // exits before reading would otherwise leave the write blocked.
+    let run = async {
+        let (_, out) = tokio::join!(feed, child.wait_with_output());
+        match out {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+            Ok(out) => Err(complaint(
+                &out.stderr,
+                &format!("the issue source's {verb} failed"),
+            )),
+            Err(e) => Err(format!("{program} failed: {e}")),
+        }
+    };
+    tokio::time::timeout(TIMEOUT, run)
+        .await
+        .unwrap_or_else(|_| Err(format!("the issue source's {verb} timed out")))
+}
+
+/// The first line a program printed that says anything, as a shell would
+/// have shown it; a silent refusal gets `fallback`.
+fn complaint(stderr: &[u8], fallback: &str) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .map_or_else(|| "gh refused the edit".to_string(), str::to_string)
+        .map_or_else(|| fallback.to_string(), str::to_string)
 }
 
 /// Parse `gh issue list --json …` — a bare array. A row with no number or
@@ -600,7 +838,9 @@ fn parse_list(json: &str) -> Option<Vec<Issue>> {
             .filter_map(|v| {
                 let url = web_url(v)?;
                 Some(Issue {
-                    number: v.get("number")?.as_u64()?,
+                    key: url.clone(),
+                    id: v.get("number")?.as_u64()?.to_string(),
+                    origin: Origin::GitHub,
                     url,
                     title: str_at(v, "title"),
                     author: login(v.get("author")),
@@ -626,7 +866,7 @@ fn parse_list(json: &str) -> Option<Vec<Issue>> {
 
 fn parse_detail(json: &str) -> Option<IssueDetail> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let url = web_url(&v)?;
+    web_url(&v)?;
     let mut comments: Vec<IssueComment> = v
         .get("comments")
         .and_then(|c| c.as_array())
@@ -642,7 +882,95 @@ fn parse_detail(json: &str) -> Option<IssueDetail> {
         .unwrap_or_default();
     // RFC 3339 UTC stamps sort lexicographically into chronological order.
     comments.sort_by(|a, b| a.at.cmp(&b.at));
-    Some(IssueDetail { url, comments })
+    Some(IssueDetail {
+        body: None,
+        comments,
+    })
+}
+
+/// An ISSUE SOURCE id as its JSON gives it — a string, or a bare number
+/// for a tracker that numbers its issues — when it is one token a launch
+/// can carry: no whitespace or control characters, not opening with `-`
+/// (it is passed back to the program as an argument), and bounded. The
+/// DAEMON holds a launch to the same rule.
+fn source_id(v: &serde_json::Value) -> Option<String> {
+    const MAX_ID_BYTES: usize = 256;
+    let id = match v {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let token = !id.is_empty()
+        && id.len() <= MAX_ID_BYTES
+        && !id.starts_with('-')
+        && !id.chars().any(|c| c.is_whitespace() || c.is_control());
+    token.then_some(id)
+}
+
+/// Parse an ISSUE SOURCE's `list`: a bare array of issues, each an `id` and
+/// whatever else the source knows — `title`, `url`, `author`, `created_at`,
+/// `updated_at`, `labels` (an array of names) and `body`. A row whose id is
+/// missing or unusable drops out rather than failing the list, as does a
+/// `url` a browser can't open; a payload that isn't an array is a miss.
+fn parse_source_list(json: &str, dir: &Path) -> Option<Vec<Issue>> {
+    let rows = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let rows = rows.as_array()?;
+    Some(
+        rows.iter()
+            .filter_map(|v| {
+                let id = source_id(v.get("id")?)?;
+                Some(Issue {
+                    key: source_key(dir, &id),
+                    origin: Origin::Source,
+                    url: web_url(v).unwrap_or_default(),
+                    title: str_at(v, "title"),
+                    author: str_at(v, "author"),
+                    created_at: str_at(v, "created_at"),
+                    updated_at: str_at(v, "updated_at"),
+                    labels: v
+                        .get("labels")
+                        .and_then(|l| l.as_array())
+                        .map(|labels| {
+                            labels
+                                .iter()
+                                .filter_map(|l| l.as_str())
+                                .filter(|n| !n.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    body: str_at(v, "body"),
+                    id,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Parse an ISSUE SOURCE's `view`: an object with the issue's `comments`
+/// (each an `author`, a `created_at` and a `body`), and its `body` when
+/// the list left the description out. Anything but an object is a miss.
+fn parse_source_detail(json: &str) -> Option<IssueDetail> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.as_object()?;
+    let comments: Vec<IssueComment> = v
+        .get("comments")
+        .and_then(|c| c.as_array())
+        .map(|list| {
+            list.iter()
+                .map(|c| IssueComment {
+                    author: str_at(c, "author"),
+                    at: str_at(c, "created_at"),
+                    body: str_at(c, "body"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // In the source's order: its stamps need not sort as text.
+    Some(IssueDetail {
+        body: v.get("body").and_then(|b| b.as_str()).map(str::to_string),
+        comments,
+    })
 }
 
 /// `2026-09-10` out of an RFC 3339 stamp; empty when there is none.
@@ -744,8 +1072,13 @@ fn request_list(app: &mut App, project: ProjectId, dir: PathBuf) {
     };
     app.issues_inflight.insert(project.clone());
     tokio::spawn(async move {
-        let list = list(&dir).await;
-        let _ = tx.send(IssuesAnswer::List { project, list });
+        let source = source_of(&dir).await;
+        let list = list(&source, &dir).await;
+        let _ = tx.send(IssuesAnswer::List {
+            project,
+            source,
+            list,
+        });
     });
 }
 
@@ -899,16 +1232,17 @@ fn arm_beat(app: &mut App, project: &ProjectId, found: bool) {
 /// pane.
 pub(crate) fn schedule_detail(app: &mut App) {
     let pending = issue_in_focus(app).and_then(|(issue, dir)| {
-        let url = issue.url.clone();
-        if app.issue_detail.contains_key(&url)
-            || app.issue_detail_inflight.contains(&url)
-            || app.issue_detail_failed.contains(&url)
+        let key = issue.key.clone();
+        if app.issue_detail.contains_key(&key)
+            || app.issue_detail_inflight.contains(&key)
+            || app.issue_detail_failed.contains(&key)
         {
             return None;
         }
         Some(PendingIssueDetail {
-            url,
-            number: issue.number,
+            key,
+            id: issue.id,
+            origin: issue.origin,
             dir,
         })
     });
@@ -922,50 +1256,67 @@ pub(crate) fn lookup_detail(app: &mut App) {
         return;
     };
     if !pending.dir.is_dir() {
-        app.issue_detail_failed.insert(pending.url);
+        app.issue_detail_failed.insert(pending.key);
         app.dirty = true;
         return;
     }
     let Some(tx) = app.issues_tx.clone() else {
         return;
     };
-    app.issue_detail_inflight.insert(pending.url.clone());
+    app.issue_detail_inflight.insert(pending.key.clone());
     tokio::spawn(async move {
-        let detail = detail(&pending.dir, pending.number).await;
+        let detail = detail(&pending.dir, pending.origin, &pending.id).await;
         let _ = tx.send(IssuesAnswer::Detail {
-            url: pending.url,
+            key: pending.key,
             detail,
         });
     });
 }
 
 /// A `gh` answer landed. A list replaces the project's rows — keeping the
-/// cursor on the issue it was on, by URL, so a refresh that retired a row
+/// cursor on the issue it was on, by key, so a refresh that retired a row
 /// above it does not slide the selection — and a failed list keeps the
 /// last good one, or says so when there is none; either way the next
 /// background ask is armed off it. Comments replace whatever the pane
-/// showed for the URL; a failed fetch is remembered so the pane says so
+/// showed for the issue — and a description a source handed over only
+/// here fills its row; a failed fetch is remembered so the pane says so
 /// instead of spinning.
 pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
     match answer {
-        IssuesAnswer::List { project, list } => {
+        IssuesAnswer::List {
+            project,
+            source,
+            list,
+        } => {
             app.issues_inflight.remove(&project);
+            app.issue_sources.insert(project.clone(), source);
             arm_beat(app, &project, list.as_ref().is_some_and(|l| !l.is_empty()));
             match list {
-                Some(list) => {
-                    let cursor_url = match &app.overlay {
+                Some(mut list) => {
+                    let cursor_url: Option<String> = match &app.overlay {
                         Some(Overlay::Issues(view)) if view.project == project => app
                             .issues
                             .get(&project)
                             .and_then(|l| l.list.get(cursor_index(view, &l.list)?))
-                            .map(|i| i.url.clone()),
+                            .map(|i| i.key.clone()),
                         _ => None,
                     };
                     app.issues_failed.remove(&project);
                     let len = list.len();
+                    // A description only `view` gave keeps its row filled
+                    // across the refresh.
+                    for issue in list.iter_mut().filter(|i| i.body.is_empty()) {
+                        if let Some(body) = app
+                            .issue_detail
+                            .get(&issue.key)
+                            .and_then(|d| d.body.clone())
+                        {
+                            issue.body = body;
+                        }
+                    }
                     let position = cursor_url
                         .as_ref()
-                        .and_then(|url| list.iter().position(|i| &i.url == url));
+                        .and_then(|key| list.iter().position(|i| &i.key == key));
                     app.issues.insert(
                         project.clone(),
                         IssueList {
@@ -990,14 +1341,24 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 }
             }
         }
-        IssuesAnswer::Detail { url, detail } => {
-            app.issue_detail_inflight.remove(&url);
+        IssuesAnswer::Detail { key, detail } => {
+            app.issue_detail_inflight.remove(&key);
             match detail {
                 Some(detail) => {
-                    app.issue_detail.insert(url, detail);
+                    if let Some(body) = detail.body.as_ref().filter(|b| !b.is_empty()) {
+                        for issue in app
+                            .issues
+                            .values_mut()
+                            .flat_map(|l| l.list.iter_mut())
+                            .filter(|i| i.key == key && i.body.is_empty())
+                        {
+                            issue.body = body.clone();
+                        }
+                    }
+                    app.issue_detail.insert(key, detail);
                 }
                 None => {
-                    app.issue_detail_failed.insert(url);
+                    app.issue_detail_failed.insert(key);
                 }
             }
         }
@@ -1007,20 +1368,26 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
             text,
             posted,
         } => {
-            app.issue_comment_inflight.remove(&issue.url);
+            app.issue_comment_inflight.remove(&issue.key);
             if posted {
                 // The conversation the pane has is one comment short now:
                 // forget it, and the cursor resting on the row reads it
                 // again, with the new comment in.
-                app.issue_detail.remove(&issue.url);
-                app.issue_detail_failed.remove(&issue.url);
-                app.flash = Some(format!("comment posted on #{}", issue.number));
+                app.issue_detail.remove(&issue.key);
+                app.issue_detail_failed.remove(&issue.key);
+                app.flash = Some(format!("comment posted on {}", issue.tag()));
                 schedule_detail(app);
             } else {
-                app.flash = Some(format!(
-                    "couldn't post the comment on #{} — is gh logged in?",
-                    issue.number
-                ));
+                app.flash = Some(match issue.origin {
+                    Origin::GitHub => format!(
+                        "couldn't post the comment on {} — is gh logged in?",
+                        issue.tag()
+                    ),
+                    Origin::Source => format!(
+                        "couldn't post the comment on {} — the issue source refused it",
+                        issue.tag()
+                    ),
+                });
                 // The box comes back with the text for a retry — unless
                 // something else has been opened over the modal meanwhile,
                 // which the flash must not interrupt.
@@ -1031,8 +1398,8 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
         }
         IssuesAnswer::Edited {
             project,
-            url,
-            number,
+            key,
+            tag,
             outcome,
         } => match outcome {
             Ok(text) => {
@@ -1041,7 +1408,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 if let Some(row) = app
                     .issues
                     .get_mut(&project)
-                    .and_then(|l| l.list.iter_mut().find(|i| i.url == url))
+                    .and_then(|l| l.list.iter_mut().find(|i| i.key == key))
                 {
                     row.title = text.title;
                     row.body = text.body;
@@ -1050,12 +1417,12 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     if view
                         .editor
                         .as_ref()
-                        .is_some_and(|e| e.saving && e.url == url)
+                        .is_some_and(|e| e.saving && e.key == key)
                     {
                         view.editor = None;
                     }
                 }
-                app.flash = Some(format!("issue #{number} updated"));
+                app.flash = Some(format!("issue {tag} updated"));
                 if let Some(dir) = app
                     .tree
                     .projects
@@ -1072,7 +1439,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 let mut told = false;
                 if let Some(Overlay::Issues(view)) = &mut app.overlay {
                     if let Some(editor) = &mut view.editor {
-                        if editor.saving && editor.url == url {
+                        if editor.saving && editor.key == key {
                             editor.saving = false;
                             editor.notice = Some(why.clone());
                             told = true;
@@ -1080,7 +1447,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     }
                 }
                 if !told {
-                    app.flash = Some(format!("couldn't update issue #{number}: {why}"));
+                    app.flash = Some(format!("couldn't update issue {tag}: {why}"));
                 }
             }
         },
@@ -1128,8 +1495,8 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
     let dir = view.dir.clone();
     if !dir.is_dir() {
         app.flash = Some(format!(
-            "couldn't post the comment on #{}: the checkout isn't on disk",
-            issue.number
+            "couldn't post the comment on {}: the checkout isn't on disk",
+            issue.tag()
         ));
         bring_box_back(app, view, issue, text);
         return;
@@ -1138,11 +1505,11 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
     let Some(tx) = app.issues_tx.clone() else {
         return;
     };
-    app.issue_comment_inflight.insert(issue.url.clone());
-    app.flash = Some(format!("posting a comment on #{}…", issue.number));
-    let number = issue.number;
+    app.issue_comment_inflight.insert(issue.key.clone());
+    app.flash = Some(format!("posting a comment on {}…", issue.tag()));
+    let (origin, id) = (issue.origin, issue.id.clone());
     tokio::spawn(async move {
-        let posted = comment(&dir, number, &text).await;
+        let posted = comment(&dir, origin, &id, &text).await;
         let _ = tx.send(IssuesAnswer::Comment {
             view,
             issue,
@@ -1162,12 +1529,13 @@ fn refresh(app: &mut App) {
     app.issues_failed.remove(&project);
     request_list(app, project, dir);
     if let Some((issue, dir)) = selected_issue(app) {
-        if !app.issue_detail_inflight.contains(&issue.url) {
-            app.issue_detail_failed.remove(&issue.url);
+        if !app.issue_detail_inflight.contains(&issue.key) {
+            app.issue_detail_failed.remove(&issue.key);
             app.pending_issue_detail = Some((
                 PendingIssueDetail {
-                    url: issue.url.clone(),
-                    number: issue.number,
+                    key: issue.key.clone(),
+                    id: issue.id.clone(),
+                    origin: issue.origin,
                     dir,
                 },
                 std::time::Instant::now(),
@@ -1189,9 +1557,12 @@ fn selected_issue(app: &App) -> Option<(Issue, PathBuf)> {
     Some((issue.clone(), view.dir.clone()))
 }
 
-/// The URL of the issue under the cursor, for the browser.
+/// The URL of the issue under the cursor, for the browser — None for a
+/// source issue with no web page.
 fn selected_url(app: &App) -> Option<String> {
-    selected_issue(app).map(|(issue, _)| issue.url)
+    selected_issue(app)
+        .map(|(issue, _)| issue.url)
+        .filter(|url| !url.is_empty())
 }
 
 /// The issue whose comments the pane wants: the modal's row while the
@@ -1287,6 +1658,20 @@ fn open_editor(app: &mut App) {
         app.flash = Some("no issue selected".into());
         return;
     };
+    // A source whose list leaves descriptions out hands this one over with
+    // the comments: a form opened before that would show the description
+    // blank, and saving it would erase the real one.
+    if issue.origin == Origin::Source
+        && issue.body.is_empty()
+        && !app.issue_detail.contains_key(&issue.key)
+    {
+        app.flash = Some(format!(
+            "{} is still loading — edit it once its description is in",
+            issue.tag()
+        ));
+        schedule_detail(app);
+        return;
+    }
     if let Some(Overlay::Issues(view)) = &mut app.overlay {
         view.editor = Some(Box::new(IssueEditor::new(&issue)));
     }
@@ -1319,7 +1704,10 @@ fn save_editor(app: &mut App) {
         return;
     }
     if !dir.is_dir() {
-        editor.notice = Some("the checkout isn't on disk — gh has nowhere to run".into());
+        editor.notice = Some(format!(
+            "the checkout isn't on disk — {} has nowhere to run",
+            editor.origin.asker()
+        ));
         return;
     }
     let Some(tx) = app.issues_tx.clone() else {
@@ -1327,13 +1715,13 @@ fn save_editor(app: &mut App) {
     };
     editor.saving = true;
     editor.notice = None;
-    let (url, number) = (editor.url.clone(), editor.number);
+    let (key, id, origin) = (editor.key.clone(), editor.id.clone(), editor.origin);
     tokio::spawn(async move {
-        let outcome = edit(&dir, number, &text).await.map(|()| text);
+        let outcome = edit(&dir, origin, &id, &text).await.map(|()| text);
         let _ = tx.send(IssuesAnswer::Edited {
             project,
-            url,
-            number,
+            key,
+            tag: origin.tag(&id),
             outcome,
         });
     });
@@ -1417,8 +1805,13 @@ pub(crate) fn paste(app: &mut App, text: &str) -> bool {
 /// The footer's key line for the modal: the form's keys while it is up,
 /// the reader's otherwise.
 pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
-    if view.editor.is_some() {
-        "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
+    if let Some(editor) = &view.editor {
+        match editor.origin {
+            Origin::GitHub => {
+                "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
+            }
+            Origin::Source => "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save  Esc: cancel edit",
+        }
     } else {
         "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c/^y: comment  ^o: browser  ^r: refresh  Esc: clear / close"
     }
@@ -1437,7 +1830,7 @@ fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<Qui
         let taken = app.project_branches(project);
         return Some(QuickTarget::NewWorktree {
             project: project.clone(),
-            branch: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+            branch: crate::branch_name::issue_name(&issue.id, &issue.title, &taken),
         });
     }
     app.root_worktree(project).map(QuickTarget::Worktree)
@@ -1521,6 +1914,8 @@ pub(crate) fn open_preset_for_row(app: &mut App) {
 pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
     if let Some(url) = selected_url(app) {
         crate::event_loop::open_link(app, &url, out);
+    } else if let Some((issue, _)) = selected_issue(app) {
+        app.flash = Some(format!("{} has no web page", issue.tag()));
     }
 }
 
@@ -1668,7 +2063,7 @@ pub fn lines(
 
     out.push(fit(
         vec![
-            Span::styled(format!("{INDENT}#{} ", issue.number), dim),
+            Span::styled(format!("{INDENT}{} ", issue.tag()), dim),
             Span::styled(
                 issue.title.clone(),
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -1841,14 +2236,30 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     }
     let rows_area = crate::ui::below_first_row(list_inner);
     if rows.is_empty() {
-        let text = if failed {
-            "couldn't list issues — is gh installed and logged in?"
-        } else if inflight || app.issues_tx.is_some() && !app.issues.contains_key(&view.project) {
-            "asking GitHub…"
-        } else {
-            "no open issues"
+        // Named for what was asked: GitHub, or the ISSUE SOURCE program
+        // (by its file name — the path is the user's to remember).
+        let program = match app.issue_sources.get(&view.project) {
+            Some(IssueSource::Program(program)) => Some(
+                Path::new(program)
+                    .file_name()
+                    .map_or(program.clone(), |n| n.to_string_lossy().into_owned()),
+            ),
+            _ => None,
         };
-        empty_list_row(f, rows_area, text, th);
+        let text = if failed {
+            match &program {
+                Some(name) => format!("couldn't list issues — the issue source ({name}) failed"),
+                None => "couldn't list issues — is gh installed and logged in?".to_string(),
+            }
+        } else if inflight || app.issues_tx.is_some() && !app.issues.contains_key(&view.project) {
+            match &program {
+                Some(name) => format!("asking {name}…"),
+                None => "asking GitHub…".to_string(),
+            }
+        } else {
+            "no open issues".to_string()
+        };
+        empty_list_row(f, rows_area, &text, th);
     } else if visible.is_empty() {
         empty_list_row(f, rows_area, "no issues match", th);
     }
@@ -1868,7 +2279,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         let label = truncate(&full, text_budget);
         let positions = visible_positions(positions, &label, &full);
         let used = label.chars().count();
-        let number = format!("#{} ", issue.number);
+        let number = format!("{} ", issue.tag());
         let number_w = number.chars().count();
         let title = label.strip_prefix(&number).unwrap_or(&label).to_string();
         // The positions split where the number ends: the title's own
@@ -1920,15 +2331,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     let current = cursor.and_then(|i| rows.get(i));
     // The frame names the number; the headline inside carries the title.
     let body_title = match current {
-        Some(issue) => format!("Issue #{}", issue.number),
+        Some(issue) => format!("Issue {}", issue.tag()),
         None => "Issue".to_string(),
     };
     let lines: Vec<Line> = match current {
         Some(issue) => lines(
             issue,
-            app.issue_detail.get(&issue.url),
-            app.issue_detail_failed.contains(&issue.url),
-            app.issue_comment_inflight.contains(&issue.url),
+            app.issue_detail.get(&issue.key),
+            app.issue_detail_failed.contains(&issue.key),
+            app.issue_comment_inflight.contains(&issue.key),
             body_a.width.saturating_sub(2) as usize,
             th,
         ),
@@ -1949,16 +2360,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     }
     f.render_widget(block, body_a);
     // The `↗ open in browser` button over the top border, once the block
-    // has drawn it — only with a row to open.
+    // has drawn it — only with a row that has a page to open.
     let browser_area = match current {
-        Some(_) => crate::ui::browser_button(
+        Some(issue) if !issue.url.is_empty() => crate::ui::browser_button(
             f,
             body_a,
             (body_title.chars().count() + 2) as u16,
             app.hover_crumb == Some(HitTarget::ModalBrowser),
             th,
         ),
-        None => Rect::default(),
+        _ => Rect::default(),
     };
     let shown: Vec<Line> = lines.iter().skip(scroll as usize).cloned().collect();
     f.render_widget(Paragraph::new(shown), body_inner);
@@ -1993,7 +2404,7 @@ fn draw_editor(
     editor: &IssueEditor,
     th: Theme,
 ) -> (Rect, Rect, Option<TextView>) {
-    let title = format!("Edit issue #{}", editor.number);
+    let title = format!("Edit issue {}", editor.origin.tag(&editor.id));
     let (foot, style) = match (&editor.notice, editor.saving) {
         (Some(notice), _) => (format!(" {notice} "), Style::default().fg(th.err)),
         (None, true) => (" saving… ".to_string(), Style::default().fg(th.warn)),
@@ -2091,7 +2502,9 @@ mod tests {
 
     fn issue(number: u64, title: &str) -> Issue {
         Issue {
-            number,
+            key: format!("https://github.com/o/r/issues/{number}"),
+            id: number.to_string(),
+            origin: crate::issues::Origin::GitHub,
             url: format!("https://github.com/o/r/issues/{number}"),
             title: title.into(),
             author: "webdevcody".into(),
@@ -2158,7 +2571,7 @@ mod tests {
             ]}"#,
         )
         .expect("parsed");
-        assert_eq!(d.url, "https://github.com/o/r/issues/15");
+        assert_eq!(d.body, None, "gh's list carries the description");
         assert_eq!(d.comments.len(), 2);
         assert_eq!(d.comments[0].author, "steiza", "sorted by time");
         assert_eq!(d.comments[1].author, "kate");
@@ -2170,7 +2583,13 @@ mod tests {
     #[test]
     fn the_launch_ref_and_its_default_task_name_the_issue() {
         let r = issue(15, "Fix login redirect").launch_ref();
-        assert_eq!(r.number, 15);
+        assert_eq!((r.id.as_str(), r.tag()), ("15", "#15".to_string()));
+        // GitHub's issue goes to the DAEMON as its URL alone.
+        assert_eq!(
+            r.launch_url().as_deref(),
+            Some("https://github.com/o/r/issues/15")
+        );
+        assert_eq!(r.launch_id(), None);
         assert_eq!(
             r.default_task(),
             "Fix GitHub issue #15: Fix login redirect (https://github.com/o/r/issues/15)"
@@ -2199,7 +2618,7 @@ mod tests {
         assert!(failed.contains("couldn't read the comments"), "{failed}");
 
         let detail = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![IssueComment {
                 author: "kate".into(),
                 at: "2026-09-11T08:00:00Z".into(),
@@ -2218,7 +2637,7 @@ mod tests {
         assert!(read.contains("kate · 2026-09-11"), "{read}");
         assert!(read.contains("same here"), "{read}");
         let quiet = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![],
         };
         let none = text(&lines(&i, Some(&quiet), false, false, 60, Theme::default()));
@@ -2246,7 +2665,7 @@ mod tests {
             "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\ncat > \"$(dirname \"$0\")/body\"",
         );
         let body = format!("-- starts like a flag\n{}", "x".repeat(200_000));
-        assert!(comment_via(&records, dir.path(), 15, &body).await);
+        assert!(comment_via(&records, dir.path(), "15", &body).await);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("args")).unwrap(),
             "issue\ncomment\n15\n--body-file\n-\n"
@@ -2257,9 +2676,9 @@ mod tests {
         );
 
         let refuses = script("gh-refuses", "exit 1");
-        assert!(!comment_via(&refuses, dir.path(), 15, &body).await);
+        assert!(!comment_via(&refuses, dir.path(), "15", &body).await);
         let missing = dir.path().join("gh-missing");
-        assert!(!comment_via(&missing, dir.path(), 15, "hi").await);
+        assert!(!comment_via(&missing, dir.path(), "15", "hi").await);
     }
 
     /// While a comment of yours is on its way the pane says so, under
@@ -2268,7 +2687,7 @@ mod tests {
     fn the_pane_says_when_a_comment_is_posting() {
         let i = issue(15, "Fix login redirect");
         let quiet = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![],
         };
         let posting = text(&lines(&i, Some(&quiet), false, true, 60, Theme::default()));
@@ -2303,6 +2722,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: Some(vec![issue(15, "a"), issue(14, "Fix login redirect")]),
             },
@@ -2323,7 +2743,7 @@ mod tests {
             panic!("{:?}", prompt.kind);
         };
         assert_eq!(view.selected, 1, "the row the box came from");
-        assert_eq!(issue.number, 14);
+        assert_eq!(issue.id, "14");
     }
 
     /// Enter posts off the loop and puts the modal back on its row; a
@@ -2336,6 +2756,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: Some(vec![issue(15, "a"), issue(14, "b")]),
             },
@@ -2381,6 +2802,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: Some(vec![issue(15, "a")]),
             },
@@ -2389,9 +2811,9 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
-                url: fifteen.url.clone(),
+                key: fifteen.url.clone(),
                 detail: Some(IssueDetail {
-                    url: fifteen.url.clone(),
+                    body: None,
                     comments: vec![],
                 }),
             },
@@ -2453,7 +2875,7 @@ mod tests {
             "1".repeat(80)
         );
         let detail = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![IssueComment {
                 author: "steiza".into(),
                 at: "2026-09-11T08:00:00Z".into(),
@@ -2482,6 +2904,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: Some(vec![issue(15, "a"), issue(14, "b"), issue(13, "c")]),
             },
@@ -2491,6 +2914,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: Some(vec![issue(15, "a"), issue(13, "c")]),
             },
@@ -2503,6 +2927,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: None,
             },
@@ -2513,6 +2938,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: other.clone(),
                 list: None,
             },
@@ -2648,6 +3074,7 @@ mod tests {
             land_answer(
                 app,
                 IssuesAnswer::List {
+                    source: crate::issues::IssueSource::GitHub,
                     project: project.clone(),
                     list,
                 },
@@ -2687,6 +3114,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: Some(vec![]),
             },
@@ -2708,7 +3136,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
-                url: url.clone(),
+                key: url.clone(),
                 detail: None,
             },
         );
@@ -2717,9 +3145,9 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
-                url: url.clone(),
+                key: url.clone(),
                 detail: Some(IssueDetail {
-                    url: url.clone(),
+                    body: None,
                     comments: vec![],
                 }),
             },
@@ -2742,6 +3170,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project: project.clone(),
                 list: Some(rows),
             },
@@ -3010,8 +3439,8 @@ mod tests {
             &mut app,
             IssuesAnswer::Edited {
                 project: project.clone(),
-                url: url.clone(),
-                number: 15,
+                key: url.clone(),
+                tag: "#15".into(),
                 outcome: Err("HTTP 403: forbidden".into()),
             },
         );
@@ -3030,8 +3459,8 @@ mod tests {
             &mut app,
             IssuesAnswer::Edited {
                 project: project.clone(),
-                url: url.clone(),
-                number: 15,
+                key: url.clone(),
+                tag: "#15".into(),
                 outcome: Ok(IssueText {
                     title: "Fix the login redirect".into(),
                     body: "Bounces to /.".into(),
@@ -3054,8 +3483,8 @@ mod tests {
             &mut app,
             IssuesAnswer::Edited {
                 project: project.clone(),
-                url,
-                number: 15,
+                key: url,
+                tag: "#15".into(),
                 outcome: Err("late".into()),
             },
         );
@@ -3090,7 +3519,7 @@ mod tests {
             title: "-- starts like a flag".into(),
             body: format!("-- so does this\n{}", "x".repeat(200_000)),
         };
-        assert_eq!(edit_via(&records, dir.path(), 15, &text).await, Ok(()));
+        assert_eq!(edit_via(&records, dir.path(), "15", &text).await, Ok(()));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("args")).unwrap(),
             "issue\nedit\n15\n--title=-- starts like a flag\n--body-file\n-\n"
@@ -3105,16 +3534,18 @@ mod tests {
             "echo >&2\necho '  GraphQL: Resource not accessible' >&2\nexit 1",
         );
         assert_eq!(
-            edit_via(&refuses, dir.path(), 15, &text).await,
+            edit_via(&refuses, dir.path(), "15", &text).await,
             Err("GraphQL: Resource not accessible".into())
         );
         let silent = script("gh-silent", "exit 1");
         assert_eq!(
-            edit_via(&silent, dir.path(), 15, &text).await,
+            edit_via(&silent, dir.path(), "15", &text).await,
             Err("gh refused the edit".into())
         );
         let missing = dir.path().join("gh-missing");
-        let why = edit_via(&missing, dir.path(), 15, &text).await.unwrap_err();
+        let why = edit_via(&missing, dir.path(), "15", &text)
+            .await
+            .unwrap_err();
         assert!(why.starts_with("couldn't run gh"), "{why}");
     }
 
@@ -3158,7 +3589,7 @@ mod tests {
     }
 
     fn cursor_number(app: &App) -> Option<u64> {
-        selected_issue(app).map(|(issue, _)| issue.number)
+        selected_issue(app).and_then(|(issue, _)| issue.id.parse().ok())
     }
 
     /// Typing narrows the rows the moment the modal is up — no key to
@@ -3231,7 +3662,7 @@ mod tests {
             key(KeyCode::Char('e'), KeyModifiers::CONTROL),
             &mut Vec::new(),
         );
-        assert_eq!(editor(&app).expect("editing").number, second);
+        assert_eq!(editor(&app).expect("editing").id, second.to_string());
         handle_key(
             &mut app,
             key(KeyCode::Esc, KeyModifiers::NONE),
@@ -3369,7 +3800,10 @@ mod tests {
         );
         let picked = cursor_number(&app).unwrap();
         let visible = visible_rows("login", &app.issues[&project].list);
-        assert_eq!(picked, app.issues[&project].list[visible[1].0].number);
+        assert_eq!(
+            picked.to_string(),
+            app.issues[&project].list[visible[1].0].id
+        );
         assert_ne!(picked, 14);
     }
 
@@ -3389,6 +3823,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::List {
+                source: crate::issues::IssueSource::GitHub,
                 project,
                 list: Some(vec![
                     issue(15, "Fix login redirect"),
@@ -3582,5 +4017,279 @@ mod tests {
         };
         assert_eq!(v.browser_area, Rect::default());
         assert_eq!(crate::ui::browser_button_under(&app, at), None);
+    }
+
+    /// An ISSUE SOURCE's `list`: ids as strings or numbers, keyed by the
+    /// checkout so two projects' trackers can't collide; a row with no
+    /// usable id drops out, and a page a browser can't open is no page.
+    #[test]
+    fn parses_an_issue_source_list() {
+        let dir = Path::new("/w/acme");
+        let list = parse_source_list(
+            r#"[
+              {"id":"ENG-123","title":"Fix login","url":"https://linear.app/acme/issue/ENG-123",
+               "author":"kate","created_at":"2026-09-10T12:00:00Z","labels":["bug",""],"body":"Bounces."},
+              {"id":7,"title":"Numbered","url":"javascript:alert(1)"},
+              {"id":"--help","title":"a flag"},
+              {"id":"two words"},
+              {"title":"no id"}
+            ]"#,
+            dir,
+        )
+        .expect("an array");
+        assert_eq!(list.len(), 2, "{list:?}");
+        let eng = &list[0];
+        assert_eq!(eng.key, source_key(dir, "ENG-123"));
+        assert_eq!(
+            (eng.id.as_str(), eng.tag()),
+            ("ENG-123", "ENG-123".to_string())
+        );
+        assert_eq!(eng.origin, Origin::Source);
+        assert_eq!(eng.url, "https://linear.app/acme/issue/ENG-123");
+        assert_eq!(eng.label(), "ENG-123 Fix login");
+        assert_eq!(eng.labels, ["bug"]);
+        assert_eq!(
+            (eng.author.as_str(), eng.body.as_str()),
+            ("kate", "Bounces.")
+        );
+        assert_eq!((list[1].id.as_str(), list[1].url.as_str()), ("7", ""));
+        assert_ne!(
+            list[1].key,
+            source_key(Path::new("/w/other"), "7"),
+            "another project's 7"
+        );
+        assert!(parse_source_list("{}", dir).is_none());
+        assert!(parse_source_list("not json", dir).is_none());
+    }
+
+    /// An ISSUE SOURCE's `view`: the comments in the order it printed them,
+    /// and the description a list left out.
+    #[test]
+    fn parses_an_issue_source_view() {
+        let d = parse_source_detail(
+            r#"{"body":"The whole story.","comments":[
+              {"author":"kate","created_at":"2026-09-11T08:00:00-04:00","body":"same here"},
+              {"author":"steiza","created_at":"2026-09-11T09:00:00+02:00","body":"repro?"}
+            ]}"#,
+        )
+        .expect("parsed");
+        assert_eq!(d.body.as_deref(), Some("The whole story."));
+        assert_eq!(d.comments.len(), 2);
+        assert_eq!(d.comments[0].author, "kate", "the source's order");
+        assert_eq!(parse_source_detail("{}").expect("an object").comments, []);
+        assert!(parse_source_detail("[]").is_none());
+    }
+
+    /// A description only the source's `view` carries fills the row it
+    /// belongs to, so the pane reads it like a GitHub issue's.
+    #[test]
+    fn a_description_from_view_fills_its_row() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        let dir = Path::new("/w/acme");
+        let list = parse_source_list(r#"[{"id":"e6c61bf","title":"No body yet"}]"#, dir).unwrap();
+        let key = list[0].key.clone();
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                source: IssueSource::Program("/bin/source".into()),
+                list: Some(list.clone()),
+            },
+        );
+        assert_eq!(app.issues[&project].list[0].body, "");
+        land_answer(
+            &mut app,
+            IssuesAnswer::Detail {
+                key: key.clone(),
+                detail: Some(IssueDetail {
+                    body: Some("Found it.".into()),
+                    comments: vec![],
+                }),
+            },
+        );
+        assert_eq!(app.issues[&project].list[0].body, "Found it.");
+        // A refresh of the list, still without the body, keeps it.
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                source: IssueSource::Program("/bin/source".into()),
+                list: Some(list),
+            },
+        );
+        assert_eq!(app.issues[&project].list[0].body, "Found it.");
+        assert_eq!(
+            app.issue_sources.get(&project),
+            Some(&IssueSource::Program("/bin/source".into()))
+        );
+    }
+
+    /// A source issue's launch names it by its id, with its page when it has
+    /// one, and goes to the DAEMON as that id — never as a GitHub issue.
+    #[test]
+    fn a_source_issue_launches_by_its_id() {
+        let dir = Path::new("/w/acme");
+        let list = parse_source_list(
+            r#"[{"id":"ENG-123","title":"Fix login","url":"https://linear.app/acme/issue/ENG-123"},
+                {"id":"e6c61bf","title":""}]"#,
+            dir,
+        )
+        .unwrap();
+        let eng = list[0].launch_ref();
+        assert_eq!(
+            eng.default_task(),
+            "Fix issue ENG-123: Fix login (https://linear.app/acme/issue/ENG-123)"
+        );
+        assert_eq!(eng.launch_id().as_deref(), Some("ENG-123"));
+        assert_eq!(
+            eng.launch_url().as_deref(),
+            Some("https://linear.app/acme/issue/ENG-123")
+        );
+        let bare = list[1].launch_ref();
+        assert_eq!(bare.default_task(), "Fix issue e6c61bf");
+        assert_eq!(bare.launch_url(), None);
+        assert_eq!(bare.launch_id().as_deref(), Some("e6c61bf"));
+    }
+
+    /// The whole protocol against a real program named in a real repo's git
+    /// config (its path with a space in it): `list`, `view <id>`, `comment
+    /// <id>` with the body on stdin, `edit <id>` with the title and body as
+    /// JSON on stdin — and a refusal's first stderr line as the reason.
+    /// With the key unset the project is GitHub's again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_issue_source_program_speaks_the_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        assert_eq!(source_of(&repo).await, IssueSource::GitHub);
+
+        let bin = home.path().join("my tools");
+        std::fs::create_dir(&bin).unwrap();
+        let program = bin.join("issues");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+out="$(dirname "$0")"
+case "$1" in
+  list) printf '[{"id":"BUG-1","title":"Crash","body":""}]' ;;
+  view) printf '{"body":"Crashes on %s.","comments":[{"author":"kate","created_at":"t","body":"same"}]}' "$2" ;;
+  comment) cat > "$out/comment-$2" ;;
+  edit) [ "$2" = "BUG-1" ] || { echo "no such issue: $2" >&2; exit 1; }; cat > "$out/edit-$2" ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = program.to_string_lossy().into_owned();
+        git(&["config", SOURCE_KEY, &program]);
+        let source = source_of(&repo).await;
+        assert_eq!(source, IssueSource::Program(program.clone()));
+
+        let issues = list(&source, &repo).await.expect("listed");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            (issues[0].id.as_str(), issues[0].origin),
+            ("BUG-1", Origin::Source)
+        );
+
+        let viewed = detail(&repo, Origin::Source, "BUG-1")
+            .await
+            .expect("viewed");
+        assert_eq!(viewed.body.as_deref(), Some("Crashes on BUG-1."));
+        assert_eq!(viewed.comments[0].body, "same");
+
+        let body = format!("-- starts like a flag\n{}", "x".repeat(200_000));
+        assert!(comment(&repo, Origin::Source, "BUG-1", &body).await);
+        assert_eq!(
+            std::fs::read_to_string(bin.join("comment-BUG-1")).unwrap(),
+            body
+        );
+
+        let text = IssueText {
+            title: "Crash on boot".into(),
+            body: "It \"crashes\".".into(),
+        };
+        assert_eq!(edit(&repo, Origin::Source, "BUG-1", &text).await, Ok(()));
+        let sent: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(bin.join("edit-BUG-1")).unwrap())
+                .unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({"title": "Crash on boot", "body": "It \"crashes\"."})
+        );
+        assert_eq!(
+            edit(&repo, Origin::Source, "BUG-2", &text).await,
+            Err("no such issue: BUG-2".into())
+        );
+
+        // The key unset: a source issue has nowhere to be asked.
+        git(&["config", "--unset", SOURCE_KEY]);
+        assert_eq!(source_of(&repo).await, IssueSource::GitHub);
+        assert!(detail(&repo, Origin::Source, "BUG-1").await.is_none());
+        assert!(!comment(&repo, Origin::Source, "BUG-1", "hi").await);
+    }
+
+    /// The form never opens on a description that hasn't arrived yet: from
+    /// a source whose list leaves descriptions out, it waits for `view`.
+    #[test]
+    fn a_source_issue_is_not_edited_before_its_description_lands() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        let dir = Path::new("/w/acme");
+        let list = parse_source_list(r#"[{"id":"e6c61bf","title":"Later"}]"#, dir).unwrap();
+        let key = list[0].key.clone();
+        app.overlay = Some(Overlay::Issues(IssuesView::new(
+            project.clone(),
+            "acme".into(),
+            dir.to_path_buf(),
+        )));
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project,
+                source: IssueSource::Program("/bin/source".into()),
+                list: Some(list),
+            },
+        );
+        open_editor(&mut app);
+        let Some(Overlay::Issues(view)) = &app.overlay else {
+            panic!("{:?}", app.overlay);
+        };
+        assert!(view.editor.is_none());
+        assert!(app
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("still loading")));
+
+        land_answer(
+            &mut app,
+            IssuesAnswer::Detail {
+                key,
+                detail: Some(IssueDetail {
+                    body: Some("The real one.".into()),
+                    comments: vec![],
+                }),
+            },
+        );
+        open_editor(&mut app);
+        let Some(Overlay::Issues(view)) = &app.overlay else {
+            panic!("{:?}", app.overlay);
+        };
+        let editor = view.editor.as_ref().expect("editing");
+        assert_eq!(editor.original.body, "The real one.");
     }
 }

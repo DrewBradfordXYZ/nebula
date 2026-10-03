@@ -1958,6 +1958,9 @@ pub struct AgentLaunchDraft {
     /// the DAEMON persists the URL as the row's context (see
     /// `ClientRequest::CreateAgent::issue_url`).
     pub issue_url: Option<String>,
+    /// The issue's id, when it comes from an ISSUE SOURCE other than
+    /// GitHub (`ClientRequest::CreateAgent::issue_id`).
+    pub issue_id: Option<String>,
     /// Enter and lock the TERMINAL PANE once the create is acked. True for
     /// every launch the user walked a picker to reach; the QUICK PROMPT
     /// passes the `quick_prompt_focus` SETTING, which is off by default.
@@ -2002,6 +2005,7 @@ impl AgentLaunchDraft {
             reopen_on_error: None,
             pr: None,
             issue_url: None,
+            issue_id: None,
             focus_pane: true,
             placeholder: None,
             follow: true,
@@ -3727,13 +3731,18 @@ pub struct App {
     /// The debounced prefetch: the project the cursor landed on and when
     /// its list is asked for, re-armed on every project switch.
     pub pending_issues_prefetch: Option<(ProjectId, std::time::Instant)>,
+    /// Where each project's list was last asked of — GitHub, or the
+    /// repository's ISSUE SOURCE — so a list that couldn't be had names
+    /// what was asked.
+    pub issue_sources: HashMap<ProjectId, crate::issues::IssueSource>,
     /// The conversations of the issues the cursor has rested on, keyed by
-    /// URL; in flight and failed like the pull requests'.
+    /// `Issue::key`; in flight and failed like the pull requests'.
     pub issue_detail: HashMap<String, crate::issues::IssueDetail>,
     pub issue_detail_inflight: std::collections::HashSet<String>,
     pub issue_detail_failed: std::collections::HashSet<String>,
-    /// Issues with a comment on its way to GitHub (`gh issue comment`),
-    /// by URL, so the reading pane says so until the answer lands.
+    /// Issues with a comment on its way to GitHub (`gh issue comment`) or
+    /// the ISSUE SOURCE, by key, so the reading pane says so until the
+    /// answer lands.
     pub issue_comment_inflight: std::collections::HashSet<String>,
     /// Debounced comments fetch: the issue under the cursor and when its
     /// lookup is due, re-armed on every move.
@@ -3966,6 +3975,7 @@ impl App {
             issues_failed: std::collections::HashSet::new(),
             issues_due: HashMap::new(),
             pending_issues_prefetch: None,
+            issue_sources: HashMap::new(),
             issue_detail: HashMap::new(),
             issue_detail_inflight: std::collections::HashSet::new(),
             issue_detail_failed: std::collections::HashSet::new(),
@@ -5139,12 +5149,12 @@ impl App {
             .position(|row| row.open_pr().is_some_and(|pr| pr.url == url))
     }
 
-    /// The Worktrees row of the open issue at `url`, while the ISSUES
-    /// group is open and lists it.
-    pub fn issue_row_of(&self, url: &str) -> Option<usize> {
+    /// The Worktrees row of the open issue `key` names (`Issue::key`),
+    /// while the ISSUES group is open and lists it.
+    pub fn issue_row_of(&self, key: &str) -> Option<usize> {
         self.worktree_rows()
             .iter()
-            .position(|row| row.open_issue().is_some_and(|i| i.url == url))
+            .position(|row| row.open_issue().is_some_and(|i| i.key == key))
     }
 
     /// Rows a half-page jump (Ctrl+d / Ctrl+u) moves the Worktrees
@@ -5216,8 +5226,9 @@ impl App {
         self.selected_worktree_issue()
     }
 
-    /// What the pane is reading, by URL — the pull request or the issue
-    /// under a cursor — so the loop can tell a turn that changed it
+    /// What the pane is reading, by URL — the pull request, or the issue
+    /// by its key (a GitHub issue's is its URL) — under a cursor — so the
+    /// loop can tell a turn that changed it
     /// (`note_preview_change`) from one that left the reader in place.
     pub fn reading_url(&self) -> Option<String> {
         // Twice a turn of the event loop, and three walks to the same
@@ -5225,7 +5236,7 @@ impl App {
         self.rows_memo.hold(|| {
             self.previewed_pr()
                 .map(|pr| pr.url)
-                .or_else(|| self.previewed_issue().map(|i| i.url.clone()))
+                .or_else(|| self.previewed_issue().map(|i| i.key.clone()))
         })
     }
 
@@ -5620,6 +5631,7 @@ mod tests {
                 status_changed_at: 1_000 * (i as i64 + 1),
                 alive: true,
                 issue_url: None,
+                issue_id: None,
                 recent_prompts: Vec::new(),
             })
             .collect();
@@ -5908,6 +5920,7 @@ mod tests {
             sort_order: 0,
             alive: true,
             issue_url: None,
+            issue_id: None,
             recent_prompts: Vec::new(),
         });
         app.tree.agents.push(Agent {
@@ -6141,6 +6154,7 @@ mod tests {
                 status_changed_at: 100 * (i as i64 + 1),
                 alive: true,
                 issue_url: None,
+                issue_id: None,
                 recent_prompts: Vec::new(),
             });
         }

@@ -3316,7 +3316,7 @@ fn draw_issue_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     };
     let left = vec![
         Span::styled(" · ".to_string(), Style::default().fg(th.dim)),
-        Span::styled(format!("#{}", issue.number), Style::default().fg(th.muted)),
+        Span::styled(issue.tag(), Style::default().fg(th.muted)),
     ];
     let inner = titled_frame(f, area, "ISSUE", left, None, focused, th);
     let inner = Rect {
@@ -4985,7 +4985,9 @@ mod tests {
             ),
             issue: crate::issues::IssueRef {
                 url: "https://github.com/o/r/issues/1".into(),
-                number: 1,
+                key: "https://github.com/o/r/issues/1".into(),
+                id: "1".into(),
+                origin: crate::issues::Origin::GitHub,
                 title: "t".into(),
             },
         };
