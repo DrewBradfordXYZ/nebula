@@ -4218,6 +4218,123 @@ async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
         "agent-3"
     );
 
+    // `--worktree` starts it in the project's worktree on that branch,
+    // cutting one first (the words slugified as `nebula worktree` does).
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat login", "port the tests"],
+    );
+    assert!(
+        out.status.success(),
+        "nebula spawn --worktree failed: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("branch \"feat-login\""),
+        "stdout names the branch: {out:?}"
+    );
+    let worktree_of = |evs: &[ServerEvent]| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "feat-login" => Some(w.clone()),
+            _ => None,
+        })
+    };
+    let in_worktree = |evs: &[ServerEvent], worktree: &nebula_core::WorktreeId| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if &a.worktree_id == worktree && a.alive => Some(a.clone()),
+            _ => None,
+        })
+    };
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        worktree_of(evs).is_some_and(|w| in_worktree(evs, &w.id).is_some())
+    })
+    .await;
+    let feat = worktree_of(&events).unwrap();
+    assert!(!feat.is_main && feat.path.is_dir(), "a real new checkout");
+    let spawned = in_worktree(&events, &feat.id).unwrap();
+    assert_eq!(spawned.kind, AgentKind::Claude, "the caller's harness");
+    assert_eq!(spawned.name, "agent-1", "named against its own worktree");
+    let caller_row = events.iter().rev().find_map(|e| match e {
+        ServerEvent::EntityUpserted {
+            entity: Entity::Agent(a),
+        } if a.id == caller => Some(a.clone()),
+        _ => None,
+    });
+    assert!(
+        caller_row.is_none_or(|a| a.worktree_id == main_worktree.id),
+        "the caller stays in its own worktree"
+    );
+    // Asked again, the same branch reuses that checkout.
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat-login", "review it"],
+    );
+    assert!(out.status.success(), "reusing the worktree failed: {out:?}");
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.worktree_id == feat.id && a.name == "agent-2" && a.alive)
+        })
+    })
+    .await;
+    assert!(
+        worktree_of(&events).is_none(),
+        "no second worktree for the same branch"
+    );
+
+    // A start point for a branch that already has a checkout is refused,
+    // never silently dropped, and nothing is spawned for it.
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat-login", "--base", "main", "x"],
+    );
+    assert!(
+        !out.status.success(),
+        "--base on an existing worktree: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already has a worktree"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // So is one for a branch kept without a checkout (a deleted worktree's).
+    let kept = std::process::Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "branch", "kept"])
+        .output()
+        .unwrap();
+    assert!(kept.status.success(), "git branch: {kept:?}");
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "kept", "--base", "main", "x"],
+    );
+    assert!(!out.status.success(), "--base on a kept branch: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already exists"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--base` means nothing without `--worktree`, or blank.
+    let out = agent_cli(&env, &caller, &["spawn", "--base", "main", "x"]);
+    assert!(!out.status.success(), "--base alone must fail: {out:?}");
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--worktree", "feat-login", "--base", " ", "x"],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("base is empty"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     // A bad harness name and a blank task are the CLI's own refusals.
     let out = agent_cli(&env, &caller, &["spawn", "--kind", "gemini", "x"]);
     assert!(!out.status.success(), "unknown harness must fail: {out:?}");
@@ -4225,6 +4342,148 @@ async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
     assert!(!out.status.success(), "blank task must fail: {out:?}");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("task is empty"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = daemon.kill();
+}
+
+/// A SHARED WORKTREE, end to end: `nebula spawn` into a checkout that
+/// already has a live session says so and names who is there; with
+/// uncommitted changes it is refused — nothing started — until
+/// `--same-worktree`; and `--prompt-file` carries the task. A fresh
+/// `--worktree` has the checkout to itself and says nothing of sharing.
+#[tokio::test]
+async fn nebula_spawn_says_a_worktree_is_shared_and_refuses_one_with_changes() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    make_executable(&script);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: "Fix Login".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+            issue_id: None,
+            issue_source: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(caller)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let caller = caller.clone();
+    let live_in = |evs: &[ServerEvent], worktree: &nebula_core::WorktreeId, name: &str| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if &a.worktree_id == worktree && a.name == name && a.alive)
+        })
+    };
+    // The caller boots on create.
+    if !live_in(&events, &main_worktree.id, "Fix Login") {
+        read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+            live_in(evs, &main_worktree.id, "Fix Login")
+        })
+        .await;
+    }
+
+    // Work in flight in the caller's checkout: a plain spawn is refused,
+    // names the checkout and the session in it, and starts nothing.
+    std::fs::write(repo.join("half-written.rs"), "fn").unwrap();
+    let out = agent_cli(&env, &caller, &["spawn", "review the change"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a busy shared worktree: {out:?}");
+    for says in [
+        "1 uncommitted path",
+        "1 live session already in it (Fix Login)",
+        "--worktree <branch>",
+        "--same-worktree",
+    ] {
+        assert!(stderr.contains(says), "{says:?} missing from {stderr}");
+    }
+
+    // `--same-worktree` shares it anyway, the task from a file, and the
+    // reply says who it shares the checkout with.
+    let brief = env.tmp.path().join("brief.md");
+    std::fs::write(&brief, "# Review\n\nRead the \"half-written\" file.\n").unwrap();
+    let out = agent_cli(
+        &env,
+        &caller,
+        &[
+            "spawn",
+            "--same-worktree",
+            "--prompt-file",
+            brief.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "--same-worktree failed: {out:?}");
+    assert!(
+        stdout.contains("with 1 other live session (Fix Login)"),
+        "stdout: {stdout}"
+    );
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        live_in(evs, &main_worktree.id, "agent-1")
+    })
+    .await;
+    assert!(live_in(&events, &main_worktree.id, "agent-1"));
+
+    // Clean again, sharing is said, not refused — now with both sessions.
+    std::fs::remove_file(repo.join("half-written.rs")).unwrap();
+    let out = agent_cli(&env, &caller, &["spawn", "run the tests"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "a clean shared worktree: {out:?}");
+    assert!(
+        stdout.contains("with 2 other live sessions (Fix Login, agent-1)"),
+        "stdout: {stdout}"
+    );
+
+    // A new worktree is nobody else's.
+    let out = agent_cli(&env, &caller, &["spawn", "--worktree", "solo", "x"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "--worktree solo: {out:?}");
+    assert!(!stdout.contains("shares"), "stdout: {stdout}");
+
+    // The task comes from words or a file, never both; a blank file is
+    // refused before the daemon is asked.
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--prompt-file", brief.to_str().unwrap(), "x"],
+    );
+    assert!(!out.status.success(), "words and a file: {out:?}");
+    let blank = env.tmp.path().join("blank.md");
+    std::fs::write(&blank, "\n").unwrap();
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--prompt-file", blank.to_str().unwrap()],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is empty"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

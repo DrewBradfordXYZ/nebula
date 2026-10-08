@@ -287,8 +287,15 @@
   agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse|grok|opencode`
   names another — opening on that task as its first prompt, so it is working before you look. The new
   card appears on the grid on its own (default name, so it titles itself), and the session you
-  asked from is untouched: no restart, no focus change. Claude learns this from the same appended system
-  prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.
+  asked from is untouched: no restart, no focus change. Ask for it "in a new worktree" or "on branch
+  fix-login" and the agent adds `--worktree <branch>`: the session starts in the project's worktree on
+  that branch — cut first, from the same base `nebula worktree` uses, when there is none — while the
+  one you asked from stays in its own checkout. Claude learns this from the same appended system
+  prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission. Two sessions in one
+  checkout share its files, index and branch, so a spawn says when it lands in a SHARED WORKTREE
+  and names the live sessions already there; if that checkout also has uncommitted changes the
+  spawn is refused, starting nothing, unless the agent adds `--same-worktree` — the refusal tells
+  it to use `--worktree <branch>` instead. A long brief goes in a file: `--prompt-file <path>`.
 - **Ask the agent to show you a file and it opens in nebula.** Say "open it" or "show me the examples"
   and the session runs `nebula open <file>…`; every TUI attached to the daemon raises its file tabs on
   them — a modal with one tab per file, the focused one previewed with syntax highlighting (a

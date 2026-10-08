@@ -476,29 +476,53 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     id,
                     kind,
                     starting_prompt,
+                    worktree,
+                    base,
+                    share_worktree,
                 } => {
                     // Logged by mode only — never the prompt text.
+                    let worktree =
+                        worktree
+                            .as_deref()
+                            .map(|branch| crate::sibling::SiblingWorktree {
+                                branch,
+                                base: base.as_deref(),
+                            });
                     let result = daemon
-                        .spawn_sibling_agent(&id, kind, &starting_prompt)
+                        .spawn_sibling_agent(&id, kind, worktree, share_worktree, &starting_prompt)
                         .await;
-                    match &result {
-                        Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
-                            req_id,
-                            agent = %agent,
-                            spawned_by = %id,
-                            launch_mode = "sibling",
-                            "agent session spawned"
-                        ),
-                        Err(error) => tracing::warn!(
-                            req_id,
-                            error = %error,
-                            spawned_by = %id,
-                            launch_mode = "sibling",
-                            "agent session spawn failed"
-                        ),
-                        Ok(_) => unreachable!("SpawnSiblingAgent returned a non-agent id"),
-                    }
-                    reply(&out_tx, req_id, result.map(Some)).await;
+                    let ev = match result {
+                        Ok(spawned) => {
+                            tracing::info!(
+                                req_id,
+                                agent = %spawned.agent,
+                                spawned_by = %id,
+                                launch_mode = "sibling",
+                                shared_with = spawned.shared_with.len(),
+                                "agent session spawned"
+                            );
+                            ServerEvent::SiblingSpawned {
+                                req_id,
+                                agent: spawned.agent,
+                                worktree: spawned.worktree,
+                                shared_with: spawned.shared_with,
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                req_id,
+                                error = %error,
+                                spawned_by = %id,
+                                launch_mode = "sibling",
+                                "agent session spawn failed"
+                            );
+                            ServerEvent::Error {
+                                req_id: Some(req_id),
+                                message: format!("{error:#}"),
+                            }
+                        }
+                    };
+                    let _ = out_tx.send(ev).await;
                 }
                 ClientRequest::OpenFiles { req_id, id, paths } => {
                     reply_done(&out_tx, req_id, daemon.open_files(&id, paths)).await;

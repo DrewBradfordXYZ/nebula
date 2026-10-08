@@ -47,7 +47,21 @@ fn main() -> Result<()> {
             nebula_tui::run_rename(title.join(" "), mode)
         }
         Some(Command::Worktree { name, base }) => nebula_tui::run_worktree(name.join(" "), base),
-        Some(Command::Spawn { task, kind }) => nebula_tui::run_spawn(task.join(" "), kind),
+        Some(Command::Spawn {
+            task,
+            prompt_file,
+            kind,
+            worktree,
+            base,
+            same_worktree,
+        }) => nebula_tui::run_spawn(nebula_tui::SpawnArgs {
+            task,
+            prompt_file,
+            kind,
+            worktree,
+            base,
+            same_worktree,
+        }),
         Some(Command::Open { files }) => nebula_tui::run_open(files),
         Some(Command::Browser {
             port,
