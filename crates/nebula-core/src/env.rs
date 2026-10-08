@@ -69,6 +69,34 @@ pub const CODEX_HOME: &str = "CODEX_HOME";
 /// every agent PTY and must never leak into plain terminals.
 pub const AGENT_SESSION_VARS: &[&str] = &[AGENT_ID, API_URL, API_TOKEN];
 
+/// Set on the PTY of a built-in Claude agent, whose own CLI is always the
+/// interactive `claude`: every process under it inherits it, so a Claude
+/// hook that runs with it set and reports a non-interactive entrypoint
+/// (below) belongs to a `claude -p` or an Agent SDK app nested inside the
+/// session, and posts nothing. A custom harness on the Claude hook dialect
+/// may run Claude non-interactively as the agent itself, so its PTY never
+/// carries it.
+pub const CLAUDE_INTERACTIVE: &str = "NEBULA_CLAUDE_INTERACTIVE";
+/// What Claude Code calls the way it was started, set for its own process,
+/// hooks and children: `cli` for the interactive CLI (and the background
+/// worker `/background` hands a session to), `sdk-cli` for `claude -p`,
+/// `sdk-ts` / `sdk-py` for the Agent SDKs. An INHERITED value is kept,
+/// except that `cli` becomes `sdk-cli` in a `-p` run (measured on Claude
+/// Code 2.1.294) — so the daemon's own value, from whatever started it,
+/// must never reach a pane's CLI.
+pub const CLAUDE_CODE_ENTRYPOINT: &str = "CLAUDE_CODE_ENTRYPOINT";
+/// Dropped from the daemon's env on every agent and terminal PTY before the
+/// session's own vars are set: the agent session identity, and the Claude
+/// entrypoint, so a pane's `claude` names its own and a `claude -p` nested
+/// in it reads `sdk-cli`.
+pub const PTY_SCRUB_VARS: &[&str] = &[
+    AGENT_ID,
+    API_URL,
+    API_TOKEN,
+    CLAUDE_INTERACTIVE,
+    CLAUDE_CODE_ENTRYPOINT,
+];
+
 /// `TERM` every PTY child is given. The pane is nebula's own grid — a vt100
 /// parser the TUI repaints through ratatui — and that grid keeps 24-bit
 /// colour whatever terminal nebula itself runs in, so the child never

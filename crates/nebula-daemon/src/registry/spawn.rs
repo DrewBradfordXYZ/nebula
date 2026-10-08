@@ -567,8 +567,17 @@ impl Daemon {
                     format!("http://127.0.0.1:{}", self.hook_env.port),
                 ),
                 (env::API_TOKEN.into(), self.hook_env.token.clone()),
-            ],
-            scrub_env: env::AGENT_SESSION_VARS,
+            ]
+            .into_iter()
+            // Only the built-in Claude is known to run interactively: its
+            // Claude hooks then stay quiet for a `claude -p` nested inside
+            // (see `env::CLAUDE_INTERACTIVE`).
+            .chain(
+                (agent.kind == AgentKind::Claude && agent.custom_harness.is_none())
+                    .then(|| (env::CLAUDE_INTERACTIVE.into(), "1".into())),
+            )
+            .collect(),
+            scrub_env: env::PTY_SCRUB_VARS,
             cols,
             rows,
         };
@@ -762,7 +771,7 @@ impl Daemon {
             args,
             cwd: worktree.path.clone(),
             env: vec![],
-            scrub_env: env::AGENT_SESSION_VARS,
+            scrub_env: env::PTY_SCRUB_VARS,
             cols,
             rows,
         };
