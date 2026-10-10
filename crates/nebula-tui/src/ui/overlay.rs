@@ -43,6 +43,7 @@ impl Overlay {
             Overlay::FileTabs(view) => draw_file_tabs_overlay(f, app, view),
             Overlay::Tree(view) => draw_tree_overlay(f, app, view),
             Overlay::Review(view) => draw_review_overlay(f, app, view),
+            Overlay::Jump(view) => crate::jump::draw(f, app, &view),
         }
     }
 }

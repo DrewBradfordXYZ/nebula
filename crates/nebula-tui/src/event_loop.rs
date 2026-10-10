@@ -35,6 +35,7 @@ mod background;
 mod commands;
 mod focus_walk;
 mod host_terminal;
+mod jump;
 mod key_modes;
 mod launcher;
 mod loop_run;

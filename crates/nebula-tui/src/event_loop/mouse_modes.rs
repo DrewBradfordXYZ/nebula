@@ -30,6 +30,14 @@ fn handle_overlay_mouse(
     // way out lives in `overlay_close`, and where focus goes after in
     // `land_click_focus`. Dismissing can put another modal up (a confirm
     // backs out to the settings it came from); focus stays put under that.
+    // JUMP MODE's labels are over the whole frame, not in a box: any
+    // press puts them away and goes on to what it landed on.
+    if matches!(mouse.kind, MouseEventKind::Down(_))
+        && matches!(app.modals.overlay, Some(Overlay::Jump(_)))
+    {
+        app.modals.overlay = None;
+        app.chrome.dirty = true;
+    }
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
         if let Some(overlay) = &app.modals.overlay {
             if crate::overlay_close::click_is_outside(overlay, mouse_pos) {
