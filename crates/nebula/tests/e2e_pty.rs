@@ -464,6 +464,8 @@ async fn full_crud_attach_and_restart_persistence() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -898,6 +900,8 @@ async fn hook_post_from_agent_pty_drives_status() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -1238,6 +1242,8 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -1367,6 +1373,8 @@ async fn claude_session_title_and_row_name_stay_tied() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -1533,6 +1541,8 @@ async fn restart_rebinds_an_attached_client_to_the_new_pty() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -1670,6 +1680,8 @@ async fn codex_hooks_install_and_drive_status() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -2329,6 +2341,8 @@ async fn reload_keeps_an_agent_of_every_harness() {
                 cloud_prompt: None,
                 starting_prompt: None,
                 issue_url: None,
+                issue_id: None,
+                issue_source: None,
                 role: nebula_core::AgentRole::Worker,
             },
         )
@@ -2678,6 +2692,8 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -2831,6 +2847,8 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -2890,6 +2908,8 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 starting_prompt: None,
                 issue_url: None,
                 role: nebula_core::AgentRole::Worker,
+                issue_id: None,
+                issue_source: None,
             },
         )
         .await
@@ -2978,6 +2998,8 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -3051,6 +3073,8 @@ async fn create_agent_get_id(
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -3235,6 +3259,8 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -3461,6 +3487,8 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -3510,6 +3538,8 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -3628,6 +3658,8 @@ async fn prewarm_worktree_sessions_boots_nothing_when_switched_off() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -3773,6 +3805,8 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -4167,6 +4201,8 @@ async fn auto_title_instruction_and_rename_flow() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -4392,6 +4428,8 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -4700,6 +4738,8 @@ async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await
@@ -5228,6 +5268,8 @@ exit 0
             starting_prompt: None,
             issue_url: None,
             role: nebula_core::AgentRole::Worker,
+            issue_id: None,
+            issue_source: None,
         },
     )
     .await

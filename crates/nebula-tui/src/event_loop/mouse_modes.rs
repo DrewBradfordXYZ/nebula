@@ -816,7 +816,7 @@ fn handle_left_click_target(app: &mut App, mouse: MouseEvent, out: &mut Vec<Clie
         }
         // Never in the hit map: the ISSUES and PULL REQUESTS MODALS route
         // the click on their button themselves, before this is reached.
-        Some(HitTarget::ModalBrowser) => {}
+        Some(HitTarget::ModalBrowser | HitTarget::IssueLabel(_) | HitTarget::IssueLabelsMore) => {}
         Some(
             target @ (HitTarget::ProjectRow(_)
             | HitTarget::WorktreeRow(_)

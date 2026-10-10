@@ -566,6 +566,10 @@ pub(crate) fn update_pointer(app: &mut App, mouse: &MouseEvent) {
             ratatui::layout::Position::new(mouse.column, mouse.row),
         )
     });
+    // The LABEL BAR's labels underline as the header's counts do.
+    let crumb = crumb.or_else(|| {
+        crate::issues::bar_item_under(app, ratatui::layout::Position::new(mouse.column, mouse.row))
+    });
     if app.launcher.hover_crumb != crumb {
         app.launcher.hover_crumb = crumb;
         app.chrome.dirty = true;

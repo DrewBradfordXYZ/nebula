@@ -261,7 +261,12 @@ pub(super) fn draft(
         starting_prompt: Some(launch.compose(&text))
             .filter(|prompt| !launch.cloud && !prompt.is_empty()),
         // An ISSUE SESSION's context, persisted by the DAEMON with the row.
-        issue_url: launch.issue.as_ref().map(|issue| issue.url.clone()),
+        issue_url: launch.issue.as_ref().and_then(|issue| issue.launch_url()),
+        issue_id: launch.issue.as_ref().and_then(|issue| issue.launch_id()),
+        issue_source: launch
+            .issue
+            .as_ref()
+            .and_then(|issue| issue.launch_source()),
         // A PR SESSION's: the create goes to the PROJECT as a
         // `CreatePrAgent`, and `worktree` only names which.
         pr: launch.pr.clone(),
@@ -359,6 +364,7 @@ mod tests {
                     alive: true,
                     issue_url: None,
                     role: nebula_core::AgentRole::Worker,
+                    source_issue: None,
                     recent_prompts: Vec::new(),
                 }),
             },

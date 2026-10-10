@@ -72,6 +72,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             issue_url: None,
+            source_issue: None,
             role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };

@@ -538,7 +538,8 @@ the word `archived`: the header says it once, for all of them.
 ## The ISSUES MODAL and ISSUE SESSIONS
 
 `i` lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,
-pull requests left out — down the left of a modal, and reads the one under the cursor on the right:
+pull requests left out, followed by those of any ISSUE SOURCE its repository adds (see
+[Configuration](configuration.md#issue-sources)) — down the left of a modal, and reads the one under the cursor on the right:
 number and title, who opened it and when, its labels, the description rendered as markdown (a newline
 is a line break, as GitHub shows a comment), and,
 once the cursor has rested on the row for a moment, its comments (`gh issue view`, one call per issue
@@ -555,7 +556,26 @@ stays on the issue it was on, by URL, when a refresh retires a row above it.
 The list filters as you type, from the moment the modal is up — the FILE FINDER's and the DIFF
 VIEWER's way, no key to press first: letters narrow the rows to the fuzzy matches of `#15 title`,
 best first, the cursor on the best with its comments asked for as any move asks for them, the matched
-letters lit in each row and the title's count reading `2/14`. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
+letters lit in each row and the title's count reading `2/14`. A `label:` term keeps only the issues
+carrying a matching label — part of the name is enough, any case, and every term must match:
+`label:bug login` is the bug-labelled issues matching `login`, and `label:"good first issue"` quotes
+a label with spaces. While the caret ends a `label:` word, LABEL COMPLETION hangs the labels that
+could finish it under the filter, with how many of the listed issues carry each — names that start
+with what you typed first; a bare `label:` lists every label, eight at a time, the frame saying
+`↓ 5 more` for the rest as `↓` scrolls to them. `Tab` (or `Enter`, or a click) finishes the word with the highlighted one,
+`↑`/`↓` choose, and `Esc` closes the suggestions before it clears anything.
+
+While the listed issues carry labels, the LABEL BAR is the line under the filter: the filter's own
+`label:` terms first, as chips with how many issues they leave and a `×`, then the other labels on
+those issues, the most used first with their counts, as many as fit before the MORE CHIP — `22 more
+▾`, as the project tabs have one — stands for the rest: a click on it opens the MORE LIST of just
+those labels (`↑`/`↓` choose, `Enter` or a click adds one, `Esc` or any other key closes it). A
+label every listed issue carries narrows nothing and is left off. A click on a label adds it to the
+filter as a `label:` term and a click on a chip takes its term out — the same text typing writes,
+so the bar is also where the syntax shows itself; the counts follow the filter, so the next label
+narrows what the last one left. The cursor stays on the issue you are reading while it still
+matches. Each label underlines under the pointer, as the header's counts do. A repo whose issues
+carry no labels never sees the bar, and the rows keep their place. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
 matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` (or `Ctrl+y`) and `Ctrl+o` act on the issue you found. `Esc`
 clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every
 fuzzy overlay; a filter nothing matches says `no issues match` and leaves the cursor where it was for

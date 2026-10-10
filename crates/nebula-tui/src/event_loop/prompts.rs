@@ -183,21 +183,21 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
 
         PromptKind::IssueComment { issue, .. } => {
             let title = if issue.title.trim().is_empty() {
-                format!("Comment on issue #{}", issue.number)
+                format!("Comment on issue {}", issue.tag())
             } else {
                 format!(
-                    "Comment on issue #{} · {}",
-                    issue.number,
+                    "Comment on issue {} · {}",
+                    issue.tag(),
                     crate::ui::truncate(issue.title.trim(), 40)
                 )
             };
+            let how = match issue.origin {
+                crate::issues::Origin::GitHub => "posted as you, with gh issue comment",
+                crate::issues::Origin::Source => "posted with the issue source's comment",
+            };
             (
                 title.into(),
-                format!(
-                    "what do you want to say on #{}? (posted as you, with gh issue comment)",
-                    issue.number
-                )
-                .into(),
+                format!("what do you want to say on {}? ({how})", issue.tag()).into(),
                 String::new(),
             )
         }

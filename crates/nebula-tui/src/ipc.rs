@@ -223,9 +223,13 @@ fn daemon_exe_path(pid: i32) -> Option<String> {
 pub struct IpcChannels {
     pub tx: tokio::sync::mpsc::Sender<ClientRequest>,
     pub rx: tokio::sync::mpsc::Receiver<ServerEvent>,
+    /// The protocol the daemon answered `Hello` with, so a request field
+    /// it may not decode is sent only to one that can.
+    pub daemon_protocol: u32,
 }
 
 pub fn split_connection(conn: Connection) -> IpcChannels {
+    let daemon_protocol = conn.protocol_version;
     let (read_half, mut write_half) = conn.stream.into_split();
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<ServerEvent>(1024);
     let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ClientRequest>(256);
@@ -251,6 +255,7 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
     IpcChannels {
         tx: req_tx,
         rx: event_rx,
+        daemon_protocol,
     }
 }
 

@@ -1,4 +1,8 @@
-//! The ISSUES MODAL: the selected project's open GitHub issues, listed
+//! The ISSUES MODAL: the selected project's open GitHub issues — and
+//! after them those of every ISSUE SOURCE its repository adds in git
+//! config (`nebula.issueSource`), each a program asked the same things
+//! through a small JSON protocol ([`list`], [`detail`], [`comment`],
+//! [`edit`]) — listed
 //! newest first down the left, the one under the cursor read on the right,
 //! and two ways to put an agent on it — a QUICK PROMPT (`Enter`) or one
 //! of the saved AGENT PRESETS (`Shift+Tab`), the QUICK PROMPT box's own
@@ -67,7 +71,7 @@ use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{clamp_selection, App, HitTarget, Overlay};
-use crate::filter_list::FilterList;
+use crate::filter_list::{window_start, FilterList, QueryTerms};
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
 use crate::pull_request::{gh, login, str_at, web_url};
@@ -125,12 +129,86 @@ const LIST_PCT: u16 = crate::pr_modal::LIST_PCT;
 const MIN_LIST_W: u16 = crate::pr_modal::MIN_LIST_W;
 const WHEEL_LINES: i32 = crate::pr_modal::WHEEL_LINES;
 
-/// One open issue, as `gh issue list` reports it. The body rides the list
-/// — one call paints the whole reading pane — and only the comments are a
-/// second, per-row call ([`detail`]).
+/// Where a project's issues come from: GitHub through `gh`, and beside it
+/// every ISSUE SOURCE program the repository names in git config
+/// (`nebula.issueSource`, one value per source) — read fresh at every ask
+/// ([`sources_of`]), as the worktree hooks are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueSource {
+    GitHub,
+    /// The program's path, as git config gives it.
+    Program(String),
+}
+
+impl IssueSource {
+    /// How a message names it: `gh`, or the program's file name (the path
+    /// is the user's to remember).
+    pub fn name(&self) -> String {
+        match self {
+            IssueSource::GitHub => "gh".to_string(),
+            IssueSource::Program(program) => program_name(program),
+        }
+    }
+}
+
+/// A source program's file name, or the value as given when it has none.
+pub fn program_name(program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .map_or_else(|| program.to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Which kind of source an [`Issue`] came from: what names it on a row
+/// (`#15` or `ENG-123`), and what a launch tells the DAEMON (a GitHub
+/// issue's URL, a source issue's id).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Origin {
+    #[default]
+    GitHub,
+    Source,
+}
+
+impl Origin {
+    /// How a row, a title or a message names the issue: `#15` on GitHub,
+    /// the source's own id elsewhere.
+    pub fn tag(self, id: &str) -> String {
+        match self {
+            Origin::GitHub => format!("#{id}"),
+            Origin::Source => id.to_string(),
+        }
+    }
+
+    /// What did the asking, for a message saying it failed.
+    pub fn asker(self) -> &'static str {
+        match self {
+            Origin::GitHub => "gh",
+            Origin::Source => "the issue source",
+        }
+    }
+}
+
+/// One open issue, as `gh issue list` — or the ISSUE SOURCE's `list` —
+/// reports it. The body rides the list — one call paints the whole
+/// reading pane — and only the comments are a second, per-row call
+/// ([`detail`]); a source that leaves the body out of its list hands it
+/// over there instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
-    pub number: u64,
+    /// What tells this issue from every other the TUI holds, across
+    /// projects: a GitHub issue's URL, or a source issue's checkout and id
+    /// ([`source_key`]) — its page may be missing, or another project's
+    /// too.
+    pub key: String,
+    /// What the source calls it, and what is passed back to ask about it:
+    /// GitHub's number, a tracker's key (`ENG-123`), an id (`e6c61bf`).
+    pub id: String,
+    #[serde(default)]
+    pub origin: Origin,
+    /// The ISSUE SOURCE program it came from — empty for a GitHub issue.
+    /// What `view`, `comment` and `edit` ask, and what a launch names.
+    #[serde(default)]
+    pub source: String,
+    /// Its web page — empty for a source issue that has none.
     pub url: String,
     pub title: String,
     pub author: String,
@@ -145,44 +223,109 @@ pub struct Issue {
 }
 
 impl Issue {
+    /// `#15` or `ENG-123`.
+    pub fn tag(&self) -> String {
+        self.origin.tag(&self.id)
+    }
+
     /// Row text: `#15 title`, the shape the OPEN PRS rows use.
     pub fn label(&self) -> String {
-        crate::pull_request::numbered_label(self.number, &self.title)
+        tagged_label(&self.tag(), &self.title)
+    }
+
+    /// Whether `source` is where this row was listed from.
+    pub fn is_from(&self, source: &IssueSource) -> bool {
+        match source {
+            IssueSource::GitHub => self.origin == Origin::GitHub,
+            IssueSource::Program(program) => {
+                self.origin == Origin::Source && &self.source == program
+            }
+        }
     }
 
     /// What a launch carries from the row to the DAEMON.
     pub fn launch_ref(&self) -> IssueRef {
         IssueRef {
+            key: self.key.clone(),
+            id: self.id.clone(),
+            origin: self.origin,
+            source: self.source.clone(),
             url: self.url.clone(),
-            number: self.number,
             title: self.title.clone(),
         }
     }
 }
 
+/// `tag title`, or the tag alone for an untitled issue.
+fn tagged_label(tag: &str, title: &str) -> String {
+    if title.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{tag} {title}")
+    }
+}
+
+/// A source issue's [`Issue::key`]: the checkout and source it was listed
+/// from and its id, so two trackers — two projects', or two sources of one
+/// project — can't collide on `1`.
+pub fn source_key(dir: &Path, program: &str, id: &str) -> String {
+    format!("{}#{program}#{id}", dir.display())
+}
+
 /// The issue a QUICK PROMPT or AGENT PRESET launch is for: enough to name
 /// it in the box's title, cut a branch for it, write the default task, and
-/// send the URL the DAEMON persists.
+/// send what the DAEMON persists — a GitHub issue's URL, a source issue's
+/// id (and its page, when it has one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueRef {
+    pub key: String,
+    pub id: String,
+    pub origin: Origin,
+    /// The ISSUE SOURCE program; empty for a GitHub issue.
+    pub source: String,
     pub url: String,
-    pub number: u64,
     pub title: String,
 }
 
 impl IssueRef {
+    /// `#15` or `ENG-123`.
+    pub fn tag(&self) -> String {
+        self.origin.tag(&self.id)
+    }
+
     /// The task sent when the box is submitted empty: the issue itself.
     pub fn default_task(&self) -> String {
-        if self.title.trim().is_empty() {
-            format!("Fix GitHub issue #{} ({})", self.number, self.url)
+        let (what, tag) = match self.origin {
+            Origin::GitHub => ("GitHub issue", self.tag()),
+            Origin::Source => ("issue", self.tag()),
+        };
+        let page = if self.url.is_empty() {
+            String::new()
         } else {
-            format!(
-                "Fix GitHub issue #{}: {} ({})",
-                self.number,
-                self.title.trim(),
-                self.url
-            )
+            format!(" ({})", self.url)
+        };
+        if self.title.trim().is_empty() {
+            format!("Fix {what} {tag}{page}")
+        } else {
+            format!("Fix {what} {tag}: {}{page}", self.title.trim())
         }
+    }
+
+    /// `CreateAgent::issue_url`: a GitHub issue's URL, or a source issue's
+    /// page when it has one.
+    pub fn launch_url(&self) -> Option<String> {
+        (!self.url.is_empty()).then(|| self.url.clone())
+    }
+
+    /// `CreateAgent::issue_id`: a source issue's id; None on GitHub, whose
+    /// URL alone names the issue.
+    pub fn launch_id(&self) -> Option<String> {
+        (self.origin == Origin::Source).then(|| self.id.clone())
+    }
+
+    /// `CreateAgent::issue_source`: the program a source issue came from.
+    pub fn launch_source(&self) -> Option<String> {
+        (self.origin == Origin::Source).then(|| self.source.clone())
     }
 }
 
@@ -195,10 +338,11 @@ pub struct IssueComment {
     pub body: String,
 }
 
-/// The per-row second call: the issue's conversation.
+/// The per-row second call: the issue's conversation — and, from a source
+/// whose list leaves descriptions out, the description.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueDetail {
-    pub url: String,
+    pub body: Option<String>,
     pub comments: Vec<IssueComment>,
 }
 
@@ -225,20 +369,24 @@ pub struct IssuesBeat {
 /// run `gh` from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingIssueDetail {
-    pub url: String,
-    pub number: u64,
+    pub key: String,
+    pub id: String,
+    pub origin: Origin,
+    pub source: String,
     pub dir: PathBuf,
 }
 
 /// A finished `gh` call, back on the loop. `None` is "couldn't ask".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssuesAnswer {
+    /// Every source's answer to one ask, in the order they are listed:
+    /// GitHub first, then the ISSUE SOURCES in git config's order.
     List {
         project: ProjectId,
-        list: Option<Vec<Issue>>,
+        lists: Vec<(IssueSource, Option<Vec<Issue>>)>,
     },
     Detail {
-        url: String,
+        key: String,
         detail: Option<IssueDetail>,
     },
     /// `gh issue comment` finished; `posted` false is "couldn't post". The
@@ -254,8 +402,8 @@ pub enum IssuesAnswer {
     /// refused — the first line `gh` printed.
     Edited {
         project: ProjectId,
-        url: String,
-        number: u64,
+        key: String,
+        tag: String,
         outcome: Result<IssueText, String>,
     },
 }
@@ -287,7 +435,9 @@ pub struct IssuesView {
     /// (`ui::browser_button`), for the click and the pointer resting on
     /// it; `Rect::default()` — no point inside — while there is none.
     pub browser_area: Rect,
-    /// Issues plus the list's live filter/cursor. Empty query shows every
+    /// Issues plus the list's live filter/cursor: the rows narrow to the
+    /// fuzzy matches of `#15 title`, best first, and to the issues carrying
+    /// every `label:` term typed ([`LABEL_KEY`]). Empty query shows every
     /// row in the cache's order.
     pub list: FilterList<Issue>,
     /// `Ctrl+e`: the reading pane turned into the editor for the row under the
@@ -295,6 +445,35 @@ pub struct IssuesView {
     /// view rides a `Comment` answer, and two text fields would make that
     /// variant several times the others' size.
     pub editor: Option<Box<IssueEditor>>,
+    /// LABEL COMPLETION: which suggestion is highlighted while the caret
+    /// ends a `label:` word ([`label_completion`]), back to the first on
+    /// every edit.
+    pub suggestion: usize,
+    /// Esc closed the suggestions for the word being typed; the next edit
+    /// opens them again.
+    pub suggestions_closed: bool,
+    /// The suggestions' rows as last drawn, for clicks; `Rect::default()`
+    /// while none are up.
+    pub suggestions_area: Rect,
+    /// Whether suggestions were up at the last draw, so the footer can
+    /// name their keys.
+    pub completing: bool,
+    /// The LABEL BAR's items as last drawn, for clicks and the pointer;
+    /// empty while the bar is not drawn.
+    pub bar: Vec<BarItem>,
+    /// The index of the first suggestion the list showed at the last
+    /// draw, for click math once it has scrolled.
+    pub suggestions_first: usize,
+    /// The LABEL BAR's MORE CHIP (`22 more ▾`) as last drawn —
+    /// `Rect::default()` while every label fits — and the labels it stands
+    /// for, with their counts.
+    pub more_chip: Rect,
+    pub bar_hidden: Vec<(String, usize)>,
+    /// The MORE LIST, while open: which of the hidden labels is
+    /// highlighted. Its rows as last drawn, and the first one shown.
+    pub more: Option<usize>,
+    pub more_rows: Rect,
+    pub more_first: usize,
 }
 
 impl IssuesView {
@@ -312,6 +491,17 @@ impl IssuesView {
             browser_area: Rect::default(),
             list: FilterList::default(),
             editor: None,
+            suggestion: 0,
+            suggestions_closed: false,
+            suggestions_area: Rect::default(),
+            completing: false,
+            bar: Vec::new(),
+            suggestions_first: 0,
+            more_chip: Rect::default(),
+            bar_hidden: Vec::new(),
+            more: None,
+            more_rows: Rect::default(),
+            more_first: 0,
         }
     }
 
@@ -365,8 +555,10 @@ pub struct IssueText {
 /// Shift+Enter / Ctrl+J for a line in the description, Enter to save.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueEditor {
-    pub url: String,
-    pub number: u64,
+    pub key: String,
+    pub id: String,
+    pub origin: Origin,
+    pub source: String,
     pub title: TextInput,
     pub body: TextInput,
     pub field: EditField,
@@ -389,8 +581,10 @@ impl IssueEditor {
     /// The form prefilled from the row, caret at the end of the title.
     pub fn new(issue: &Issue) -> Self {
         Self {
-            url: issue.url.clone(),
-            number: issue.number,
+            key: issue.key.clone(),
+            id: issue.id.clone(),
+            origin: issue.origin,
+            source: issue.source.clone(),
             title: TextInput::with_text(issue.title.clone()),
             body: TextInput::multiline_with_text(issue.body.clone()),
             field: EditField::Title,
@@ -430,13 +624,59 @@ impl IssueEditor {
     }
 }
 
-// ---- gh ----
+// ---- gh, or the ISSUE SOURCE ----
 
-/// Ask `gh` for every open issue on `dir`'s repo, newest first. `None` is
+/// The git config key naming a repository's ISSUE SOURCE program.
+pub const SOURCE_KEY: &str = "nebula.issueSource";
+
+/// Where `dir`'s repository keeps its issues: GitHub, then every program
+/// its git config names under [`SOURCE_KEY`] — resolved the way git
+/// resolves any multi-valued key, so a `--global` value serves every
+/// project and a repo's own config adds to it. Read at every ask, so a
+/// change applies on the next one.
+pub async fn sources_of(dir: &Path) -> Vec<IssueSource> {
+    let ask = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get-all", SOURCE_KEY])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let programs = match tokio::time::timeout(TIMEOUT, ask).await {
+        Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut sources = vec![IssueSource::GitHub];
+    for program in programs {
+        let source = IssueSource::Program(program);
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    sources
+}
+
+/// Every open issue on `dir`'s repo, as `source` lists them: GitHub's
+/// newest first, a program's in the order it printed them. `None` is
 /// "couldn't ask" and is kept apart from `Some(vec![])`, the real answer
 /// "nothing is open": the caller keeps the last good list over a failed
 /// call. `gh issue list` leaves pull requests out on its own.
-pub async fn list(dir: &Path) -> Option<Vec<Issue>> {
+pub async fn list(source: &IssueSource, dir: &Path) -> Option<Vec<Issue>> {
+    let program = match source {
+        IssueSource::GitHub => return gh_list(dir).await,
+        IssueSource::Program(program) => program,
+    };
+    let out = run_source(program, dir, &["list"], None).await.ok()?;
+    parse_source_list(&out, dir, program)
+}
+
+async fn gh_list(dir: &Path) -> Option<Vec<Issue>> {
     let limit = LIST_LIMIT.to_string();
     let out = gh(
         Some(dir),
@@ -456,27 +696,41 @@ pub async fn list(dir: &Path) -> Option<Vec<Issue>> {
     parse_list(&out)
 }
 
-/// Ask `gh` for one issue's conversation. `number` picks it, so any
-/// checkout of the repo will do.
-pub async fn detail(dir: &Path, number: u64) -> Option<IssueDetail> {
-    let number = number.to_string();
-    let out = gh(
-        Some(dir),
-        &["issue", "view", &number, "--json", "url,comments"],
-        TIMEOUT,
-    )
-    .await?;
-    parse_detail(&out)
+/// One issue's conversation, asked of where it came from: `gh` for a
+/// GitHub issue (`id` picks it, so any checkout of the repo will do), the
+/// ISSUE SOURCE program that listed it for any other.
+pub async fn detail(dir: &Path, origin: Origin, source: &str, id: &str) -> Option<IssueDetail> {
+    match origin {
+        Origin::GitHub => {
+            let out = gh(
+                Some(dir),
+                &["issue", "view", id, "--json", "url,comments"],
+                TIMEOUT,
+            )
+            .await?;
+            parse_detail(&out)
+        }
+        Origin::Source => {
+            let out = run_source(source, dir, &["view", id], None).await.ok()?;
+            parse_source_detail(&out)
+        }
+    }
 }
 
-/// Post `body` as a comment on issue `number`, as the `gh` user. The body
-/// goes down stdin (`--body-file -`), never argv: a comment can be long,
-/// and one opening with `-` must not read as a flag. True when `gh` exited
-/// clean; anything else — no `gh`, not logged in, a network that stalled
-/// past [`TIMEOUT`] — is "couldn't post". A `gh` still running at the
-/// timeout is killed with the future, not left behind.
-pub async fn comment(dir: &Path, number: u64, body: &str) -> bool {
-    comment_via("gh", dir, number, body).await
+/// Post `body` as a comment on the issue, as the `gh` user — or through
+/// the ISSUE SOURCE's `comment`. The body goes down stdin, never argv: a
+/// comment can be long, and one opening with `-` must not read as a flag.
+/// True when the program exited clean; anything else — no program, not
+/// logged in, a network that stalled past [`TIMEOUT`] — is "couldn't
+/// post". A program still running at the timeout is killed with the
+/// future, not left behind.
+pub async fn comment(dir: &Path, origin: Origin, source: &str, id: &str, body: &str) -> bool {
+    match origin {
+        Origin::GitHub => comment_via("gh", dir, id, body).await,
+        Origin::Source => run_source(source, dir, &["comment", id], Some(body.as_bytes()))
+            .await
+            .is_ok(),
+    }
 }
 
 /// [`comment`] through `program`: `gh` in the app, a script on disk in the
@@ -484,13 +738,12 @@ pub async fn comment(dir: &Path, number: u64, body: &str) -> bool {
 async fn comment_via(
     program: impl AsRef<std::ffi::OsStr>,
     dir: &Path,
-    number: u64,
+    id: &str,
     body: &str,
 ) -> bool {
     use tokio::io::AsyncWriteExt;
-    let number = number.to_string();
     let mut child = match tokio::process::Command::new(program)
-        .args(["issue", "comment", &number, "--body-file", "-"])
+        .args(["issue", "comment", id, "--body-file", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -518,14 +771,30 @@ async fn comment_via(
     tokio::time::timeout(TIMEOUT, run).await.unwrap_or(false)
 }
 
-/// Send one issue a new title and description, as the `gh` user. Unlike
-/// the reads this wants `gh`'s complaint, not just its silence: the first
-/// line it printed is what the form shows when GitHub refuses. The
-/// description goes down stdin (`--body-file -`) as a comment's does; the
-/// title rides argv as `--title=…`, one token, so one opening with `-`
-/// can't read as a flag either.
-pub async fn edit(dir: &Path, number: u64, text: &IssueText) -> Result<(), String> {
-    edit_via("gh", dir, number, text).await
+/// Send one issue a new title and description, as the `gh` user — or
+/// through the ISSUE SOURCE's `edit`, which reads both as one JSON object
+/// on stdin. Unlike the reads this wants the program's complaint, not
+/// just its silence: the first line it printed is what the form shows
+/// when the tracker refuses. On GitHub the description goes down stdin
+/// (`--body-file -`) as a comment's does; the title rides argv as
+/// `--title=…`, one token, so one opening with `-` can't read as a flag
+/// either.
+pub async fn edit(
+    dir: &Path,
+    origin: Origin,
+    source: &str,
+    id: &str,
+    text: &IssueText,
+) -> Result<(), String> {
+    match origin {
+        Origin::GitHub => edit_via("gh", dir, id, text).await,
+        Origin::Source => {
+            let input = serde_json::json!({ "title": text.title, "body": text.body }).to_string();
+            run_source(source, dir, &["edit", id], Some(input.as_bytes()))
+                .await
+                .map(|_| ())
+        }
+    }
 }
 
 /// [`edit`] through `program`: `gh` in the app, a script on disk in the
@@ -533,14 +802,13 @@ pub async fn edit(dir: &Path, number: u64, text: &IssueText) -> Result<(), Strin
 async fn edit_via(
     program: impl AsRef<std::ffi::OsStr>,
     dir: &Path,
-    number: u64,
+    id: &str,
     text: &IssueText,
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
-    let number = number.to_string();
     let title = format!("--title={}", text.title);
     let mut child = tokio::process::Command::new(program)
-        .args(["issue", "edit", &number, &title, "--body-file", "-"])
+        .args(["issue", "edit", id, &title, "--body-file", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -563,7 +831,7 @@ async fn edit_via(
         let (_, out) = tokio::join!(feed, child.wait_with_output());
         match out {
             Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(complaint(&out.stderr)),
+            Ok(out) => Err(complaint(&out.stderr, "gh refused the edit")),
             Err(e) => Err(format!("gh failed: {e}")),
         }
     };
@@ -572,14 +840,69 @@ async fn edit_via(
         .unwrap_or_else(|_| Err("gh timed out".into()))
 }
 
-/// The first line `gh` printed that says anything, as a shell would have
-/// shown it; a silent refusal gets a stock one.
-fn complaint(stderr: &[u8]) -> String {
+/// Run the ISSUE SOURCE `program` with `args` from `dir`, with `input` on
+/// its stdin (or none), under [`TIMEOUT`]: its stdout when it exits 0,
+/// else the first line it printed to stderr, as [`complaint`] reads it.
+/// Spawned directly, with no shell, as the worktree hooks are — a path
+/// with a space in it is still one program.
+async fn run_source(
+    program: &str,
+    dir: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    let verb = args.first().copied().unwrap_or_default();
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("couldn't run {program}: {e}"))?;
+    let stdin = child.stdin.take();
+    let input = input.map(<[u8]>::to_vec);
+    let feed = async move {
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await?;
+        }
+        std::io::Result::Ok(())
+    };
+    // Feed and wait together, as `gh`'s comment does: a program that
+    // exits before reading would otherwise leave the write blocked.
+    let run = async {
+        let (_, out) = tokio::join!(feed, child.wait_with_output());
+        match out {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+            Ok(out) => Err(complaint(
+                &out.stderr,
+                &format!("the issue source's {verb} failed"),
+            )),
+            Err(e) => Err(format!("{program} failed: {e}")),
+        }
+    };
+    tokio::time::timeout(TIMEOUT, run)
+        .await
+        .unwrap_or_else(|_| Err(format!("the issue source's {verb} timed out")))
+}
+
+/// The first line a program printed that says anything, as a shell would
+/// have shown it; a silent refusal gets `fallback`.
+fn complaint(stderr: &[u8], fallback: &str) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .map_or_else(|| "gh refused the edit".to_string(), str::to_string)
+        .map_or_else(|| fallback.to_string(), str::to_string)
 }
 
 /// Parse `gh issue list --json …` — a bare array. A row with no number or
@@ -593,7 +916,10 @@ fn parse_list(json: &str) -> Option<Vec<Issue>> {
             .filter_map(|v| {
                 let url = web_url(v)?;
                 Some(Issue {
-                    number: v.get("number")?.as_u64()?,
+                    key: url.clone(),
+                    id: v.get("number")?.as_u64()?.to_string(),
+                    origin: Origin::GitHub,
+                    source: String::new(),
                     url,
                     title: str_at(v, "title"),
                     author: login(v.get("author")),
@@ -619,7 +945,7 @@ fn parse_list(json: &str) -> Option<Vec<Issue>> {
 
 fn parse_detail(json: &str) -> Option<IssueDetail> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let url = web_url(&v)?;
+    web_url(&v)?;
     let mut comments: Vec<IssueComment> = v
         .get("comments")
         .and_then(|c| c.as_array())
@@ -635,7 +961,96 @@ fn parse_detail(json: &str) -> Option<IssueDetail> {
         .unwrap_or_default();
     // RFC 3339 UTC stamps sort lexicographically into chronological order.
     comments.sort_by(|a, b| a.at.cmp(&b.at));
-    Some(IssueDetail { url, comments })
+    Some(IssueDetail {
+        body: None,
+        comments,
+    })
+}
+
+/// An ISSUE SOURCE id as its JSON gives it — a string, or a bare number
+/// for a tracker that numbers its issues — when it is one token a launch
+/// can carry: no whitespace or control characters, not opening with `-`
+/// (it is passed back to the program as an argument), and bounded. The
+/// DAEMON holds a launch to the same rule.
+fn source_id(v: &serde_json::Value) -> Option<String> {
+    const MAX_ID_BYTES: usize = 256;
+    let id = match v {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let token = !id.is_empty()
+        && id.len() <= MAX_ID_BYTES
+        && !id.starts_with('-')
+        && !id.chars().any(|c| c.is_whitespace() || c.is_control());
+    token.then_some(id)
+}
+
+/// Parse an ISSUE SOURCE's `list`: a bare array of issues, each an `id` and
+/// whatever else the source knows — `title`, `url`, `author`, `created_at`,
+/// `updated_at`, `labels` (an array of names) and `body`. A row whose id is
+/// missing or unusable drops out rather than failing the list, as does a
+/// `url` a browser can't open; a payload that isn't an array is a miss.
+fn parse_source_list(json: &str, dir: &Path, program: &str) -> Option<Vec<Issue>> {
+    let rows = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let rows = rows.as_array()?;
+    Some(
+        rows.iter()
+            .filter_map(|v| {
+                let id = source_id(v.get("id")?)?;
+                Some(Issue {
+                    key: source_key(dir, program, &id),
+                    origin: Origin::Source,
+                    source: program.to_string(),
+                    url: web_url(v).unwrap_or_default(),
+                    title: str_at(v, "title"),
+                    author: str_at(v, "author"),
+                    created_at: str_at(v, "created_at"),
+                    updated_at: str_at(v, "updated_at"),
+                    labels: v
+                        .get("labels")
+                        .and_then(|l| l.as_array())
+                        .map(|labels| {
+                            labels
+                                .iter()
+                                .filter_map(|l| l.as_str())
+                                .filter(|n| !n.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    body: str_at(v, "body"),
+                    id,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Parse an ISSUE SOURCE's `view`: an object with the issue's `comments`
+/// (each an `author`, a `created_at` and a `body`), and its `body` when
+/// the list left the description out. Anything but an object is a miss.
+fn parse_source_detail(json: &str) -> Option<IssueDetail> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.as_object()?;
+    let comments: Vec<IssueComment> = v
+        .get("comments")
+        .and_then(|c| c.as_array())
+        .map(|list| {
+            list.iter()
+                .map(|c| IssueComment {
+                    author: str_at(c, "author"),
+                    at: str_at(c, "created_at"),
+                    body: str_at(c, "body"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // In the source's order: its stamps need not sort as text.
+    Some(IssueDetail {
+        body: v.get("body").and_then(|b| b.as_str()).map(str::to_string),
+        comments,
+    })
 }
 
 /// `2026-09-10` out of an RFC 3339 stamp; empty when there is none.
@@ -683,7 +1098,41 @@ fn has_query(view: &IssuesView) -> bool {
 
 fn rebuild_list(view: &mut IssuesView, rows: &[Issue]) {
     view.list.items = rows.to_vec();
-    view.list.apply_filter(|issue| issue.label());
+    view.list
+        .apply_filter_where(&[LABEL_KEY], |issue| issue.label(), carries_labels);
+}
+
+/// The issues list's one filter key: `label:bug` keeps the rows carrying a
+/// label containing `bug` (`label:plugin` finds `browser-plugin` and
+/// `plugin-sdk` alike, case ignored), every such term must match, and the
+/// rest of the text ranks and lights `#15 title` as before.
+const LABEL_KEY: &str = "label";
+
+/// The rows `query` leaves, as indices into `list`, in the order the
+/// list shows them: what `rebuild_list` filters to, for a query other
+/// than the typed one (LABEL COMPLETION counts over the rest of the
+/// filter).
+fn filtered_rows(query: &str, list: &[Issue]) -> Vec<usize> {
+    crate::filter_list::rank_where(
+        query,
+        &[LABEL_KEY],
+        list,
+        |issue| issue.label(),
+        carries_labels,
+    )
+    .into_iter()
+    .map(|m| m.item)
+    .collect()
+}
+
+/// Whether `issue` carries a label for every `label:` term typed.
+fn carries_labels(issue: &Issue, terms: &QueryTerms) -> bool {
+    terms.values(LABEL_KEY).all(|term| {
+        issue
+            .labels
+            .iter()
+            .any(|label| label.to_lowercase().contains(&term.to_lowercase()))
+    })
 }
 
 /// The row under the cursor, as an index into `list`: `selected` while
@@ -741,8 +1190,25 @@ fn request_list(app: &mut App, project: ProjectId, dir: PathBuf) {
     };
     app.github.issues_inflight.insert(project.clone());
     tokio::spawn(async move {
-        let list = list(&dir).await;
-        let _ = tx.send(IssuesAnswer::List { project, list });
+        // Every source at once; the answer waits for the slowest.
+        let asks: Vec<_> = sources_of(&dir)
+            .await
+            .into_iter()
+            .map(|source| {
+                let dir = dir.clone();
+                tokio::spawn(async move {
+                    let list = list(&source, &dir).await;
+                    (source, list)
+                })
+            })
+            .collect();
+        let mut lists = Vec::with_capacity(asks.len());
+        for ask in asks {
+            if let Ok(answer) = ask.await {
+                lists.push(answer);
+            }
+        }
+        let _ = tx.send(IssuesAnswer::List { project, lists });
     });
 }
 
@@ -898,16 +1364,18 @@ fn arm_beat(app: &mut App, project: &ProjectId, found: bool) {
 /// pane.
 pub(crate) fn schedule_detail(app: &mut App) {
     let pending = issue_in_focus(app).and_then(|(issue, dir)| {
-        let url = issue.url.clone();
-        if app.github.issue_detail.contains_key(&url)
-            || app.github.issue_detail_inflight.contains(&url)
-            || app.github.issue_detail_failed.contains(&url)
+        let key = issue.key.clone();
+        if app.github.issue_detail.contains_key(&key)
+            || app.github.issue_detail_inflight.contains(&key)
+            || app.github.issue_detail_failed.contains(&key)
         {
             return None;
         }
         Some(PendingIssueDetail {
-            url,
-            number: issue.number,
+            key,
+            id: issue.id,
+            origin: issue.origin,
+            source: issue.source,
             dir,
         })
     });
@@ -922,51 +1390,73 @@ pub(crate) fn lookup_detail(app: &mut App) {
         return;
     };
     if !pending.dir.is_dir() {
-        app.github.issue_detail_failed.insert(pending.url);
+        app.github.issue_detail_failed.insert(pending.key);
         app.chrome.dirty = true;
         return;
     }
     let Some(tx) = app.github.issues_tx.clone() else {
         return;
     };
-    app.github.issue_detail_inflight.insert(pending.url.clone());
+    app.github.issue_detail_inflight.insert(pending.key.clone());
     tokio::spawn(async move {
-        let detail = detail(&pending.dir, pending.number).await;
+        let detail = detail(&pending.dir, pending.origin, &pending.source, &pending.id).await;
         let _ = tx.send(IssuesAnswer::Detail {
-            url: pending.url,
+            key: pending.key,
             detail,
         });
     });
 }
 
 /// A `gh` answer landed. A list replaces the project's rows — keeping the
-/// cursor on the issue it was on, by URL, so a refresh that retired a row
+/// cursor on the issue it was on, by key, so a refresh that retired a row
 /// above it does not slide the selection — and a failed list keeps the
 /// last good one, or says so when there is none; either way the next
 /// background ask is armed off it. Comments replace whatever the pane
-/// showed for the URL; a failed fetch is remembered so the pane says so
+/// showed for the issue — and a description a source handed over only
+/// here fills its row; a failed fetch is remembered so the pane says so
 /// instead of spinning.
 pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
     match answer {
-        IssuesAnswer::List { project, list } => {
+        IssuesAnswer::List { project, lists } => {
             app.github.issues_inflight.remove(&project);
+            app.github.issue_sources_missed.insert(
+                project.clone(),
+                lists
+                    .iter()
+                    .filter(|(_, list)| list.is_none())
+                    .map(|(source, _)| source.clone())
+                    .collect(),
+            );
+            let list = merge_lists(app.github.issues.get(&project), lists);
             arm_beat(app, &project, list.as_ref().is_some_and(|l| !l.is_empty()));
             match list {
-                Some(list) => {
-                    let cursor_url = match &app.modals.overlay {
+                Some(mut list) => {
+                    let cursor_url: Option<String> = match &app.modals.overlay {
                         Some(Overlay::Issues(view)) if view.project == project => app
                             .github
                             .issues
                             .get(&project)
                             .and_then(|l| l.list.get(cursor_index(view, &l.list)?))
-                            .map(|i| i.url.clone()),
+                            .map(|i| i.key.clone()),
                         _ => None,
                     };
                     app.github.issues_failed.remove(&project);
                     let len = list.len();
+                    // A description only `view` gave keeps its row filled
+                    // across the refresh.
+                    for issue in list.iter_mut().filter(|i| i.body.is_empty()) {
+                        if let Some(body) = app
+                            .github
+                            .issue_detail
+                            .get(&issue.key)
+                            .and_then(|d| d.body.clone())
+                        {
+                            issue.body = body;
+                        }
+                    }
                     let position = cursor_url
                         .as_ref()
-                        .and_then(|url| list.iter().position(|i| &i.url == url));
+                        .and_then(|key| list.iter().position(|i| &i.key == key));
                     app.github.issues.insert(
                         project.clone(),
                         IssueList {
@@ -998,14 +1488,25 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 }
             }
         }
-        IssuesAnswer::Detail { url, detail } => {
-            app.github.issue_detail_inflight.remove(&url);
+        IssuesAnswer::Detail { key, detail } => {
+            app.github.issue_detail_inflight.remove(&key);
             match detail {
                 Some(detail) => {
-                    app.github.issue_detail.insert(url, detail);
+                    if let Some(body) = detail.body.as_ref().filter(|b| !b.is_empty()) {
+                        for issue in app
+                            .github
+                            .issues
+                            .values_mut()
+                            .flat_map(|l| l.list.iter_mut())
+                            .filter(|i| i.key == key && i.body.is_empty())
+                        {
+                            issue.body = body.clone();
+                        }
+                    }
+                    app.github.issue_detail.insert(key, detail);
                 }
                 None => {
-                    app.github.issue_detail_failed.insert(url);
+                    app.github.issue_detail_failed.insert(key);
                 }
             }
         }
@@ -1015,20 +1516,26 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
             text,
             posted,
         } => {
-            app.github.issue_comment_inflight.remove(&issue.url);
+            app.github.issue_comment_inflight.remove(&issue.key);
             if posted {
                 // The conversation the pane has is one comment short now:
                 // forget it, and the cursor resting on the row reads it
                 // again, with the new comment in.
-                app.github.issue_detail.remove(&issue.url);
-                app.github.issue_detail_failed.remove(&issue.url);
-                app.chrome.flash = Some(format!("comment posted on #{}", issue.number));
+                app.github.issue_detail.remove(&issue.key);
+                app.github.issue_detail_failed.remove(&issue.key);
+                app.chrome.flash = Some(format!("comment posted on {}", issue.tag()));
                 schedule_detail(app);
             } else {
-                app.chrome.flash = Some(format!(
-                    "couldn't post the comment on #{} — is gh logged in?",
-                    issue.number
-                ));
+                app.chrome.flash = Some(match issue.origin {
+                    Origin::GitHub => format!(
+                        "couldn't post the comment on {} — is gh logged in?",
+                        issue.tag()
+                    ),
+                    Origin::Source => format!(
+                        "couldn't post the comment on {} — the issue source refused it",
+                        issue.tag()
+                    ),
+                });
                 // The box comes back with the text for a retry — unless
                 // something else has been opened over the modal meanwhile,
                 // which the flash must not interrupt.
@@ -1039,8 +1546,8 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
         }
         IssuesAnswer::Edited {
             project,
-            url,
-            number,
+            key,
+            tag,
             outcome,
         } => match outcome {
             Ok(text) => {
@@ -1050,7 +1557,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     .github
                     .issues
                     .get_mut(&project)
-                    .and_then(|l| l.list.iter_mut().find(|i| i.url == url))
+                    .and_then(|l| l.list.iter_mut().find(|i| i.key == key))
                 {
                     row.title = text.title;
                     row.body = text.body;
@@ -1059,12 +1566,12 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     if view
                         .editor
                         .as_ref()
-                        .is_some_and(|e| e.saving && e.url == url)
+                        .is_some_and(|e| e.saving && e.key == key)
                     {
                         view.editor = None;
                     }
                 }
-                app.chrome.flash = Some(format!("issue #{number} updated"));
+                app.chrome.flash = Some(format!("issue {tag} updated"));
                 if let Some(dir) = app
                     .tree
                     .projects
@@ -1081,7 +1588,7 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 let mut told = false;
                 if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
                     if let Some(editor) = &mut view.editor {
-                        if editor.saving && editor.url == url {
+                        if editor.saving && editor.key == key {
                             editor.saving = false;
                             editor.notice = Some(why.clone());
                             told = true;
@@ -1089,12 +1596,38 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                     }
                 }
                 if !told {
-                    app.chrome.flash = Some(format!("couldn't update issue #{number}: {why}"));
+                    app.chrome.flash = Some(format!("couldn't update issue {tag}: {why}"));
                 }
             }
         },
     }
     app.chrome.dirty = true;
+}
+
+/// One list out of every source's answer, in their order. A source that
+/// couldn't answer keeps the rows it had, so one tracker down doesn't
+/// empty the list of the others; None when none of them answered.
+fn merge_lists(
+    previous: Option<&IssueList>,
+    lists: Vec<(IssueSource, Option<Vec<Issue>>)>,
+) -> Option<Vec<Issue>> {
+    if lists.iter().all(|(_, list)| list.is_none()) {
+        return None;
+    }
+    let mut merged = Vec::new();
+    for (source, list) in lists {
+        match list {
+            Some(list) => merged.extend(list),
+            None => merged.extend(
+                previous
+                    .into_iter()
+                    .flat_map(|l| l.list.iter())
+                    .filter(|i| i.is_from(&source))
+                    .cloned(),
+            ),
+        }
+    }
+    Some(merged)
 }
 
 // ---- commenting ----
@@ -1137,8 +1670,8 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
     let dir = view.dir.clone();
     if !dir.is_dir() {
         app.chrome.flash = Some(format!(
-            "couldn't post the comment on #{}: the checkout isn't on disk",
-            issue.number
+            "couldn't post the comment on {}: the checkout isn't on disk",
+            issue.tag()
         ));
         bring_box_back(app, view, issue, text);
         return;
@@ -1147,11 +1680,11 @@ pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, tex
     let Some(tx) = app.github.issues_tx.clone() else {
         return;
     };
-    app.github.issue_comment_inflight.insert(issue.url.clone());
-    app.chrome.flash = Some(format!("posting a comment on #{}…", issue.number));
-    let number = issue.number;
+    app.github.issue_comment_inflight.insert(issue.key.clone());
+    app.chrome.flash = Some(format!("posting a comment on {}…", issue.tag()));
+    let (origin, source, id) = (issue.origin, issue.source.clone(), issue.id.clone());
     tokio::spawn(async move {
-        let posted = comment(&dir, number, &text).await;
+        let posted = comment(&dir, origin, &source, &id, &text).await;
         let _ = tx.send(IssuesAnswer::Comment {
             view: Box::new(view),
             issue,
@@ -1171,12 +1704,14 @@ fn refresh(app: &mut App) {
     app.github.issues_failed.remove(&project);
     request_list(app, project, dir);
     if let Some((issue, dir)) = selected_issue(app) {
-        if !app.github.issue_detail_inflight.contains(&issue.url) {
-            app.github.issue_detail_failed.remove(&issue.url);
+        if !app.github.issue_detail_inflight.contains(&issue.key) {
+            app.github.issue_detail_failed.remove(&issue.key);
             app.github.pending_issue_detail = Some((
                 PendingIssueDetail {
-                    url: issue.url.clone(),
-                    number: issue.number,
+                    key: issue.key.clone(),
+                    id: issue.id.clone(),
+                    origin: issue.origin,
+                    source: issue.source.clone(),
                     dir,
                 },
                 std::time::Instant::now(),
@@ -1198,9 +1733,12 @@ fn selected_issue(app: &App) -> Option<(Issue, PathBuf)> {
     Some((issue.clone(), view.dir.clone()))
 }
 
-/// The URL of the issue under the cursor, for the browser.
+/// The URL of the issue under the cursor, for the browser — None for a
+/// source issue with no web page.
 fn selected_url(app: &App) -> Option<String> {
-    selected_issue(app).map(|(issue, _)| issue.url)
+    selected_issue(app)
+        .map(|(issue, _)| issue.url)
+        .filter(|url| !url.is_empty())
 }
 
 /// The issue whose comments the pane wants: the modal's row while the
@@ -1262,6 +1800,455 @@ fn step(app: &mut App, delta: i64) {
     }
 }
 
+// ---- the label bar ----
+
+/// One label on the LABEL BAR as last drawn: where it is, which label —
+/// for a chip, the term as typed — and whether it is one of the filter's
+/// own terms (a chip, whose click drops it) or one more to add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarItem {
+    pub area: Rect,
+    pub label: String,
+    pub active: bool,
+}
+
+/// Labels, or the filter's terms, each with how many listed issues carry it.
+type LabelCounts = Vec<(String, usize)>;
+
+/// What the LABEL BAR lists for `query` over `list`: the filter's own
+/// `label:` terms first, as typed, each with how many rows the filter
+/// leaves; then every other label on those rows, the most used first and
+/// then by name, leaving out one that every listed row carries — it would
+/// narrow nothing. Empty when there is nothing to show, and then the bar
+/// is not drawn.
+fn bar_labels(query: &str, list: &[Issue]) -> (LabelCounts, LabelCounts) {
+    let shown = filtered_rows(query, list);
+    let terms: Vec<String> = QueryTerms::parse(query, &[LABEL_KEY])
+        .values(LABEL_KEY)
+        .map(str::to_string)
+        .collect();
+    let chips: Vec<(String, usize)> = terms.iter().map(|t| (t.clone(), shown.len())).collect();
+    let mut others: Vec<(String, usize)> = Vec::new();
+    for i in &shown {
+        for label in &list[*i].labels {
+            match others.iter_mut().find(|(name, _)| name == label) {
+                Some((_, n)) => *n += 1,
+                None => others.push((label.clone(), 1)),
+            }
+        }
+    }
+    others.retain(|(name, n)| {
+        *n < shown.len() && !terms.iter().any(|t| t.eq_ignore_ascii_case(name))
+    });
+    others.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    (chips, others)
+}
+
+/// The query with `label` added as a `label:` term — quoted when the name
+/// has a space — after whatever is typed, and a space for the next word.
+fn with_label_term(query: &str, label: &str) -> String {
+    let term = if label.contains(char::is_whitespace) {
+        format!("label:\"{label}\"")
+    } else {
+        format!("label:{label}")
+    };
+    match query.trim_end() {
+        "" => format!("{term} "),
+        typed => format!("{typed} {term} "),
+    }
+}
+
+/// The query with its `label:` term for `label` taken out, the words on
+/// either side closing up.
+fn without_label_term(query: &str, label: &str) -> String {
+    let terms = QueryTerms::parse(query, &[LABEL_KEY]);
+    let Some(token) = terms
+        .terms
+        .iter()
+        .find(|t| t.key == LABEL_KEY && t.value.eq_ignore_ascii_case(label))
+    else {
+        return query.to_string();
+    };
+    let before = query[..token.span.start].trim_end();
+    let after = query[token.span.end..].trim_start();
+    match (before.is_empty(), after.is_empty()) {
+        (true, _) => after.to_string(),
+        (false, true) => format!("{before} "),
+        (false, false) => format!("{before} {after}"),
+    }
+}
+
+/// Set the filter to `text` from the LABEL BAR. The cursor stays on the
+/// issue being read when the new filter still lists it: a label narrows
+/// the list without ranking it, so there is no better row to move to, and
+/// a click must not swap the issue out from under the reader. Only an
+/// issue the change filters out moves the cursor, as any filter change.
+fn set_filter_from_bar(app: &mut App, text: String) {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return;
+    };
+    let stays = filtered_rows(&text, &view.list.items).contains(&view.selected);
+    view.list.query.set_text(text);
+    if stays {
+        view.suggestion = 0;
+        view.suggestions_closed = false;
+        let items = std::mem::take(&mut view.list.items);
+        rebuild_list(view, &items);
+        view.list.move_to_item(view.selected);
+        schedule_detail(app);
+        app.chrome.dirty = true;
+    } else {
+        query_changed(app);
+    }
+}
+
+/// A click on the LABEL BAR: a label adds its term to the filter, a chip
+/// takes its own term out — the same text typing `label:…` writes, so the
+/// click and the keys end in the same state.
+fn click_bar_item(app: &mut App, item: &BarItem) {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+        return;
+    };
+    let text = if item.active {
+        without_label_term(&view.list.query, &item.label)
+    } else {
+        with_label_term(&view.list.query, &item.label)
+    };
+    set_filter_from_bar(app, text);
+}
+
+/// The LABEL BAR item under the pointer, for `event_loop::update_pointer`
+/// to underline as it does the header's counts: the modal keeps the bar's
+/// rects outside the hit map, as it does the browser button's.
+pub(crate) fn bar_item_under(app: &App, pos: Position) -> Option<HitTarget> {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+        return None;
+    };
+    if view.more_chip.contains(pos) {
+        return Some(HitTarget::IssueLabelsMore);
+    }
+    view.bar
+        .iter()
+        .find(|item| item.area.contains(pos))
+        .map(|item| HitTarget::IssueLabel(item.label.clone()))
+}
+
+/// What [`draw_label_bar`] drew: each label's place, and the MORE CHIP's
+/// with the labels it stands for.
+struct DrawnBar {
+    items: Vec<BarItem>,
+    more_chip: Option<Rect>,
+    hidden: LabelCounts,
+}
+
+/// Draw the LABEL BAR on `area`, one line: the chips, then the other labels
+/// joined by ` · `, as many as fit with room left for the MORE CHIP —
+/// `22 more ▾`, the project tabs' `2 more ▾` for labels — standing for
+/// the rest. `hover` is the label under the pointer, `more_hover` whether
+/// the pointer is on the chip; both underline.
+fn draw_label_bar(
+    f: &mut Frame,
+    area: Rect,
+    chips: &[(String, usize)],
+    others: &[(String, usize)],
+    hover: Option<&str>,
+    more_hover: bool,
+    th: Theme,
+) -> DrawnBar {
+    let width = area.width as usize;
+    let mut items = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let place = |spans: &mut Vec<Span<'static>>, used: &mut usize, text: String, style: Style| {
+        let w = text.chars().count();
+        let rect = Rect {
+            x: area.x + *used as u16,
+            y: area.y,
+            width: w as u16,
+            height: 1,
+        };
+        spans.push(Span::styled(text, style));
+        *used += w;
+        rect
+    };
+    let underline = |label: &str, style: Style| {
+        if hover == Some(label) {
+            style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            style
+        }
+    };
+    // The focused title chip's colors: a term the filter already has.
+    let chip = Style::default().fg(th.on_accent).bg(th.accent);
+    for (term, count) in chips {
+        let text = format!(" {term} {count} × ");
+        if used + text.chars().count() > width {
+            break;
+        }
+        let rect = place(&mut spans, &mut used, text, underline(term, chip));
+        items.push(BarItem {
+            area: rect,
+            label: term.clone(),
+            active: true,
+        });
+        place(&mut spans, &mut used, " ".into(), Style::default());
+    }
+    let label_style = Style::default().fg(th.warn);
+    let more_text = |n: usize| format!("{n} more ▾");
+    let mut more_chip = None;
+    let mut hidden = Vec::new();
+    for (i, (name, count)) in others.iter().enumerate() {
+        let sep = if i == 0 { "" } else { " · " };
+        let text = format!("{name} {count}");
+        let rest = others.len() - i - 1;
+        let tail = if rest > 0 {
+            3 + more_text(rest).chars().count()
+        } else {
+            0
+        };
+        if used + sep.chars().count() + text.chars().count() + tail > width {
+            hidden = others[i..].to_vec();
+            place(
+                &mut spans,
+                &mut used,
+                sep.to_string(),
+                Style::default().fg(th.dim),
+            );
+            let style = Style::default().fg(th.muted);
+            let style = if more_hover {
+                style.add_modifier(Modifier::UNDERLINED)
+            } else {
+                style
+            };
+            let text = more_text(hidden.len());
+            if used + text.chars().count() <= width {
+                more_chip = Some(place(&mut spans, &mut used, text, style));
+            }
+            break;
+        }
+        place(
+            &mut spans,
+            &mut used,
+            sep.to_string(),
+            Style::default().fg(th.dim),
+        );
+        let rect = place(&mut spans, &mut used, text, underline(name, label_style));
+        items.push(BarItem {
+            area: rect,
+            label: name.clone(),
+            active: false,
+        });
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    DrawnBar {
+        items,
+        more_chip,
+        hidden,
+    }
+}
+
+/// The MORE CHIP: open the MORE LIST of the labels the bar had no room
+/// for, or close it when it is open — the project tabs' `2 more ▾`.
+fn toggle_more(app: &mut App) {
+    if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
+        view.more = match view.more {
+            Some(_) => None,
+            None => (!view.bar_hidden.is_empty()).then_some(0),
+        };
+        app.chrome.dirty = true;
+    }
+}
+
+/// A pick from the MORE LIST: its label joins the filter as a bar click's
+/// does, and the list closes.
+fn pick_more(app: &mut App, index: usize) {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return;
+    };
+    view.more = None;
+    let Some((label, _)) = view.bar_hidden.get(index).cloned() else {
+        return;
+    };
+    let text = with_label_term(&view.list.query, &label);
+    set_filter_from_bar(app, text);
+}
+
+/// Keys while the MORE LIST is open: ↑/↓ (and Ctrl+n/p) choose, Enter
+/// picks, Esc closes it. Any other key closes it and goes on to the
+/// filter, so typing never stops working. True when the key was the
+/// list's.
+fn handle_more_key(app: &mut App, key: &KeyEvent) -> bool {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return false;
+    };
+    let Some(selected) = view.more else {
+        return false;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let last = view.bar_hidden.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Down => view.more = Some((selected + 1).min(last)),
+        KeyCode::Up => view.more = Some(selected.saturating_sub(1)),
+        KeyCode::Char('n') if ctrl => view.more = Some((selected + 1).min(last)),
+        KeyCode::Char('p') if ctrl => view.more = Some(selected.saturating_sub(1)),
+        KeyCode::Enter => pick_more(app, selected),
+        KeyCode::Esc => view.more = None,
+        _ => {
+            view.more = None;
+            return false;
+        }
+    }
+    app.chrome.dirty = true;
+    true
+}
+
+// ---- label completion ----
+
+/// The most rows a label list (the suggestions, the MORE LIST) shows at
+/// once; the rest scroll, the frame saying how many are out of sight.
+const MAX_SUGGESTIONS: usize = 8;
+
+/// What LABEL COMPLETION offers for the word the caret ends: the byte
+/// range of that `label:` word in the query, and the labels that could
+/// finish it, with how many of the rows the rest of the filter leaves
+/// carry each.
+#[derive(Debug, PartialEq, Eq)]
+struct Completion {
+    word: std::ops::Range<usize>,
+    labels: Vec<(String, usize)>,
+}
+
+/// LABEL COMPLETION for `query` with the caret `caret` chars in: when the
+/// caret ends a word that starts `label:` (any case; `label:"` for a
+/// quoted name), the labels on the rows the rest of the filter leaves
+/// whose name contains what follows the colon — names that start with it
+/// first, then the most used, then by name — leaving out a name already
+/// typed in full. None anywhere else, so ordinary typing never sees it.
+fn label_completion(query: &str, caret: usize, list: &[Issue]) -> Option<Completion> {
+    const KEY: &str = "label:";
+    let end = query
+        .char_indices()
+        .nth(caret)
+        .map_or(query.len(), |(i, _)| i);
+    if query[end..]
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace())
+    {
+        return None;
+    }
+    // An unclosed `label:"` reaches back past the spaces in its name;
+    // anything else is the word since the last space.
+    let before = &query[..end];
+    let quoted = before
+        .to_ascii_lowercase()
+        .rfind("label:\"")
+        .filter(|&i| !before[i + KEY.len() + 1..].contains('"'));
+    let start = quoted.unwrap_or_else(|| {
+        before.rfind(char::is_whitespace).map_or(0, |i| {
+            i + before[i..].chars().next().map_or(1, char::len_utf8)
+        })
+    });
+    let word = &query[start..end];
+    let head = word.get(..KEY.len())?;
+    if !head.eq_ignore_ascii_case(KEY) {
+        return None;
+    }
+    let typed = word[KEY.len()..].trim_start_matches('"').to_lowercase();
+    let rest = format!("{} {}", &query[..start], &query[end..]);
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for i in filtered_rows(&rest, list) {
+        for label in &list[i].labels {
+            match counts.iter_mut().find(|(name, _)| name == label) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((label.clone(), 1)),
+            }
+        }
+    }
+    counts.retain(|(name, _)| {
+        let name = name.to_lowercase();
+        name.contains(&typed) && name != typed
+    });
+    counts.sort_by(|a, b| {
+        let starts = |n: &str| !n.to_lowercase().starts_with(&typed);
+        starts(&a.0)
+            .cmp(&starts(&b.0))
+            .then(b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    (!counts.is_empty()).then_some(Completion {
+        word: start..end,
+        labels: counts,
+    })
+}
+
+/// The suggestions the modal shows right now — None when the caret ends no
+/// `label:` word, nothing matches, or Esc closed them.
+fn current_completion(app: &App) -> Option<Completion> {
+    let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+        return None;
+    };
+    if view.suggestions_closed || view.editor.is_some() {
+        return None;
+    }
+    label_completion(
+        &view.list.query,
+        view.list.query.cursor_chars(),
+        &view.list.items,
+    )
+}
+
+/// Finish the `label:` word with the highlighted suggestion — quoted when
+/// the name has a space — and a space after it, ready for the next word.
+fn complete_label(app: &mut App, completion: &Completion) {
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return;
+    };
+    let index = view.suggestion.min(completion.labels.len() - 1);
+    let name = &completion.labels[index].0;
+    let term = if name.contains(char::is_whitespace) {
+        format!("label:\"{name}\" ")
+    } else {
+        format!("label:{name} ")
+    };
+    let query = view.list.query.as_str();
+    let after = query[completion.word.end..].trim_start();
+    let text = format!("{}{term}{after}", &query[..completion.word.start]);
+    let caret = query[..completion.word.start].chars().count() + term.chars().count();
+    view.list.query.set_text(text);
+    view.list.query.set_cursor_chars(caret);
+    view.suggestion = 0;
+    query_changed(app);
+}
+
+/// Keys LABEL COMPLETION takes while its suggestions are up: Tab or Enter
+/// finishes the word (Enter would otherwise launch an agent on whatever
+/// row the half-typed filter left), ↑/↓ and Ctrl+n/p choose, Esc closes
+/// them. False for every other key, which the filter handles as ever.
+fn handle_completion_key(app: &mut App, key: &KeyEvent) -> bool {
+    let Some(completion) = current_completion(app) else {
+        return false;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let last = completion.labels.len() - 1;
+    let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Tab if !shift => complete_label(app, &completion),
+        KeyCode::Enter => complete_label(app, &completion),
+        KeyCode::Down => view.suggestion = (view.suggestion + 1).min(last),
+        KeyCode::Up => view.suggestion = view.suggestion.saturating_sub(1),
+        KeyCode::Char('n') if ctrl => view.suggestion = (view.suggestion + 1).min(last),
+        KeyCode::Char('p') if ctrl => view.suggestion = view.suggestion.saturating_sub(1),
+        KeyCode::Esc => view.suggestions_closed = true,
+        _ => return false,
+    }
+    app.chrome.dirty = true;
+    true
+}
+
 /// The filter's text changed: the cursor goes to its best match — the
 /// pane rewinds onto it and its comments are asked for, as any move does
 /// — or stays where it is once nothing is typed, so the row just found
@@ -1269,6 +2256,10 @@ fn step(app: &mut App, delta: i64) {
 /// filter nothing matches moves nothing: the list says so, the pane has
 /// no row to read, and the next letter or Backspace decides.
 fn query_changed(app: &mut App) {
+    if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
+        view.suggestion = 0;
+        view.suggestions_closed = false;
+    }
     let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return;
     };
@@ -1312,6 +2303,20 @@ fn open_editor(app: &mut App) {
         app.chrome.flash = Some("no issue selected".into());
         return;
     };
+    // A source whose list leaves descriptions out hands this one over with
+    // the comments: a form opened before that would show the description
+    // blank, and saving it would erase the real one.
+    if issue.origin == Origin::Source
+        && issue.body.is_empty()
+        && !app.github.issue_detail.contains_key(&issue.key)
+    {
+        app.chrome.flash = Some(format!(
+            "{} is still loading — edit it once its description is in",
+            issue.tag()
+        ));
+        schedule_detail(app);
+        return;
+    }
     if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
         view.editor = Some(Box::new(IssueEditor::new(&issue)));
     }
@@ -1344,7 +2349,10 @@ fn save_editor(app: &mut App) {
         return;
     }
     if !dir.is_dir() {
-        editor.notice = Some("the checkout isn't on disk — gh has nowhere to run".into());
+        editor.notice = Some(format!(
+            "the checkout isn't on disk — {} has nowhere to run",
+            editor.origin.asker()
+        ));
         return;
     }
     let Some(tx) = app.github.issues_tx.clone() else {
@@ -1352,13 +2360,14 @@ fn save_editor(app: &mut App) {
     };
     editor.saving = true;
     editor.notice = None;
-    let (url, number) = (editor.url.clone(), editor.number);
+    let (key, id, origin) = (editor.key.clone(), editor.id.clone(), editor.origin);
+    let source = editor.source.clone();
     tokio::spawn(async move {
-        let outcome = edit(&dir, number, &text).await.map(|()| text);
+        let outcome = edit(&dir, origin, &source, &id, &text).await.map(|()| text);
         let _ = tx.send(IssuesAnswer::Edited {
             project,
-            url,
-            number,
+            key,
+            tag: origin.tag(&id),
             outcome,
         });
     });
@@ -1442,8 +2451,17 @@ pub(crate) fn paste(app: &mut App, text: &str) -> bool {
 /// The footer's key line for the modal: the form's keys while it is up,
 /// the reader's otherwise.
 pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
-    if view.editor.is_some() {
-        "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
+    if let Some(editor) = &view.editor {
+        match editor.origin {
+            Origin::GitHub => {
+                "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
+            }
+            Origin::Source => "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save  Esc: cancel edit",
+        }
+    } else if view.more.is_some() {
+        "↑/↓ ^n/^p: label  Enter: filter by it  Esc: close the list"
+    } else if view.completing {
+        "Tab/Enter: complete the label  ↑/↓ ^n/^p: choose  Esc: close the suggestions"
     } else {
         "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c/^y: comment  ^o: browser  ^r: refresh  Esc: clear / close"
     }
@@ -1462,7 +2480,7 @@ fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<Qui
         let taken = app.project_branches(project);
         return Some(QuickTarget::NewWorktree {
             project: project.clone(),
-            branch: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+            branch: crate::branch_name::issue_name(&issue.id, &issue.title, &taken),
         });
     }
     app.root_worktree(project).map(QuickTarget::Worktree)
@@ -1546,6 +2564,8 @@ pub(crate) fn open_preset_for_row(app: &mut App) {
 pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
     if let Some(url) = selected_url(app) {
         crate::event_loop::open_link(app, &url, out);
+    } else if let Some((issue, _)) = selected_issue(app) {
+        app.chrome.flash = Some(format!("{} has no web page", issue.tag()));
     }
 }
 
@@ -1558,6 +2578,12 @@ pub(crate) fn open_in_browser(app: &mut App, out: &mut Vec<ClientRequest>) {
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if matches!(&app.modals.overlay, Some(Overlay::Issues(v)) if v.editor.is_some()) {
         handle_editor_key(app, key);
+        return;
+    }
+    if handle_more_key(app, &key) {
+        return;
+    }
+    if handle_completion_key(app, &key) {
         return;
     }
     let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
@@ -1641,6 +2667,59 @@ pub(crate) fn handle_mouse(
         app.chrome.dirty = true;
         return;
     }
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        // The MORE CHIP and its list first: a click on the chip opens or
+        // closes the list, one on a row picks it, and one anywhere else
+        // closes the list and goes on as it would have.
+        let (on_chip, more_row) = match &app.modals.overlay {
+            Some(Overlay::Issues(v)) => (
+                v.more_chip.contains(mouse_pos),
+                (v.more.is_some() && v.more_rows.contains(mouse_pos))
+                    .then(|| v.more_first + (mouse_pos.y - v.more_rows.y) as usize),
+            ),
+            _ => (false, None),
+        };
+        if on_chip {
+            toggle_more(app);
+            return;
+        }
+        if let Some(row) = more_row {
+            pick_more(app, row);
+            return;
+        }
+        if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
+            v.more = None;
+        }
+        let on_bar = match &app.modals.overlay {
+            Some(Overlay::Issues(v)) => v.bar.iter().find(|i| i.area.contains(mouse_pos)).cloned(),
+            _ => None,
+        };
+        if let Some(item) = on_bar {
+            click_bar_item(app, &item);
+            return;
+        }
+        let over = match &app.modals.overlay {
+            Some(Overlay::Issues(v)) if v.suggestions_area.contains(mouse_pos) => {
+                Some((mouse_pos.y - v.suggestions_area.y) as usize)
+            }
+            _ => None,
+        };
+        if let (Some(row), Some(completion)) = (over, current_completion(app)) {
+            let first = match &app.modals.overlay {
+                Some(Overlay::Issues(v)) => v.suggestions_first,
+                _ => 0,
+            };
+            let row = first + row;
+            if row < completion.labels.len() {
+                if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
+                    v.suggestion = row;
+                }
+                complete_label(app, &completion);
+            }
+            app.chrome.dirty = true;
+            return;
+        }
+    }
     let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return;
     };
@@ -1688,7 +2767,7 @@ pub fn lines(
 
     out.push(fit(
         vec![
-            Span::styled(format!("{INDENT}#{} ", issue.number), dim),
+            Span::styled(format!("{INDENT}{} ", issue.tag()), dim),
             Span::styled(
                 issue.title.clone(),
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -1709,6 +2788,13 @@ pub fn lines(
     let opened = day(&issue.created_at);
     if !opened.is_empty() {
         meta.push(Span::styled(format!(" · {opened}"), dim));
+    }
+    // Which tracker, beside GitHub's, the issue lives in.
+    if issue.origin == Origin::Source {
+        meta.push(Span::styled(
+            format!(" · {}", program_name(&issue.source)),
+            dim,
+        ));
     }
     out.push(fit(meta, width));
     if !issue.labels.is_empty() {
@@ -1852,21 +2938,76 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     f.render_widget(block, list_a);
     // The always-live filter on the list's first line, the rows under it.
     if let Some(query_area) = row_rect(list_inner, 0) {
-        let line = search_line(&view.list.query, "type to filter…", query_area, th);
+        let line = search_line(
+            &view.list.query,
+            "type to filter… label:name",
+            query_area,
+            th,
+        );
         f.render_widget(Paragraph::new(line), query_area);
     }
-    let rows_area = crate::ui::below_first_row(list_inner);
+    // The LABEL BAR on the line under the filter, while the listed issues
+    // carry any label; the rows start under it.
+    let (chips, others) = bar_labels(&view.list.query, &rows);
+    let hover = match &app.launcher.hover_crumb {
+        Some(HitTarget::IssueLabel(label)) => Some(label.clone()),
+        _ => None,
+    };
+    let more_hover = app.launcher.hover_crumb == Some(HitTarget::IssueLabelsMore);
+    let (rows_area, bar, more_chip, hidden) = match row_rect(list_inner, 1) {
+        Some(bar_area) if !chips.is_empty() || !others.is_empty() => {
+            let drawn = draw_label_bar(
+                f,
+                bar_area,
+                &chips,
+                &others,
+                hover.as_deref(),
+                more_hover,
+                th,
+            );
+            let below = crate::ui::below_first_row(crate::ui::below_first_row(list_inner));
+            (below, drawn.items, drawn.more_chip, drawn.hidden)
+        }
+        _ => (
+            crate::ui::below_first_row(list_inner),
+            Vec::new(),
+            None,
+            Vec::new(),
+        ),
+    };
+    if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
+        v.bar = bar;
+    }
     if rows.is_empty() {
+        // Named for what didn't answer: `gh`, or an ISSUE SOURCE program.
+        let missed = app
+            .github
+            .issue_sources_missed
+            .get(&view.project)
+            .cloned()
+            .unwrap_or_default();
         let text = if failed {
-            "couldn't list issues — is gh installed and logged in?"
+            match missed.as_slice() {
+                [] | [IssueSource::GitHub] => {
+                    "couldn't list issues — is gh installed and logged in?".to_string()
+                }
+                missed => format!(
+                    "couldn't list issues — {} didn't answer",
+                    missed
+                        .iter()
+                        .map(IssueSource::name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
         } else if inflight
             || app.github.issues_tx.is_some() && !app.github.issues.contains_key(&view.project)
         {
-            "asking GitHub…"
+            "asking for issues…".to_string()
         } else {
-            "no open issues"
+            "no open issues".to_string()
         };
-        empty_list_row(f, rows_area, text, th);
+        empty_list_row(f, rows_area, &text, th);
     } else if view.list.matches.is_empty() {
         empty_list_row(f, rows_area, "no issues match", th);
     }
@@ -1886,7 +3027,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
         let label = truncate(&full, text_budget);
         let positions = visible_positions(&m.positions, &label, &full);
         let used = label.chars().count();
-        let number = format!("#{} ", issue.number);
+        let number = format!("{} ", issue.tag());
         let number_w = number.chars().count();
         let title = label.strip_prefix(&number).unwrap_or(&label).to_string();
         // The positions split where the number ends: the title's own
@@ -1910,6 +3051,51 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
             spans.push(Span::styled(opened, Style::default().fg(th.dim)));
         }
         render_row(f, row_area, spans, i == view.list.cursor, list_focused, th);
+    }
+
+    // LABEL COMPLETION over the rows, under the word it would finish.
+    let completion = if view.suggestions_closed || view.editor.is_some() {
+        None
+    } else {
+        label_completion(
+            &view.list.query,
+            view.list.query.cursor_chars(),
+            &view.list.items,
+        )
+    };
+    let (suggestions_area, suggestions_first) = match &completion {
+        Some(completion) => draw_label_list(
+            f,
+            list_inner,
+            list_inner.x
+                + view.list.query.as_str()[..completion.word.start]
+                    .chars()
+                    .count() as u16,
+            list_inner.y + 1,
+            &completion.labels,
+            view.suggestion,
+            th,
+        ),
+        None => (Rect::default(), 0),
+    };
+    // The MORE LIST under its chip, while it is open.
+    let (more_rows, more_first) = match (view.more, more_chip) {
+        (Some(selected), Some(chip)) if !hidden.is_empty() => {
+            draw_label_list(f, list_inner, chip.x, chip.y + 1, &hidden, selected, th)
+        }
+        _ => (Rect::default(), 0),
+    };
+    if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
+        v.suggestions_area = suggestions_area;
+        v.suggestions_first = suggestions_first;
+        v.completing = completion.is_some();
+        v.more_chip = more_chip.unwrap_or_default();
+        v.more_rows = more_rows;
+        v.more_first = more_first;
+        v.bar_hidden = hidden.clone();
+        if hidden.is_empty() {
+            v.more = None;
+        }
     }
 
     // ---- right: the editor, while it is up ----
@@ -1938,15 +3124,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     let current = cursor.and_then(|i| rows.get(i));
     // The frame names the number; the headline inside carries the title.
     let body_title = match current {
-        Some(issue) => format!("Issue #{}", issue.number),
+        Some(issue) => format!("Issue {}", issue.tag()),
         None => "Issue".to_string(),
     };
     let lines: Vec<Line> = match current {
         Some(issue) => lines(
             issue,
-            app.github.issue_detail.get(&issue.url),
-            app.github.issue_detail_failed.contains(&issue.url),
-            app.github.issue_comment_inflight.contains(&issue.url),
+            app.github.issue_detail.get(&issue.key),
+            app.github.issue_detail_failed.contains(&issue.key),
+            app.github.issue_comment_inflight.contains(&issue.key),
             body_a.width.saturating_sub(2) as usize,
             th,
         ),
@@ -1967,16 +3153,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     }
     f.render_widget(block, body_a);
     // The `↗ open in browser` button over the top border, once the block
-    // has drawn it — only with a row to open.
+    // has drawn it — only with a row that has a page to open.
     let browser_area = match current {
-        Some(_) => crate::ui::browser_button(
+        Some(issue) if !issue.url.is_empty() => crate::ui::browser_button(
             f,
             body_a,
             (body_title.chars().count() + 2) as u16,
             app.launcher.hover_crumb == Some(HitTarget::ModalBrowser),
             th,
         ),
-        None => Rect::default(),
+        _ => Rect::default(),
     };
     let shown: Vec<Line> = lines.iter().skip(scroll as usize).cloned().collect();
     f.render_widget(Paragraph::new(shown), body_inner);
@@ -2000,6 +3186,76 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     }
 }
 
+/// A list of labels with their counts in a box hung over the rows — LABEL
+/// COMPLETION's suggestions, or the LABEL BAR's MORE LIST: its left edge
+/// at `x` (pulled in to fit `bounds`), its top at `y`, at most
+/// [`MAX_SUGGESTIONS`] rows with the window following `selected` and the
+/// frame saying `↑ 3 more` / `↓ 5 more` for what is out of sight, as a
+/// long text box does. Returns the rows' rect and the index of the first
+/// row shown, for clicks.
+fn draw_label_list(
+    f: &mut Frame,
+    bounds: Rect,
+    x: u16,
+    y: u16,
+    labels: &[(String, usize)],
+    selected: usize,
+    th: Theme,
+) -> (Rect, usize) {
+    let widest = labels
+        .iter()
+        .map(|(name, n)| name.chars().count() + n.to_string().len() + 3)
+        .max()
+        .unwrap_or(0);
+    let w = (widest as u16 + 2).clamp(18, bounds.width.max(1));
+    let room = bounds.bottom().saturating_sub(y);
+    let shown = labels.len().min(MAX_SUGGESTIONS);
+    let h = (shown as u16 + 2).min(room);
+    if h < 3 || labels.is_empty() {
+        return (Rect::default(), 0);
+    }
+    let rows = (h - 2) as usize;
+    let selected = selected.min(labels.len() - 1);
+    let first = window_start(selected, rows).min(labels.len().saturating_sub(rows));
+    let area = Rect {
+        x: x.min(bounds.right().saturating_sub(w)),
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, area);
+    let dim = Style::default().fg(th.dim);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.accent));
+    if first > 0 {
+        block = block.title(Line::from(Span::styled(format!(" ↑ {first} more "), dim)));
+    }
+    let below = labels.len() - (first + rows).min(labels.len());
+    if below > 0 {
+        block = block.title_bottom(Line::from(Span::styled(format!(" ↓ {below} more "), dim)));
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let budget = inner.width as usize;
+    for (row, (name, count)) in labels.iter().enumerate().skip(first).take(rows) {
+        let Some(row_area) = row_rect(inner, row - first) else {
+            break;
+        };
+        let count = count.to_string();
+        let name = truncate(name, budget.saturating_sub(count.len() + 2));
+        let used = name.chars().count();
+        let spans = vec![
+            Span::raw(format!(" {name}")),
+            Span::raw(" ".repeat(budget.saturating_sub(used + count.len() + 2))),
+            Span::styled(count, dim),
+        ];
+        render_row(f, row_area, spans, row == selected, true, th);
+    }
+    (inner, first)
+}
+
 /// The reading pane as the form: the title on the first row, the
 /// description in a box under it, the frame's foot saying what Enter will
 /// do — or why the last one did nothing, or that GitHub is being asked.
@@ -2011,7 +3267,7 @@ fn draw_editor(
     editor: &IssueEditor,
     th: Theme,
 ) -> (Rect, Rect, Option<TextView>) {
-    let title = format!("Edit issue #{}", editor.number);
+    let title = format!("Edit issue {}", editor.origin.tag(&editor.id));
     let (foot, style) = match (&editor.notice, editor.saving) {
         (Some(notice), _) => (format!(" {notice} "), Style::default().fg(th.err)),
         (None, true) => (" saving… ".to_string(), Style::default().fg(th.warn)),
@@ -2109,7 +3365,10 @@ mod tests {
 
     fn issue(number: u64, title: &str) -> Issue {
         Issue {
-            number,
+            key: format!("https://github.com/o/r/issues/{number}"),
+            id: number.to_string(),
+            origin: crate::issues::Origin::GitHub,
+            source: String::new(),
             url: format!("https://github.com/o/r/issues/{number}"),
             title: title.into(),
             author: "webdevcody".into(),
@@ -2176,7 +3435,7 @@ mod tests {
             ]}"#,
         )
         .expect("parsed");
-        assert_eq!(d.url, "https://github.com/o/r/issues/15");
+        assert_eq!(d.body, None, "gh's list carries the description");
         assert_eq!(d.comments.len(), 2);
         assert_eq!(d.comments[0].author, "steiza", "sorted by time");
         assert_eq!(d.comments[1].author, "kate");
@@ -2188,7 +3447,13 @@ mod tests {
     #[test]
     fn the_launch_ref_and_its_default_task_name_the_issue() {
         let r = issue(15, "Fix login redirect").launch_ref();
-        assert_eq!(r.number, 15);
+        assert_eq!((r.id.as_str(), r.tag()), ("15", "#15".to_string()));
+        // GitHub's issue goes to the DAEMON as its URL alone.
+        assert_eq!(
+            r.launch_url().as_deref(),
+            Some("https://github.com/o/r/issues/15")
+        );
+        assert_eq!(r.launch_id(), None);
         assert_eq!(
             r.default_task(),
             "Fix GitHub issue #15: Fix login redirect (https://github.com/o/r/issues/15)"
@@ -2217,7 +3482,7 @@ mod tests {
         assert!(failed.contains("couldn't read the comments"), "{failed}");
 
         let detail = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![IssueComment {
                 author: "kate".into(),
                 at: "2026-09-11T08:00:00Z".into(),
@@ -2236,7 +3501,7 @@ mod tests {
         assert!(read.contains("kate · 2026-09-11"), "{read}");
         assert!(read.contains("same here"), "{read}");
         let quiet = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![],
         };
         let none = text(&lines(&i, Some(&quiet), false, false, 60, Theme::default()));
@@ -2266,7 +3531,7 @@ mod tests {
             "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\ncat > \"$(dirname \"$0\")/body\"",
         );
         let body = format!("-- starts like a flag\n{}", "x".repeat(200_000));
-        assert!(comment_via(&records, dir.path(), 15, &body).await);
+        assert!(comment_via(&records, dir.path(), "15", &body).await);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("args")).unwrap(),
             "issue\ncomment\n15\n--body-file\n-\n"
@@ -2277,9 +3542,9 @@ mod tests {
         );
 
         let refuses = script("gh-refuses", "exit 1");
-        assert!(!comment_via(&refuses, dir.path(), 15, &body).await);
+        assert!(!comment_via(&refuses, dir.path(), "15", &body).await);
         let missing = dir.path().join("gh-missing");
-        assert!(!comment_via(&missing, dir.path(), 15, "hi").await);
+        assert!(!comment_via(&missing, dir.path(), "15", "hi").await);
     }
 
     /// While a comment of yours is on its way the pane says so, under
@@ -2288,7 +3553,7 @@ mod tests {
     fn the_pane_says_when_a_comment_is_posting() {
         let i = issue(15, "Fix login redirect");
         let quiet = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![],
         };
         let posting = text(&lines(&i, Some(&quiet), false, true, 60, Theme::default()));
@@ -2324,7 +3589,10 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: Some(vec![issue(15, "a"), issue(14, "Fix login redirect")]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Some(vec![issue(15, "a"), issue(14, "Fix login redirect")]),
+                )],
             },
         );
         select(&mut app, 1);
@@ -2346,7 +3614,7 @@ mod tests {
             panic!("{:?}", prompt.kind);
         };
         assert_eq!(view.selected, 1, "the row the box came from");
-        assert_eq!(issue.number, 14);
+        assert_eq!(issue.id, "14");
     }
 
     /// Enter posts off the loop and puts the modal back on its row; a
@@ -2360,7 +3628,10 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: Some(vec![issue(15, "a"), issue(14, "b")]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Some(vec![issue(15, "a"), issue(14, "b")]),
+                )],
             },
         );
         let mut view = IssuesView::new(project.clone(), "demo".into(), std::env::temp_dir());
@@ -2409,16 +3680,19 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: Some(vec![issue(15, "a")]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Some(vec![issue(15, "a")]),
+                )],
             },
         );
         let fifteen = issue(15, "a");
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
-                url: fifteen.url.clone(),
+                key: fifteen.url.clone(),
                 detail: Some(IssueDetail {
-                    url: fifteen.url.clone(),
+                    body: None,
                     comments: vec![],
                 }),
             },
@@ -2496,7 +3770,7 @@ mod tests {
             "1".repeat(80)
         );
         let detail = IssueDetail {
-            url: i.url.clone(),
+            body: None,
             comments: vec![IssueComment {
                 author: "steiza".into(),
                 at: "2026-09-11T08:00:00Z".into(),
@@ -2526,7 +3800,10 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: Some(vec![issue(15, "a"), issue(14, "b"), issue(13, "c")]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Some(vec![issue(15, "a"), issue(14, "b"), issue(13, "c")]),
+                )],
             },
         );
         select(&mut app, 2);
@@ -2535,7 +3812,10 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: Some(vec![issue(15, "a"), issue(13, "c")]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Some(vec![issue(15, "a"), issue(13, "c")]),
+                )],
             },
         );
         assert!(
@@ -2547,7 +3827,7 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: None,
+                lists: vec![(crate::issues::IssueSource::GitHub, None)],
             },
         );
         assert_eq!(app.github.issues[&project].list.len(), 2);
@@ -2557,7 +3837,7 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: other.clone(),
-                list: None,
+                lists: vec![(crate::issues::IssueSource::GitHub, None)],
             },
         );
         assert!(app.github.issues_failed.contains(&other));
@@ -2692,7 +3972,7 @@ mod tests {
                 app,
                 IssuesAnswer::List {
                     project: project.clone(),
-                    list,
+                    lists: vec![(crate::issues::IssueSource::GitHub, list)],
                 },
             );
         }
@@ -2734,7 +4014,7 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: Some(vec![]),
+                lists: vec![(crate::issues::IssueSource::GitHub, Some(vec![]))],
             },
         );
         assert!(is_fresh(&app, &project), "an empty answer is an answer");
@@ -2754,7 +4034,7 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
-                url: url.clone(),
+                key: url.clone(),
                 detail: None,
             },
         );
@@ -2763,9 +4043,9 @@ mod tests {
         land_answer(
             &mut app,
             IssuesAnswer::Detail {
-                url: url.clone(),
+                key: url.clone(),
                 detail: Some(IssueDetail {
-                    url: url.clone(),
+                    body: None,
                     comments: vec![],
                 }),
             },
@@ -2789,7 +4069,7 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project: project.clone(),
-                list: Some(rows),
+                lists: vec![(crate::issues::IssueSource::GitHub, Some(rows))],
             },
         );
         (app, project)
@@ -3056,8 +4336,8 @@ mod tests {
             &mut app,
             IssuesAnswer::Edited {
                 project: project.clone(),
-                url: url.clone(),
-                number: 15,
+                key: url.clone(),
+                tag: "#15".into(),
                 outcome: Err("HTTP 403: forbidden".into()),
             },
         );
@@ -3079,8 +4359,8 @@ mod tests {
             &mut app,
             IssuesAnswer::Edited {
                 project: project.clone(),
-                url: url.clone(),
-                number: 15,
+                key: url.clone(),
+                tag: "#15".into(),
                 outcome: Ok(IssueText {
                     title: "Fix the login redirect".into(),
                     body: "Bounces to /.".into(),
@@ -3103,8 +4383,8 @@ mod tests {
             &mut app,
             IssuesAnswer::Edited {
                 project: project.clone(),
-                url,
-                number: 15,
+                key: url,
+                tag: "#15".into(),
                 outcome: Err("late".into()),
             },
         );
@@ -3139,7 +4419,7 @@ mod tests {
             title: "-- starts like a flag".into(),
             body: format!("-- so does this\n{}", "x".repeat(200_000)),
         };
-        assert_eq!(edit_via(&records, dir.path(), 15, &text).await, Ok(()));
+        assert_eq!(edit_via(&records, dir.path(), "15", &text).await, Ok(()));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("args")).unwrap(),
             "issue\nedit\n15\n--title=-- starts like a flag\n--body-file\n-\n"
@@ -3154,16 +4434,18 @@ mod tests {
             "echo >&2\necho '  GraphQL: Resource not accessible' >&2\nexit 1",
         );
         assert_eq!(
-            edit_via(&refuses, dir.path(), 15, &text).await,
+            edit_via(&refuses, dir.path(), "15", &text).await,
             Err("GraphQL: Resource not accessible".into())
         );
         let silent = script("gh-silent", "exit 1");
         assert_eq!(
-            edit_via(&silent, dir.path(), 15, &text).await,
+            edit_via(&silent, dir.path(), "15", &text).await,
             Err("gh refused the edit".into())
         );
         let missing = dir.path().join("gh-missing");
-        let why = edit_via(&missing, dir.path(), 15, &text).await.unwrap_err();
+        let why = edit_via(&missing, dir.path(), "15", &text)
+            .await
+            .unwrap_err();
         assert!(why.starts_with("couldn't run gh"), "{why}");
     }
 
@@ -3207,7 +4489,7 @@ mod tests {
     }
 
     fn cursor_number(app: &App) -> Option<u64> {
-        selected_issue(app).map(|(issue, _)| issue.number)
+        selected_issue(app).and_then(|(issue, _)| issue.id.parse().ok())
     }
 
     /// Typing narrows the rows the moment the modal is up — no key to
@@ -3280,7 +4562,7 @@ mod tests {
             key(KeyCode::Char('e'), KeyModifiers::CONTROL),
             &mut Vec::new(),
         );
-        assert_eq!(editor(&app).expect("editing").number, second);
+        assert_eq!(editor(&app).expect("editing").id, second.to_string());
         handle_key(
             &mut app,
             key(KeyCode::Esc, KeyModifiers::NONE),
@@ -3305,7 +4587,7 @@ mod tests {
         assert_eq!(cursor_number(&app), Some(second));
         let shot = screen(&mut app, 120, 40);
         assert!(shot.contains("(3)"), "{shot}");
-        assert!(shot.contains("type to filter…"), "{shot}");
+        assert!(shot.contains("type to filter… label:name"), "{shot}");
         handle_key(
             &mut app,
             key(KeyCode::Esc, KeyModifiers::NONE),
@@ -3418,7 +4700,7 @@ mod tests {
         );
         let picked = cursor_number(&app).unwrap();
         let row = issues_view(&app).list.matches[1].item;
-        assert_eq!(picked, issues_view(&app).list.items[row].number);
+        assert_eq!(picked.to_string(), issues_view(&app).list.items[row].id);
         assert_ne!(picked, 14);
     }
 
@@ -3439,10 +4721,13 @@ mod tests {
             &mut app,
             IssuesAnswer::List {
                 project,
-                list: Some(vec![
-                    issue(15, "Fix login redirect"),
-                    issue(14, "Docs pass"),
-                ]),
+                lists: vec![(
+                    crate::issues::IssueSource::GitHub,
+                    Some(vec![
+                        issue(15, "Fix login redirect"),
+                        issue(14, "Docs pass"),
+                    ]),
+                )],
             },
         );
         assert_eq!(
@@ -3634,5 +4919,846 @@ mod tests {
         };
         assert_eq!(v.browser_area, Rect::default());
         assert_eq!(crate::ui::browser_button_under(&app, at), None);
+    }
+
+    const SOURCE: &str = "/opt/bin/issues";
+
+    /// An ISSUE SOURCE's `list`: ids as strings or numbers, keyed by the
+    /// checkout and the source so two trackers can't collide; a row with no
+    /// usable id drops out, and a page a browser can't open is no page.
+    #[test]
+    fn parses_an_issue_source_list() {
+        let dir = Path::new("/w/acme");
+        let list = parse_source_list(
+            r#"[
+              {"id":"ENG-123","title":"Fix login","url":"https://linear.app/acme/issue/ENG-123",
+               "author":"kate","created_at":"2026-09-10T12:00:00Z","labels":["bug",""],"body":"Bounces."},
+              {"id":7,"title":"Numbered","url":"javascript:alert(1)"},
+              {"id":"--help","title":"a flag"},
+              {"id":"two words"},
+              {"title":"no id"}
+            ]"#,
+            dir,
+            SOURCE,
+        )
+        .expect("an array");
+        assert_eq!(list.len(), 2, "{list:?}");
+        let eng = &list[0];
+        assert_eq!(eng.key, source_key(dir, SOURCE, "ENG-123"));
+        assert_eq!(
+            (eng.id.as_str(), eng.tag()),
+            ("ENG-123", "ENG-123".to_string())
+        );
+        assert_eq!((eng.origin, eng.source.as_str()), (Origin::Source, SOURCE));
+        assert!(eng.is_from(&IssueSource::Program(SOURCE.into())));
+        assert!(!eng.is_from(&IssueSource::Program("/opt/bin/other".into())));
+        assert!(!eng.is_from(&IssueSource::GitHub));
+        assert_eq!(eng.url, "https://linear.app/acme/issue/ENG-123");
+        assert_eq!(eng.label(), "ENG-123 Fix login");
+        assert_eq!(eng.labels, ["bug"]);
+        assert_eq!(
+            (eng.author.as_str(), eng.body.as_str()),
+            ("kate", "Bounces.")
+        );
+        assert_eq!((list[1].id.as_str(), list[1].url.as_str()), ("7", ""));
+        assert_ne!(
+            list[1].key,
+            source_key(dir, "/opt/bin/other", "7"),
+            "another source's 7"
+        );
+        assert!(parse_source_list("{}", dir, SOURCE).is_none());
+        assert!(parse_source_list("not json", dir, SOURCE).is_none());
+    }
+
+    /// An ISSUE SOURCE's `view`: the comments in the order it printed them,
+    /// and the description a list left out.
+    #[test]
+    fn parses_an_issue_source_view() {
+        let d = parse_source_detail(
+            r#"{"body":"The whole story.","comments":[
+              {"author":"kate","created_at":"2026-09-11T08:00:00-04:00","body":"same here"},
+              {"author":"steiza","created_at":"2026-09-11T09:00:00+02:00","body":"repro?"}
+            ]}"#,
+        )
+        .expect("parsed");
+        assert_eq!(d.body.as_deref(), Some("The whole story."));
+        assert_eq!(d.comments.len(), 2);
+        assert_eq!(d.comments[0].author, "kate", "the source's order");
+        assert_eq!(parse_source_detail("{}").expect("an object").comments, []);
+        assert!(parse_source_detail("[]").is_none());
+    }
+
+    /// GitHub and every ISSUE SOURCE land as one list, GitHub's first. A
+    /// source that can't answer keeps the rows it had while the others
+    /// refresh; only when none answer is the ask a miss.
+    #[test]
+    fn every_source_lands_in_one_list() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        let dir = Path::new("/w/acme");
+        let bug = IssueSource::Program(SOURCE.into());
+        let tracked = parse_source_list(r#"[{"id":"e6c61bf","title":"Local"}]"#, dir, SOURCE);
+        let ids = |app: &App| -> Vec<String> {
+            app.github.issues[&project]
+                .list
+                .iter()
+                .map(|i| i.tag())
+                .collect()
+        };
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                lists: vec![
+                    (IssueSource::GitHub, Some(vec![issue(15, "Remote")])),
+                    (bug.clone(), tracked.clone()),
+                ],
+            },
+        );
+        assert_eq!(ids(&app), ["#15", "e6c61bf"]);
+        assert_eq!(app.github.issue_sources_missed[&project], []);
+
+        // gh down: its rows stay, the source's refresh.
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                lists: vec![
+                    (IssueSource::GitHub, None),
+                    (
+                        bug.clone(),
+                        parse_source_list(r#"[{"id":"a1b2c3d","title":"New"}]"#, dir, SOURCE),
+                    ),
+                ],
+            },
+        );
+        assert_eq!(ids(&app), ["#15", "a1b2c3d"]);
+        assert_eq!(
+            app.github.issue_sources_missed[&project],
+            [IssueSource::GitHub]
+        );
+        assert!(!app.github.issues_failed.contains(&project));
+
+        // A source dropped from git config takes its rows with it.
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                lists: vec![(IssueSource::GitHub, Some(vec![issue(15, "Remote")]))],
+            },
+        );
+        assert_eq!(ids(&app), ["#15"]);
+
+        // Nobody answers a project never listed: a miss, named.
+        let fresh = ProjectId("p2".into());
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: fresh.clone(),
+                lists: vec![(IssueSource::GitHub, None), (bug.clone(), None)],
+            },
+        );
+        assert!(app.github.issues_failed.contains(&fresh));
+        assert_eq!(
+            app.github.issue_sources_missed[&fresh]
+                .iter()
+                .map(IssueSource::name)
+                .collect::<Vec<_>>(),
+            ["gh", "issues"]
+        );
+    }
+
+    /// A description only the source's `view` carries fills the row it
+    /// belongs to, and a refresh without it keeps it.
+    #[test]
+    fn a_description_from_view_fills_its_row() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        let dir = Path::new("/w/acme");
+        let list =
+            parse_source_list(r#"[{"id":"e6c61bf","title":"No body yet"}]"#, dir, SOURCE).unwrap();
+        let key = list[0].key.clone();
+        let answer = |list: Vec<Issue>| IssuesAnswer::List {
+            project: project.clone(),
+            lists: vec![(IssueSource::Program(SOURCE.into()), Some(list))],
+        };
+        land_answer(&mut app, answer(list.clone()));
+        assert_eq!(app.github.issues[&project].list[0].body, "");
+        land_answer(
+            &mut app,
+            IssuesAnswer::Detail {
+                key: key.clone(),
+                detail: Some(IssueDetail {
+                    body: Some("Found it.".into()),
+                    comments: vec![],
+                }),
+            },
+        );
+        assert_eq!(app.github.issues[&project].list[0].body, "Found it.");
+        land_answer(&mut app, answer(list));
+        assert_eq!(app.github.issues[&project].list[0].body, "Found it.");
+    }
+
+    /// A source issue's launch names it by its id and its source, with its
+    /// page when it has one — never as a GitHub issue.
+    #[test]
+    fn a_source_issue_launches_by_its_id() {
+        let dir = Path::new("/w/acme");
+        let list = parse_source_list(
+            r#"[{"id":"ENG-123","title":"Fix login","url":"https://linear.app/acme/issue/ENG-123"},
+                {"id":"e6c61bf","title":""}]"#,
+            dir,
+            SOURCE,
+        )
+        .unwrap();
+        let eng = list[0].launch_ref();
+        assert_eq!(
+            eng.default_task(),
+            "Fix issue ENG-123: Fix login (https://linear.app/acme/issue/ENG-123)"
+        );
+        assert_eq!(eng.launch_id().as_deref(), Some("ENG-123"));
+        assert_eq!(eng.launch_source().as_deref(), Some(SOURCE));
+        assert_eq!(
+            eng.launch_url().as_deref(),
+            Some("https://linear.app/acme/issue/ENG-123")
+        );
+        let bare = list[1].launch_ref();
+        assert_eq!(bare.default_task(), "Fix issue e6c61bf");
+        assert_eq!(bare.launch_url(), None);
+        let github = issue(15, "Remote").launch_ref();
+        assert_eq!((github.launch_id(), github.launch_source()), (None, None));
+    }
+
+    /// The whole protocol against a real program named in a real repo's git
+    /// config (its path with a space in it), beside GitHub: `list`, `view
+    /// <id>`, `comment <id>` with the body on stdin, `edit <id>` with the
+    /// title and body as JSON on stdin — and a refusal's first stderr line
+    /// as the reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_issue_source_program_speaks_the_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        assert_eq!(sources_of(&repo).await, [IssueSource::GitHub]);
+
+        let bin = home.path().join("my tools");
+        std::fs::create_dir(&bin).unwrap();
+        let program = bin.join("issues");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+out="$(dirname "$0")"
+case "$1" in
+  list) printf '[{"id":"BUG-1","title":"Crash","body":""}]' ;;
+  view) printf '{"body":"Crashes on %s.","comments":[{"author":"kate","created_at":"t","body":"same"}]}' "$2" ;;
+  comment) cat > "$out/comment-$2" ;;
+  edit) [ "$2" = "BUG-1" ] || { echo "no such issue: $2" >&2; exit 1; }; cat > "$out/edit-$2" ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = program.to_string_lossy().into_owned();
+        git(&["config", "--add", SOURCE_KEY, &program]);
+        git(&["config", "--add", SOURCE_KEY, "/opt/bin/second"]);
+        git(&["config", "--add", SOURCE_KEY, &program]);
+        assert_eq!(
+            sources_of(&repo).await,
+            [
+                IssueSource::GitHub,
+                IssueSource::Program(program.clone()),
+                IssueSource::Program("/opt/bin/second".into()),
+            ],
+            "GitHub first, then each source once, in git config's order"
+        );
+
+        let issues = list(&IssueSource::Program(program.clone()), &repo)
+            .await
+            .expect("listed");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            (issues[0].id.as_str(), issues[0].source.as_str()),
+            ("BUG-1", program.as_str())
+        );
+
+        let viewed = detail(&repo, Origin::Source, &program, "BUG-1")
+            .await
+            .expect("viewed");
+        assert_eq!(viewed.body.as_deref(), Some("Crashes on BUG-1."));
+        assert_eq!(viewed.comments[0].body, "same");
+
+        let body = format!("-- starts like a flag\n{}", "x".repeat(200_000));
+        assert!(comment(&repo, Origin::Source, &program, "BUG-1", &body).await);
+        assert_eq!(
+            std::fs::read_to_string(bin.join("comment-BUG-1")).unwrap(),
+            body
+        );
+
+        let text = IssueText {
+            title: "Crash on boot".into(),
+            body: "It \"crashes\".".into(),
+        };
+        assert_eq!(
+            edit(&repo, Origin::Source, &program, "BUG-1", &text).await,
+            Ok(())
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(bin.join("edit-BUG-1")).unwrap())
+                .unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({"title": "Crash on boot", "body": "It \"crashes\"."})
+        );
+        assert_eq!(
+            edit(&repo, Origin::Source, &program, "BUG-2", &text).await,
+            Err("no such issue: BUG-2".into())
+        );
+        // A source that isn't there is a miss, not a hang.
+        assert!(list(&IssueSource::Program("/opt/bin/second".into()), &repo)
+            .await
+            .is_none());
+    }
+
+    /// The form never opens on a description that hasn't arrived yet: from
+    /// a source whose list leaves descriptions out, it waits for `view`.
+    #[test]
+    fn a_source_issue_is_not_edited_before_its_description_lands() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        let dir = Path::new("/w/acme");
+        let list = parse_source_list(r#"[{"id":"e6c61bf","title":"Later"}]"#, dir, SOURCE).unwrap();
+        let key = list[0].key.clone();
+        app.modals.overlay = Some(Overlay::Issues(IssuesView::new(
+            project.clone(),
+            "acme".into(),
+            dir.to_path_buf(),
+        )));
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project,
+                lists: vec![(IssueSource::Program(SOURCE.into()), Some(list))],
+            },
+        );
+        open_editor(&mut app);
+        let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+            panic!("{:?}", app.modals.overlay);
+        };
+        assert!(view.editor.is_none());
+        assert!(app
+            .chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("still loading")));
+
+        land_answer(
+            &mut app,
+            IssuesAnswer::Detail {
+                key,
+                detail: Some(IssueDetail {
+                    body: Some("The real one.".into()),
+                    comments: vec![],
+                }),
+            },
+        );
+        open_editor(&mut app);
+        let Some(Overlay::Issues(view)) = &app.modals.overlay else {
+            panic!("{:?}", app.modals.overlay);
+        };
+        let editor = view.editor.as_ref().expect("editing");
+        assert_eq!(editor.original.body, "The real one.");
+        assert_eq!(editor.source, SOURCE);
+    }
+
+    /// `label:` keeps the rows carrying a matching label — part of a label
+    /// is enough, and every term must match — and the rest of the text
+    /// still ranks and lights `#15 title` as before.
+    #[test]
+    fn label_terms_narrow_the_rows() {
+        let tagged = |n: u64, title: &str, labels: &[&str]| Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, title)
+        };
+        let list = vec![
+            tagged(15, "Fix login redirect", &["bug", "browser-plugin"]),
+            tagged(14, "Docs pass", &["documentation"]),
+            tagged(13, "Login on Linux", &["bug", "plugin-sdk", "p1"]),
+            tagged(12, "Good first one", &["good first issue"]),
+        ];
+        let filtered = |query: &str| -> Vec<(String, Vec<usize>)> {
+            // What `rebuild_list` runs.
+            let mut rows = FilterList::new(list.clone());
+            rows.query.set_text(query);
+            rows.apply_filter_where(&[LABEL_KEY], |issue| issue.label(), carries_labels);
+            rows.matches
+                .iter()
+                .map(|m| (list[m.item].id.clone(), m.positions.clone()))
+                .collect()
+        };
+        let ids = |query: &str| -> Vec<String> {
+            filtered(query).into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(ids("label:bug"), ["15", "13"], "list order, nothing ranked");
+        assert_eq!(ids("label:plugin"), ["15", "13"], "part of a label");
+        assert_eq!(ids("label:bug label:p1"), ["13"], "every term");
+        assert_eq!(ids("LABEL:BUG label:P1"), ["13"], "case ignored");
+        assert_eq!(ids("label:\"good first\""), ["12"]);
+        assert_eq!(ids("label:nothing"), Vec::<String>::new());
+        assert_eq!(ids("label:"), ["15", "14", "13", "12"]);
+        let rows = filtered("label:bug linux");
+        assert_eq!(rows.len(), 1);
+        let (id, positions) = &rows[0];
+        assert_eq!(id, "13");
+        let label = list.iter().find(|i| &i.id == id).unwrap().label();
+        let lit: String = positions
+            .iter()
+            .map(|&p| label.chars().nth(p).unwrap())
+            .collect();
+        assert_eq!(lit.to_lowercase(), "linux", "the text part is what lights");
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_key(
+                app,
+                key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+    }
+
+    fn tagged_rows() -> Vec<Issue> {
+        let tagged = |n: u64, title: &str, labels: &[&str]| Issue {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(n, title)
+        };
+        vec![
+            tagged(15, "Fix login redirect", &["bug", "browser-plugin", "plan"]),
+            tagged(14, "Docs pass", &["documentation", "plan"]),
+            tagged(13, "Login on Linux", &["bug", "plugin-sdk", "plan"]),
+            tagged(12, "Good first one", &["good first issue"]),
+        ]
+    }
+
+    fn names(c: &Option<Completion>) -> Vec<String> {
+        c.as_ref()
+            .map(|c| c.labels.iter().map(|(n, k)| format!("{n} {k}")).collect())
+            .unwrap_or_default()
+    }
+
+    fn at_end(q: &str) -> usize {
+        q.chars().count()
+    }
+
+    /// Suggestions come only while the caret ends a `label:` word: names
+    /// containing what is typed, those starting with it first, counted
+    /// over the rows the rest of the filter leaves, a name typed in full
+    /// left out.
+    #[test]
+    fn completion_offers_labels_for_the_word_the_caret_ends() {
+        let rows = tagged_rows();
+        let q = "label:pl";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            ["plan 3", "plugin-sdk 1", "browser-plugin 1"]
+        );
+        let q = "linux LABEL:pl";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            ["plan 1", "plugin-sdk 1"],
+            "counted over what the rest of the filter leaves"
+        );
+        let q = "label:";
+        assert_eq!(
+            label_completion(q, at_end(q), &rows).unwrap().labels.len(),
+            6
+        );
+        let q = "label:plan";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            Vec::<String>::new()
+        );
+        let q = "label:\"good f";
+        assert_eq!(
+            names(&label_completion(q, at_end(q), &rows)),
+            ["good first issue 1"]
+        );
+        // Nowhere else: plain text, a caret inside a word, after a space.
+        assert!(label_completion("plan", 4, &rows).is_none());
+        assert!(label_completion("label:pl", 7, &rows).is_none());
+        assert!(label_completion("label:pl ", 9, &rows).is_none());
+        let q = "label:pl login";
+        let c = label_completion(q, 8, &rows).expect("the caret ends the label word");
+        assert_eq!(c.word, 0..8);
+    }
+
+    /// Tab finishes the word and leaves a space for the next; ↓ chooses;
+    /// Enter finishes too instead of launching an agent; text after the
+    /// word is kept.
+    #[test]
+    fn tab_and_enter_finish_the_label_word() {
+        let (mut app, _) = modal_with(tagged_rows());
+        typed(&mut app, "label:pl");
+        assert!(current_completion(&app).is_some());
+        handle_key(
+            &mut app,
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(issues_view(&app).list.query.as_str(), "label:plan ");
+        assert!(current_completion(&app).is_none(), "the word is done");
+
+        typed(&mut app, "label:pl");
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            "label:plan label:plugin-sdk "
+        );
+        assert!(
+            matches!(&app.modals.overlay, Some(Overlay::Issues(_))),
+            "Enter completed rather than launching: {:?}",
+            app.modals.overlay
+        );
+        assert_eq!(cursor_number(&app), Some(13));
+
+        if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
+            view.list.query.set_text("label:goo first");
+            view.list.query.set_cursor_chars(9);
+        }
+        handle_key(
+            &mut app,
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            "label:\"good first issue\" first"
+        );
+    }
+
+    /// Esc closes the suggestions without touching the filter; the next
+    /// letter brings them back, and with none up Esc clears as before.
+    #[test]
+    fn esc_closes_the_suggestions_first() {
+        let (mut app, _) = modal_with(tagged_rows());
+        typed(&mut app, "label:b");
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc, &mut Vec::new());
+        assert!(current_completion(&app).is_none());
+        assert_eq!(issues_view(&app).list.query.as_str(), "label:b");
+        typed(&mut app, "u");
+        assert_eq!(names(&current_completion(&app)), ["bug 2"]);
+        handle_key(&mut app, esc, &mut Vec::new());
+        handle_key(&mut app, esc, &mut Vec::new());
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            "",
+            "the filter's own Esc"
+        );
+    }
+
+    /// A click on a suggestion finishes the word with it, as Tab does.
+    #[test]
+    fn clicking_a_suggestion_finishes_the_word() {
+        let (mut app, _) = modal_with(tagged_rows());
+        typed(&mut app, "label:pl");
+        if let Some(Overlay::Issues(view)) = &mut app.modals.overlay {
+            view.suggestions_area = Rect::new(10, 4, 20, 3);
+        }
+        let at = Position::new(12, 5);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(issues_view(&app).list.query.as_str(), "label:plugin-sdk ");
+    }
+
+    fn counted(v: &[(String, usize)]) -> Vec<String> {
+        v.iter().map(|(n, k)| format!("{n} {k}")).collect()
+    }
+
+    /// The bar lists the filter's own terms first, then the other labels on
+    /// the listed rows by use, leaving out one every listed row carries.
+    #[test]
+    fn the_bar_lists_terms_then_labels_that_would_narrow() {
+        let rows = tagged_rows();
+        let (chips, others) = bar_labels("", &rows);
+        assert!(chips.is_empty());
+        assert_eq!(
+            counted(&others),
+            [
+                "plan 3",
+                "bug 2",
+                "browser-plugin 1",
+                "documentation 1",
+                "good first issue 1",
+                "plugin-sdk 1"
+            ],
+            "the most used first, then by name"
+        );
+        // With bug on: its two rows both carry plan too, so plan narrows
+        // nothing and drops out; bug is a chip.
+        let (chips, others) = bar_labels("label:bug", &rows);
+        assert_eq!(counted(&chips), ["bug 2"]);
+        assert_eq!(counted(&others), ["browser-plugin 1", "plugin-sdk 1"]);
+        // No labels anywhere: nothing to draw.
+        let bare = vec![Issue {
+            labels: vec![],
+            ..issue(1, "Plain")
+        }];
+        let (chips, others) = bar_labels("", &bare);
+        assert!(chips.is_empty() && others.is_empty());
+    }
+
+    #[test]
+    fn terms_are_added_and_taken_out_of_the_typed_text() {
+        assert_eq!(with_label_term("", "bug"), "label:bug ");
+        assert_eq!(with_label_term("login  ", "bug"), "login label:bug ");
+        assert_eq!(
+            with_label_term("x", "good first issue"),
+            "x label:\"good first issue\" "
+        );
+        assert_eq!(without_label_term("label:bug ", "bug"), "");
+        assert_eq!(without_label_term("login label:bug ", "BUG"), "login ");
+        assert_eq!(without_label_term("label:bug login", "bug"), "login");
+        assert_eq!(
+            without_label_term("a label:\"good first issue\" b", "good first issue"),
+            "a b"
+        );
+        assert_eq!(
+            without_label_term("login", "bug"),
+            "login",
+            "nothing to take"
+        );
+    }
+
+    /// A click on a label adds it and keeps the cursor on the issue being
+    /// read while it still matches; a click on a chip takes it back out.
+    #[test]
+    fn clicking_the_bar_adds_and_drops_terms() {
+        let (mut app, _) = modal_with(tagged_rows());
+        for _ in 0..2 {
+            handle_key(
+                &mut app,
+                key(KeyCode::Down, KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(cursor_number(&app), Some(13));
+        let item = |label: &str, active: bool| BarItem {
+            area: Rect::default(),
+            label: label.into(),
+            active,
+        };
+        click_bar_item(&mut app, &item("bug", false));
+        assert_eq!(issues_view(&app).list.query.as_str(), "label:bug ");
+        assert_eq!(cursor_number(&app), Some(13), "15 matches first, 13 stays");
+        click_bar_item(&mut app, &item("browser-plugin", false));
+        assert_eq!(cursor_number(&app), Some(15), "13 is filtered out");
+        click_bar_item(&mut app, &item("bug", true));
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            "label:browser-plugin "
+        );
+    }
+
+    /// Drawn: the bar sits on the line under the filter with the rows under
+    /// it, a click on a drawn label lands on that label, and a list with no
+    /// labels draws no bar and keeps its rows where they were.
+    #[test]
+    fn the_bar_is_drawn_under_the_filter_only_when_there_are_labels() {
+        let (mut app, _) = modal_with(tagged_rows());
+        let shot = screen(&mut app, 120, 30);
+        let line = shot
+            .lines()
+            .find(|l| l.contains("plan 3"))
+            .expect("the bar is drawn");
+        assert!(line.contains("bug 2 · "), "{line}");
+        let bar = issues_view(&app).bar.clone();
+        let plan = bar.iter().find(|i| i.label == "plan").expect("plan drawn");
+        let filter_y = shot
+            .lines()
+            .position(|l| l.contains("type to filter"))
+            .unwrap() as u16;
+        assert_eq!(plan.area.y, filter_y + 1, "the line under the filter");
+        assert_eq!(
+            issues_view(&app).list.list_area.y,
+            filter_y + 2,
+            "rows under the bar"
+        );
+        let at = Position::new(plan.area.x + 1, plan.area.y);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(issues_view(&app).list.query.as_str(), "label:plan ");
+        assert_eq!(
+            bar_item_under(&app, at),
+            Some(HitTarget::IssueLabel("plan".into()))
+        );
+
+        let bare = vec![Issue {
+            labels: vec![],
+            ..issue(1, "Plain")
+        }];
+        let (mut plain, _) = modal_with(bare);
+        let _ = screen(&mut plain, 120, 30);
+        assert!(issues_view(&plain).bar.is_empty());
+        let filter_y = screen(&mut plain, 120, 30)
+            .lines()
+            .position(|l| l.contains("type to filter"))
+            .unwrap() as u16;
+        assert_eq!(issues_view(&plain).list.list_area.y, filter_y + 1);
+    }
+
+    /// Twelve issues, each with a label of its own and `common` on all but
+    /// the last, so the bar has more labels than a narrow modal can show.
+    fn many_labels() -> Vec<Issue> {
+        (1..=12)
+            .map(|n| {
+                let mut labels = vec![format!("area-{n:02}")];
+                if n < 12 {
+                    labels.push("common".into());
+                }
+                Issue {
+                    labels,
+                    ..issue(n, &format!("Issue {n}"))
+                }
+            })
+            .collect()
+    }
+
+    /// A bare `label:` lists every label, not just the first screenful: the
+    /// list scrolls with ↓, its frame saying how many are out of sight,
+    /// and a click lands on the label drawn there.
+    #[test]
+    fn the_suggestions_reach_every_label() {
+        let (mut app, _) = modal_with(many_labels());
+        typed(&mut app, "label:");
+        let all = current_completion(&app).expect("suggestions");
+        assert_eq!(all.labels.len(), 13, "every label, none cut");
+        let shot = screen(&mut app, 120, 30);
+        assert!(shot.contains("↓ 5 more"), "{shot}");
+        for _ in 0..10 {
+            handle_key(
+                &mut app,
+                key(KeyCode::Down, KeyModifiers::NONE),
+                &mut Vec::new(),
+            );
+        }
+        let shot = screen(&mut app, 120, 30);
+        assert!(shot.contains("↑ 3 more"), "{shot}");
+        let view = issues_view(&app);
+        let (rows, first) = (view.suggestions_area, view.suggestions_first);
+        assert_eq!(first, 3);
+        let at = Position::new(rows.x + 2, rows.y + 7);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let expected = all.labels[first + 7].0.clone();
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            format!("label:{expected} ")
+        );
+    }
+
+    /// The labels the bar has no room for stand behind `N more ▾`: a click
+    /// opens their list, Enter picks one into the filter, Esc closes it,
+    /// and a typed letter closes it and types.
+    #[test]
+    fn the_more_chip_lists_the_labels_the_bar_had_no_room_for() {
+        let (mut app, _) = modal_with(many_labels());
+        let shot = screen(&mut app, 100, 30);
+        let view = issues_view(&app);
+        let hidden = view.bar_hidden.len();
+        assert!(hidden > 0, "a narrow modal hides some: {shot}");
+        assert!(shot.contains(&format!("{hidden} more ▾")), "{shot}");
+        assert_eq!(
+            view.bar.len() + hidden,
+            13,
+            "every label is on the bar or behind the chip"
+        );
+        let chip = view.more_chip;
+        let at = Position::new(chip.x + 1, chip.y);
+        assert_eq!(bar_item_under(&app, at), Some(HitTarget::IssueLabelsMore));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, at, &mut Vec::new());
+        assert_eq!(issues_view(&app).more, Some(0));
+        assert!(footer_hint(issues_view(&app)).contains("Enter: filter by it"));
+        let shot = screen(&mut app, 100, 30);
+        let first_hidden = issues_view(&app).bar_hidden[0].0.clone();
+        assert!(shot.contains(&first_hidden), "the list is drawn: {shot}");
+
+        handle_key(
+            &mut app,
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        let second = issues_view(&app).bar_hidden[1].0.clone();
+        handle_key(
+            &mut app,
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            issues_view(&app).list.query.as_str(),
+            format!("label:{second} ")
+        );
+        assert_eq!(issues_view(&app).more, None);
+
+        let (mut app, _) = modal_with(many_labels());
+        let _ = screen(&mut app, 100, 30);
+        toggle_more(&mut app);
+        handle_key(
+            &mut app,
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(issues_view(&app).more, None);
+        assert!(
+            app.modals.overlay.is_some(),
+            "Esc closed the list, not the modal"
+        );
+        toggle_more(&mut app);
+        typed(&mut app, "x");
+        assert_eq!(issues_view(&app).more, None);
+        assert_eq!(issues_view(&app).list.query.as_str(), "x");
     }
 }
