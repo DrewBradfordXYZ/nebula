@@ -468,6 +468,8 @@ beats and filters as you type, `Enter` and `Shift+Tab` start an agent on the iss
 is named `issue-eng-123-fix-login` after the id and title), `Ctrl+c` comments, `Ctrl+e` edits, and
 `Ctrl+o` and the card's `Shift+I` open the issue's `url` when it has one. Rows and titles name a
 source's issue by its id (`ENG-123`) where GitHub's say `#15`, and the reading pane names the source.
+To see one tracker's issues alone, filter by it: `source:github` keeps GitHub's, and `source:git-bug`
+the issues of a source whose program's file name contains `git-bug`.
 The ISSUE SESSION carries the id and the source — persisted with the row like a GitHub issue's URL,
 and checked against the repository's git config when it is created — and every spawn tells the agent
 which issue it is for and how to read it: the same `program view <id>`, run from its worktree.

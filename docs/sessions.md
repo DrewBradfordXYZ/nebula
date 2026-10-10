@@ -565,7 +565,10 @@ with what you typed first; a bare `label:` lists every label, eight at a time, t
 `↓ 5 more` for the rest as `↓` scrolls to them. `Tab` (or `Enter`, or a click) finishes the word with
 the highlighted one, `↑`/`↓` choose, and `Esc` closes the suggestions before it clears anything. A
 word that already names a label in full offers nothing, so `label:p1` beside a `p1-blocker` label
-leaves `Enter` and `↑`/`↓` to the rows. There is no negation:
+leaves `Enter` and `↑`/`↓` to the rows. A `source:` term does for where an issue lives what `label:`
+does for its labels: `source:github` keeps GitHub's own issues and `source:git-bug` those from an
+ISSUE SOURCE whose program's file name contains `git-bug` — the name the reading pane gives it — and a
+`source:` word completes from the sources on the listed rows the same way. There is no negation:
 `-label:bug` is text like any other. `↑`/`↓` (or `Ctrl+n`/`Ctrl+p`) walk the
 matches, and `Enter`, `Shift+Tab`, `Ctrl+e`, `Ctrl+c` (or `Ctrl+y`) and `Ctrl+o` act on the issue you found. `Esc`
 clears the filter, the cursor staying on that row, and a second `Esc` closes the modal, as in every

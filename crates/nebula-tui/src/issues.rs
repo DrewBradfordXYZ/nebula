@@ -449,7 +449,7 @@ pub struct IssuesView {
     pub browser_area: Rect,
     /// Issues plus the list's live filter/cursor: the rows narrow to the
     /// fuzzy matches of `#15 title`, best first, and to the issues carrying
-    /// every `label:` term typed ([`LABEL_KEY`]). Empty query shows every
+    /// every `label:` and `source:` term typed ([`FILTER_KEYS`]). Empty query shows every
     /// row in the cache's order.
     pub list: FilterList<Issue>,
     /// `Ctrl+e`: the reading pane turned into the editor for the row under the
@@ -458,7 +458,7 @@ pub struct IssuesView {
     /// variant several times the others' size.
     pub editor: Option<Box<IssueEditor>>,
     /// LABEL COMPLETION: which suggestion is highlighted while the caret
-    /// ends a `label:` word ([`label_completion`]), back to the first on
+    /// ends a `label:` or `source:` word ([`term_completion`]), back to the first on
     /// every edit.
     pub suggestion: usize,
     /// Esc closed the suggestions for the word being typed; the next edit
@@ -1198,40 +1198,61 @@ fn has_query(view: &IssuesView) -> bool {
 fn rebuild_list(view: &mut IssuesView, rows: &[Issue]) {
     view.list.items = rows.to_vec();
     view.list
-        .apply_filter_where(&[LABEL_KEY], |issue| issue.label(), carries_labels);
+        .apply_filter_where(FILTER_KEYS, |issue| issue.label(), keeps_terms);
 }
 
-/// The issues list's one filter key: `label:bug` keeps the rows carrying a
+/// The issues list's label key: `label:bug` keeps the rows carrying a
 /// label containing `bug` (`label:plugin` finds `browser-plugin` and
 /// `plugin-sdk` alike, case ignored), every such term must match, and the
 /// rest of the text ranks and lights `#15 title` as before.
 const LABEL_KEY: &str = "label";
+
+/// The issues list's source key: `source:git-bug` keeps the rows from an
+/// ISSUE SOURCE whose program's name contains `git-bug`, and
+/// `source:github` GitHub's own ([`source_name`]), as `label:` matches.
+const SOURCE_TERM: &str = "source";
+
+/// The `key:` terms the issues filter takes.
+const FILTER_KEYS: &[&str] = &[LABEL_KEY, SOURCE_TERM];
+
+/// The name a `source:` term matches: `github` for GitHub's issues, the
+/// ISSUE SOURCE program's file name for a source's — what the reading
+/// pane's meta line names it by.
+fn source_name(issue: &Issue) -> String {
+    match issue.origin {
+        Origin::GitHub => "github".into(),
+        Origin::Source => program_name(&issue.source),
+    }
+}
+
+/// What `key` names on `issue`: its labels, or its one source.
+fn term_names(issue: &Issue, key: &str) -> Vec<String> {
+    if key == SOURCE_TERM {
+        vec![source_name(issue)]
+    } else {
+        issue.labels.clone()
+    }
+}
 
 /// The rows `query` leaves, as indices into `list`, in the order the
 /// list shows them: what `rebuild_list` filters to, for a query other
 /// than the typed one (LABEL COMPLETION counts over the rest of the
 /// filter).
 fn filtered_rows(query: &str, list: &[Issue]) -> Vec<usize> {
-    crate::filter_list::rank_where(
-        query,
-        &[LABEL_KEY],
-        list,
-        |issue| issue.label(),
-        carries_labels,
-    )
-    .into_iter()
-    .map(|m| m.item)
-    .collect()
+    crate::filter_list::rank_where(query, FILTER_KEYS, list, |issue| issue.label(), keeps_terms)
+        .into_iter()
+        .map(|m| m.item)
+        .collect()
 }
 
-/// Whether `issue` carries a label for every `label:` term typed.
-fn carries_labels(issue: &Issue, terms: &QueryTerms) -> bool {
-    terms.values(LABEL_KEY).all(|term| {
-        let term = term.to_lowercase();
-        issue
-            .labels
+/// Whether `issue` matches every term typed: for each `label:` a label
+/// containing it, for each `source:` a source whose name contains it.
+fn keeps_terms(issue: &Issue, terms: &QueryTerms) -> bool {
+    terms.terms.iter().all(|term| {
+        let value = term.value.to_lowercase();
+        term_names(issue, term.key)
             .iter()
-            .any(|label| label.to_lowercase().contains(&term))
+            .any(|name| name.to_lowercase().contains(&value))
     })
 }
 
@@ -1959,12 +1980,13 @@ fn step(app: &mut App, delta: i64) {
 /// how many are out of sight.
 const MAX_SUGGESTIONS: usize = 8;
 
-/// What LABEL COMPLETION offers for the word the caret ends: the byte
-/// range of that `label:` word in the query, and the labels that could
-/// finish it, with how many of the rows the rest of the filter leaves
-/// carry each.
+/// What LABEL COMPLETION offers for the word the caret ends: its key
+/// (`label`, or `source`), the byte range of that word in the query, and
+/// the names that could finish it, with how many of the rows the rest of
+/// the filter leaves carry each.
 #[derive(Debug, PartialEq, Eq)]
 struct Completion {
+    key: &'static str,
     word: std::ops::Range<usize>,
     labels: Vec<(String, usize)>,
 }
@@ -1973,12 +1995,12 @@ struct Completion {
 /// caret ends a word that starts `label:` (any case; `label:"` for a
 /// quoted name), the labels on the rows the rest of the filter leaves
 /// whose name contains what follows the colon — names that start with it
-/// first, then the most used, then by name. None once the word already
-/// names a label in full — `label:p1` beside a `p1-blocker` is done, so
-/// Enter launches and ↑/↓ walk the rows — and None anywhere else, so
-/// ordinary typing never sees it.
-fn label_completion(query: &str, caret: usize, list: &[Issue]) -> Option<Completion> {
-    const KEY: &str = "label:";
+/// first, then the most used, then by name; a `source:` word the same way
+/// over the rows' sources. None once the word already names one in full
+/// — `label:p1` beside a `p1-blocker` is done, so Enter launches and ↑/↓
+/// walk the rows — and None anywhere else, so ordinary typing never sees
+/// it.
+fn term_completion(query: &str, caret: usize, list: &[Issue]) -> Option<Completion> {
     let end = query
         .char_indices()
         .nth(caret)
@@ -1993,39 +2015,48 @@ fn label_completion(query: &str, caret: usize, list: &[Issue]) -> Option<Complet
     // An unclosed `label:"` reaches back past the spaces in its name;
     // anything else is the word since the last space.
     let before = &query[..end];
-    let quoted = before
-        .to_ascii_lowercase()
-        .rmatch_indices("label:\"")
-        .map(|(i, _)| i)
-        .find(|&i| {
-            before[..i]
-                .chars()
-                .next_back()
-                .is_none_or(char::is_whitespace)
+    let lower = before.to_ascii_lowercase();
+    let quoted = FILTER_KEYS
+        .iter()
+        .filter_map(|key| {
+            lower
+                .rmatch_indices(&format!("{key}:\""))
+                .map(|(i, _)| i)
+                .find(|&i| {
+                    before[..i]
+                        .chars()
+                        .next_back()
+                        .is_none_or(char::is_whitespace)
+                })
+                .filter(|&i| !before[i + key.len() + 2..].contains('"'))
         })
-        .filter(|&i| !before[i + KEY.len() + 1..].contains('"'));
+        .max();
     let start = quoted.unwrap_or_else(|| {
         before.rfind(char::is_whitespace).map_or(0, |i| {
             i + before[i..].chars().next().map_or(1, char::len_utf8)
         })
     });
     let word = &query[start..end];
-    let head = word.get(..KEY.len())?;
-    if !head.eq_ignore_ascii_case(KEY) {
-        return None;
-    }
-    let typed = word[KEY.len()..].trim_start_matches('"').to_lowercase();
-    let named = |label: &String| label.to_lowercase() == typed;
-    if list.iter().any(|issue| issue.labels.iter().any(named)) {
+    let key = FILTER_KEYS.iter().copied().find(|key| {
+        word.get(..key.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(key))
+            && word[key.len()..].starts_with(':')
+    })?;
+    let typed = word[key.len() + 1..].trim_start_matches('"').to_lowercase();
+    if list.iter().any(|issue| {
+        term_names(issue, key)
+            .iter()
+            .any(|n| n.to_lowercase() == typed)
+    }) {
         return None;
     }
     let rest = format!("{} {}", &query[..start], &query[end..]);
     let mut counts: Vec<(String, usize)> = Vec::new();
     for i in filtered_rows(&rest, list) {
-        for label in &list[i].labels {
-            match counts.iter_mut().find(|(name, _)| name == label) {
+        for name in term_names(&list[i], key) {
+            match counts.iter_mut().find(|(seen, _)| *seen == name) {
                 Some((_, n)) => *n += 1,
-                None => counts.push((label.clone(), 1)),
+                None => counts.push((name, 1)),
             }
         }
     }
@@ -2038,13 +2069,14 @@ fn label_completion(query: &str, caret: usize, list: &[Issue]) -> Option<Complet
             .then_with(|| a.0.cmp(&b.0))
     });
     (!counts.is_empty()).then_some(Completion {
+        key,
         word: start..end,
         labels: counts,
     })
 }
 
 /// The suggestions the modal shows right now — None when the caret ends no
-/// `label:` word, nothing matches, or Esc closed them.
+/// `label:` or `source:` word, nothing matches, or Esc closed them.
 fn current_completion(app: &App) -> Option<Completion> {
     let Some(Overlay::Issues(view)) = &app.modals.overlay else {
         return None;
@@ -2052,25 +2084,27 @@ fn current_completion(app: &App) -> Option<Completion> {
     if view.suggestions_closed || view.editor.is_some() {
         return None;
     }
-    label_completion(
+    term_completion(
         &view.list.query,
         view.list.query.cursor_chars(),
         &view.list.items,
     )
 }
 
-/// Finish the `label:` word with the highlighted suggestion — quoted when
-/// the name has a space — and a space after it, ready for the next word.
-fn complete_label(app: &mut App, completion: &Completion) {
+/// Finish the `label:` (or `source:`) word with the highlighted suggestion
+/// — quoted when the name has a space — and a space after it, ready for
+/// the next word.
+fn complete_term(app: &mut App, completion: &Completion) {
     let Some(Overlay::Issues(view)) = &mut app.modals.overlay else {
         return;
     };
     let index = view.suggestion.min(completion.labels.len() - 1);
     let name = &completion.labels[index].0;
+    let key = completion.key;
     let term = if name.contains(char::is_whitespace) {
-        format!("label:\"{name}\" ")
+        format!("{key}:\"{name}\" ")
     } else {
-        format!("label:{name} ")
+        format!("{key}:{name} ")
     };
     let query = view.list.query.as_str();
     let after = query[completion.word.end..].trim_start();
@@ -2097,8 +2131,8 @@ fn handle_completion_key(app: &mut App, key: &KeyEvent) -> bool {
         return false;
     };
     match key.code {
-        KeyCode::Tab if !shift => complete_label(app, &completion),
-        KeyCode::Enter => complete_label(app, &completion),
+        KeyCode::Tab if !shift => complete_term(app, &completion),
+        KeyCode::Enter => complete_term(app, &completion),
         KeyCode::Down => view.suggestion = (view.suggestion + 1).min(last),
         KeyCode::Up => view.suggestion = view.suggestion.saturating_sub(1),
         KeyCode::Char('n') if ctrl => view.suggestion = (view.suggestion + 1).min(last),
@@ -2320,7 +2354,7 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
             Origin::Source => "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save  Esc: cancel edit",
         }
     } else if view.completing {
-        "Tab/Enter: complete the label  ↑/↓ ^n/^p: choose  Esc: close the suggestions"
+        "Tab/Enter: complete the word  ↑/↓ ^n/^p: choose  Esc: close the suggestions"
     } else {
         "type to filter  ↑/↓ ^n/^p: issue  PgUp/PgDn ^d/^u: read  Enter: prompt an agent  ⇧Tab: preset  ^e: edit  ^c/^y: comment  ^o: browser  ^r: refresh  Esc: clear / close"
     }
@@ -2540,7 +2574,7 @@ pub(crate) fn handle_mouse(
                 if let Some(Overlay::Issues(v)) = &mut app.modals.overlay {
                     v.suggestion = row;
                 }
-                complete_label(app, &completion);
+                complete_term(app, &completion);
             }
             app.chrome.dirty = true;
             return;
@@ -2877,7 +2911,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, b
     let completion = if view.suggestions_closed || view.editor.is_some() {
         None
     } else {
-        label_completion(
+        term_completion(
             &view.list.query,
             view.list.query.cursor_chars(),
             &view.list.items,
@@ -5361,7 +5395,7 @@ esac
             // What `rebuild_list` runs.
             let mut rows = FilterList::new(list.clone());
             rows.query.set_text(query);
-            rows.apply_filter_where(&[LABEL_KEY], |issue| issue.label(), carries_labels);
+            rows.apply_filter_where(FILTER_KEYS, |issue| issue.label(), keeps_terms);
             rows.matches
                 .iter()
                 .map(|m| (list[m.item].id.clone(), m.positions.clone()))
@@ -5431,36 +5465,36 @@ esac
         let rows = tagged_rows();
         let q = "label:pl";
         assert_eq!(
-            names(&label_completion(q, at_end(q), &rows)),
+            names(&term_completion(q, at_end(q), &rows)),
             ["plan 3", "plugin-sdk 1", "browser-plugin 1"]
         );
         let q = "linux LABEL:pl";
         assert_eq!(
-            names(&label_completion(q, at_end(q), &rows)),
+            names(&term_completion(q, at_end(q), &rows)),
             ["plan 1", "plugin-sdk 1"],
             "counted over what the rest of the filter leaves"
         );
         let q = "label:";
         assert_eq!(
-            label_completion(q, at_end(q), &rows).unwrap().labels.len(),
+            term_completion(q, at_end(q), &rows).unwrap().labels.len(),
             6
         );
         let q = "label:plan";
         assert_eq!(
-            names(&label_completion(q, at_end(q), &rows)),
+            names(&term_completion(q, at_end(q), &rows)),
             Vec::<String>::new()
         );
         let q = "label:\"good f";
         assert_eq!(
-            names(&label_completion(q, at_end(q), &rows)),
+            names(&term_completion(q, at_end(q), &rows)),
             ["good first issue 1"]
         );
         // Nowhere else: plain text, a caret inside a word, after a space.
-        assert!(label_completion("plan", 4, &rows).is_none());
-        assert!(label_completion("label:pl", 7, &rows).is_none());
-        assert!(label_completion("label:pl ", 9, &rows).is_none());
+        assert!(term_completion("plan", 4, &rows).is_none());
+        assert!(term_completion("label:pl", 7, &rows).is_none());
+        assert!(term_completion("label:pl ", 9, &rows).is_none());
         let q = "label:pl login";
-        let c = label_completion(q, 8, &rows).expect("the caret ends the label word");
+        let c = term_completion(q, 8, &rows).expect("the caret ends the label word");
         assert_eq!(c.word, 0..8);
     }
 
@@ -5572,11 +5606,11 @@ esac
             tagged(13, "Also urgent", &["P1"]),
         ];
         for q in ["label:p1", "LABEL:P1", "label:\"p1"] {
-            assert!(label_completion(q, at_end(q), &rows).is_none(), "{q}");
+            assert!(term_completion(q, at_end(q), &rows).is_none(), "{q}");
         }
         let q = "label:p";
         assert_eq!(
-            names(&label_completion(q, at_end(q), &rows)),
+            names(&term_completion(q, at_end(q), &rows)),
             ["P1 1", "p1 1", "p1-blocker 1"]
         );
         let (mut app, _) = modal_with(rows);
@@ -5609,13 +5643,98 @@ esac
     fn a_quoted_label_word_starts_at_a_word_boundary() {
         let rows = tagged_rows();
         let q = "xlabel:\"pl";
-        assert!(label_completion(q, at_end(q), &rows).is_none());
+        assert!(term_completion(q, at_end(q), &rows).is_none());
         let q = "xlabel:\"good fi";
-        assert!(label_completion(q, at_end(q), &rows).is_none());
+        assert!(term_completion(q, at_end(q), &rows).is_none());
         let q = "good label:\"good f";
-        let c = label_completion(q, at_end(q), &rows).expect("a word of its own");
+        let c = term_completion(q, at_end(q), &rows).expect("a word of its own");
         assert_eq!(c.word.start, 5);
         assert_eq!(names(&Some(c)), ["good first issue 1"]);
+    }
+
+    /// GitHub's two issues and one from each of two ISSUE SOURCES.
+    fn mixed_sources() -> Vec<Issue> {
+        let from = |program: &str, id: &str, labels: &[&str]| Issue {
+            key: format!("/tmp/demo#{program}#{id}"),
+            id: id.into(),
+            origin: Origin::Source,
+            source: program.into(),
+            url: String::new(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..issue(1, "From a tracker")
+        };
+        vec![
+            Issue {
+                labels: vec!["bug".into()],
+                ..issue(15, "Fix login redirect")
+            },
+            Issue {
+                labels: vec!["docs".into()],
+                ..issue(14, "Docs pass")
+            },
+            from("/opt/bin/nebula-issues-git-bug", "e6c61bf", &["bug"]),
+            from("/opt/bin/linear-src", "ENG-1", &[]),
+        ]
+    }
+
+    /// `source:` keeps the issues from a source whose name contains it —
+    /// `github` for GitHub's own, a program's file name for a tracker's —
+    /// beside `label:` and the text, every term matching.
+    #[test]
+    fn source_terms_narrow_the_rows() {
+        let list = mixed_sources();
+        let ids = |query: &str| -> Vec<String> {
+            filtered_rows(query, &list)
+                .into_iter()
+                .map(|i| list[i].id.clone())
+                .collect()
+        };
+        assert_eq!(ids("source:git-bug"), ["e6c61bf"]);
+        assert_eq!(ids("source:github"), ["15", "14"]);
+        assert_eq!(ids("SOURCE:Linear"), ["ENG-1"]);
+        assert_eq!(ids("source:git label:bug"), ["15", "e6c61bf"], "every term");
+        assert_eq!(ids("source:nothing"), Vec::<String>::new());
+        assert_eq!(ids("source:"), ["15", "14", "e6c61bf", "ENG-1"]);
+    }
+
+    /// A `source:` word completes from the sources on the listed rows, as
+    /// a `label:` word does from their labels.
+    #[test]
+    fn source_words_complete_like_label_words() {
+        let rows = mixed_sources();
+        let q = "source:";
+        assert_eq!(
+            names(&term_completion(q, at_end(q), &rows)),
+            ["github 2", "linear-src 1", "nebula-issues-git-bug 1"]
+        );
+        let q = "source:git";
+        assert_eq!(
+            names(&term_completion(q, at_end(q), &rows)),
+            ["github 2", "nebula-issues-git-bug 1"]
+        );
+        let q = "source:github";
+        assert!(
+            term_completion(q, at_end(q), &rows).is_none(),
+            "named in full"
+        );
+        let q = "label:bug source:gi";
+        assert_eq!(
+            names(&term_completion(q, at_end(q), &rows)),
+            ["github 1", "nebula-issues-git-bug 1"],
+            "counted over what the rest of the filter leaves"
+        );
+        let (mut app, _) = modal_with(rows);
+        typed(&mut app, "source:li");
+        handle_key(
+            &mut app,
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &mut Vec::new(),
+        );
+        assert_eq!(issues_view(&app).list.query.as_str(), "source:linear-src ");
+        assert_eq!(
+            selected_issue(&app).map(|(issue, _)| issue.id.clone()),
+            Some("ENG-1".into())
+        );
     }
 
     /// Twelve issues, each with a label of its own and `common` on all but
