@@ -5134,6 +5134,8 @@ async fn nebula_spawn_says_a_worktree_is_shared_and_refuses_one_with_changes() {
             cloud_prompt: None,
             starting_prompt: None,
             issue_url: None,
+            issue_id: None,
+            issue_source: None,
             role: nebula_core::AgentRole::Worker,
         },
     )
