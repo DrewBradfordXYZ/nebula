@@ -457,7 +457,15 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
             }
             KeyCode::Enter | KeyCode::Char('y') => {
+                // A worktree delete waits for its DELETE CHECK: the user
+                // confirms what it found, never ahead of it.
                 let action = confirm.action.clone();
+                if let Some(branch) = crate::delete_check::still_checking(app, &action) {
+                    app.chrome.flash = Some(format!(
+                        "still checking '{branch}' for work in progress — a moment"
+                    ));
+                    return;
+                }
                 app.modals.overlay = None;
                 run_pending_action(app, action, out);
             }

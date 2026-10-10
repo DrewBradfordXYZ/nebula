@@ -7,6 +7,7 @@ macro_rules! main_loop_body {
 
     let mut app = App::new();
     app.chrome.conn = ConnState::Connected;
+    app.requests.daemon_protocol = $channels.protocol_version;
     // The repo nebula was started in, for the first run's "open this
     // folder" — looked up once, off the tree the snapshot has not sent yet.
     app.launcher.launch_repo = crate::app::launch_repo();
@@ -505,6 +506,10 @@ macro_rules! main_loop_body {
                 }
             }
         }
+
+        // A confirm that would delete a worktree asks what it still holds,
+        // whichever key or menu opened it.
+        crate::delete_check::sync(&mut app, &mut out);
 
         for req in out.drain(..) {
             if $channels.tx.send(req).await.is_err() {
