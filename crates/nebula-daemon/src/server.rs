@@ -89,6 +89,9 @@ struct ClientConnection {
     handshaken: bool,
     /// The client process, when the socket's credentials name it.
     peer_pid: Option<u32>,
+    /// The protocol the client said it speaks in its Hello: a reply grown
+    /// since is sent in the shape it can decode.
+    client_protocol: u32,
 }
 
 impl ClientConnection {
@@ -100,6 +103,7 @@ impl ClientConnection {
             subscription: None,
             handshaken: false,
             peer_pid: None,
+            client_protocol: nebula_core::MIN_COMPATIBLE_PROTOCOL,
         }
     }
 
@@ -222,12 +226,21 @@ impl ClientConnection {
                 self.spawn_create_worktree(req_id, project, branch, base);
                 Ok(true)
             }
-            ClientRequest::DeleteWorktree { req_id, id, force } => {
-                self.spawn_delete_worktree(req_id, id, force);
+            ClientRequest::DeleteWorktree {
+                req_id,
+                id,
+                force,
+                delete_branch,
+            } => {
+                self.spawn_delete_worktree(req_id, id, force, delete_branch);
                 Ok(true)
             }
-            ClientRequest::CheckWorktree { req_id, id } => {
-                self.spawn_check_worktree(req_id, id);
+            ClientRequest::CheckWorktree {
+                req_id,
+                id,
+                git_only,
+            } => {
+                self.spawn_check_worktree(req_id, id, git_only);
                 Ok(true)
             }
             ClientRequest::CleanupMergedWorktree {
@@ -640,6 +653,7 @@ impl ClientConnection {
 
     async fn handle_hello(&mut self, protocol_version: u32) -> bool {
         self.handshaken = nebula_core::protocol_compatible_with(protocol_version);
+        self.client_protocol = protocol_version;
         let reply = if self.handshaken {
             ServerEvent::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
@@ -885,26 +899,42 @@ impl ClientConnection {
         });
     }
 
-    fn spawn_delete_worktree(&self, req_id: u64, id: nebula_core::WorktreeId, force: bool) {
+    fn spawn_delete_worktree(
+        &self,
+        req_id: u64,
+        id: nebula_core::WorktreeId,
+        force: bool,
+        delete_branch: Option<nebula_core::BranchTip>,
+    ) {
         // `git worktree remove` can take seconds on a large checkout; run it
         // off the request loop so Input/Attach frames keep flowing while it
         // grinds. `worktree_ops` still serializes it against create/sync.
         let daemon = self.daemon.clone();
         let out_tx = self.out_tx.clone();
         tokio::spawn(async move {
-            reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
+            let result = daemon
+                .delete_worktree_and_branch(&id, force, delete_branch)
+                .await;
+            reply_done(&out_tx, req_id, result).await;
         });
     }
 
-    fn spawn_check_worktree(&self, req_id: u64, id: nebula_core::WorktreeId) {
+    fn spawn_check_worktree(&self, req_id: u64, id: nebula_core::WorktreeId, git_only: bool) {
         // `git status` on a big checkout and an `lsof` of every process are
         // each a fraction of a second; off the request loop, like a delete.
         let daemon = self.daemon.clone();
         let out_tx = self.out_tx.clone();
         let client = self.peer_pid;
+        // A client from before the check grew `landing` cannot decode it.
+        let landing = self.client_protocol >= nebula_core::BRANCH_LANDING_PROTOCOL;
         tokio::spawn(async move {
-            let ev = match daemon.check_worktree(&id, client).await {
-                Ok(check) => ServerEvent::WorktreeChecked { req_id, id, check },
+            let ev = match daemon.check_worktree(&id, client, git_only).await {
+                Ok(mut check) => {
+                    if !landing {
+                        check.landing = None;
+                    }
+                    ServerEvent::WorktreeChecked { req_id, id, check }
+                }
                 Err(e) => ServerEvent::Error {
                     req_id: Some(req_id),
                     message: format!("{e:#}"),
