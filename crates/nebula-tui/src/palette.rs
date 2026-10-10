@@ -464,6 +464,7 @@ mod tests {
             ],
             terminals: Vec::new(),
             links: Vec::new(),
+            subagents: HashMap::new(),
         }
     }
 

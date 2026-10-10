@@ -189,11 +189,36 @@ pub(crate) fn lines(app: &App, action: &PendingAction, now_ms: i64) -> Vec<Check
             ))
         })
         .collect();
-    match states.as_slice() {
+    // SUBAGENT PRESENCE needs no check: the DAEMON already said who is
+    // working where, so it leads, and a clean check under it no longer
+    // claims nothing is running there.
+    let working: Vec<CheckLine> = ids
+        .iter()
+        .filter_map(|id| {
+            let who = crate::presence::label(app, id, now_ms)?;
+            Some(CheckLine::warn(if ids.len() == 1 {
+                format!("⚠ {who} — working in it from another session")
+            } else {
+                format!("⚠ '{}': {who}", branch_of(app, id))
+            }))
+        })
+        .collect();
+    let checked = match states.as_slice() {
         [] => Vec::new(),
         [(branch, state)] if ids.len() == 1 => single_lines(branch, state, now_ms),
         _ => bulk_lines(&states, now_ms),
+    };
+    if working.is_empty() {
+        return checked;
     }
+    working
+        .into_iter()
+        .chain(
+            checked
+                .into_iter()
+                .filter(|l| l.warn || l.text.starts_with("Checking")),
+        )
+        .collect()
 }
 
 fn single_lines(branch: &str, state: &CheckState, now_ms: i64) -> Vec<CheckLine> {

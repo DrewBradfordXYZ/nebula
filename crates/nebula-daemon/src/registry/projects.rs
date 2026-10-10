@@ -253,6 +253,9 @@ impl Daemon {
         self.kill_sessions_in(&wt_ids, &agents, &terminals);
         // Removing a project only forgets it in nebula — never touches disk.
         self.store.delete_project(id)?;
+        for w in &wt_ids {
+            self.forget_worktree_presence(w);
+        }
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Project(id.clone()),
         });
@@ -478,6 +481,7 @@ impl Daemon {
         let delete_id = id.clone();
         self.store_blocking(move |store| store.delete_worktree(&delete_id))
             .await?;
+        self.forget_worktree_presence(id);
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Worktree(id.clone()),
         });
@@ -641,8 +645,16 @@ impl Daemon {
             bail!("auto-cleanup skipped {branch}: terminal is still running");
         }
 
-        // Idle sessions are not the only work a checkout can hold: an agent
-        // whose session lives elsewhere may be building here right now.
+        // Idle sessions are not the only work a checkout can hold: another
+        // session's subagent may be working here (SUBAGENT PRESENCE), or a
+        // process with no session at all.
+        if let Some(p) = self.subagent_presence(id).first() {
+            let parent = agents
+                .iter()
+                .find(|a| a.id == p.parent)
+                .map_or("another session", |a| a.name.as_str());
+            bail!("auto-cleanup skipped {branch}: a subagent of '{parent}' is working in it");
+        }
         let mut spare = self.own_session_pids(id).await?;
         spare.extend(self.nebula_helper_pids(None).await?);
         let dir = worktree.path.clone();
@@ -662,6 +674,7 @@ impl Daemon {
         let delete_id = id.clone();
         self.store_blocking(move |store| store.delete_worktree(&delete_id))
             .await?;
+        self.forget_worktree_presence(id);
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Worktree(id.clone()),
         });
@@ -804,6 +817,7 @@ impl Daemon {
             let id = w.id.clone();
             self.store_blocking(move |store| store.delete_worktree(&id))
                 .await?;
+            self.forget_worktree_presence(&w.id);
             self.broadcast(ServerEvent::EntityRemoved {
                 id: EntityId::Worktree(w.id.clone()),
             });

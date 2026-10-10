@@ -17,6 +17,7 @@ pub(crate) fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut V
         | event @ ServerEvent::ReviewOpened { .. }
         | event @ ServerEvent::Metrics { .. }
         | event @ ServerEvent::WorktreeChecked { .. }
+        | event @ ServerEvent::WorktreeActivity { .. }
         | event @ ServerEvent::OutputTail { .. }
         | event @ ServerEvent::AttachRefused { .. } => handle_tree_event(app, event, out),
         event @ ServerEvent::Error { .. } => handle_error_event(app, event, out),
@@ -43,6 +44,8 @@ fn handle_snapshot_event(app: &mut App, event: ServerEvent, out: &mut Vec<Client
             app.tree.agents = agents;
             app.tree.terminals = terminals;
             app.tree.links = links;
+            // Presence rides its own events, which follow the snapshot.
+            app.tree.subagents.clear();
             app.github.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
             // The cache painted rows for whatever the last run's tree had;
             // the ones this tree no longer has go, before they could be
@@ -474,6 +477,9 @@ fn handle_tree_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequ
             app.chrome.dirty = true;
         }
         ServerEvent::EntityRemoved { id } => {
+            if let EntityId::Worktree(w) = &id {
+                app.tree.subagents.remove(w);
+            }
             let before = selection_snapshot(app);
             apply_removal(app, &id);
             app.prune_term_cache();
@@ -499,6 +505,9 @@ fn handle_tree_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequ
             // The footer's readout keeps the latest reading either way.
             app.jobs.last_metrics = Some(snapshot);
             app.chrome.dirty = true;
+        }
+        ServerEvent::WorktreeActivity { worktree, agents } => {
+            crate::presence::land(app, worktree, agents);
         }
         ServerEvent::WorktreeChecked { req_id, id, check } => {
             // Answered with WorktreeChecked, not Ack; `land` clears the slot.

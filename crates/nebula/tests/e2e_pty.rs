@@ -1336,6 +1336,210 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     wait_for_exit(&mut daemon);
 }
 
+/// SUBAGENT PRESENCE end to end: a subagent's hook naming a file in
+/// another worktree puts it on that worktree's band — pushed live and
+/// replayed after a late subscriber's snapshot — and its stop takes it off.
+#[tokio::test]
+async fn subagent_hooks_put_presence_on_the_worktree_it_works_in() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(_)
+                }
+            )
+        })
+    })
+    .await;
+    let main_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    // A second worktree — the one the agent will "enter".
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateWorktree {
+            req_id: 2,
+            project: main_worktree.project_id.clone(),
+            branch: "feat".into(),
+            base: None,
+        },
+    )
+    .await
+    .unwrap();
+    // The upsert broadcast and the Ack ride different channels — wait for
+    // the upsert itself.
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
+                if w.branch == "feat")
+        })
+    })
+    .await;
+    let feat_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "feat" => Some(w.clone()),
+            _ => None,
+        })
+        .expect("feat worktree upsert");
+
+    // Agent lives in the main checkout.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: main_worktree.id.clone(),
+            name: "parent".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 3).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // POST a hook from inside the agent PTY whose payload reports the feat
+    // worktree as cwd — exactly what claude sends after entering it.
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    // A subagent of the session in the main checkout edits a file in
+    // `feat` — its cwd still the parent's, the path absolute, as a
+    // background subagent's tool calls are — and then stops.
+    let post = |event: &str, body: String| {
+        format!(
+            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H 'Content-Type: application/json' -d '{body}' \
+             \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent={event}\"\n"
+        )
+    };
+    let edit = format!(
+        r#"{{"session_id":"sess-1","cwd":"{}","agent_id":"sub-1","tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#,
+        main_worktree.path.display(),
+        feat_worktree.path.join("src/lib.rs").display()
+    );
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: post("PostToolUse", edit).into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let on_feat = |e: &ServerEvent, want: usize| {
+        matches!(e, ServerEvent::WorktreeActivity { worktree, agents }
+            if *worktree == feat_worktree.id && agents.len() == want
+                && agents.iter().all(|p| p.parent == agent_id))
+    };
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| on_feat(e, 1))
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| on_feat(e, 1)),
+        "the subagent shows on feat's band: {events:#?}"
+    );
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat_worktree.id)
+        }),
+        "the parent's row never moves with its subagent: {events:#?}"
+    );
+
+    // A client that subscribes now catches up after its snapshot.
+    let mut late = connect(&env.sock()).await;
+    handshake(&mut late).await;
+    write_frame(&mut late, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let caught_up = read_events_until(&mut late, EVENT_TIMEOUT, |evs| {
+        evs.iter().any(|e| on_feat(e, 1))
+    })
+    .await;
+    assert!(
+        matches!(caught_up.first(), Some(ServerEvent::Snapshot { .. }))
+            && caught_up.iter().any(|e| on_feat(e, 1)),
+        "{caught_up:#?}"
+    );
+
+    let stop = r#"{"session_id":"sess-1","agent_id":"sub-1"}"#.to_string();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: post("SubagentStop", stop).into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| on_feat(e, 0))
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| on_feat(e, 0)),
+        "SubagentStop clears it: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// CLAUDE TITLE SYNC end to end, with a /bin/sh standing in for claude:
 /// the row's name reaches the CLI as the `UserPromptSubmit` reply's
 /// `sessionTitle`, and a `/rename` inside the CLI — which fires no hook,

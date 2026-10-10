@@ -191,6 +191,20 @@
   dialog. Inside 5 s of the row leaving red that notification is taken as the echo it is and
   ignored; a genuinely new dialog announces itself through `PermissionRequest` or `PreToolUse`
   first, never through that notification alone.
+- **SUBAGENT PRESENCE: a subagent shows on the band of the checkout it works in.** A subagent's hook
+  payloads never move its parent's row (an isolated subagent in a scratch checkout must not drag the
+  conversation with it), so a checkout a background subagent works in through absolute paths read
+  "nothing running". Instead, every subagent event (`agent_id` on Claude's and OpenCode's payloads,
+  `subagent_id` on Cursor's) names the paths it touched — the payload's cwd, the `file_path` /
+  `path` / `notebook_path` of its tool call, and for a `Bash` call the absolute paths in the command
+  and the targets of `cd` and `git -C` — and each that falls inside a worktree other than the
+  parent's own (the deepest one, so a checkout nested in the root is its own) puts the subagent on
+  that worktree's band: `1 agent from 'Fix Login' · active 2m ago`, and `· 1 agent` on its rule. It
+  comes off at the subagent's `SubagentStop`, when the parent's process ends, or after 20 min with
+  no event from it there (Claude reports a tool call when it ends, so one long build is that much
+  silence). Claude's unmatched `PostToolUse` is where the paths come from; Codex and Cursor report
+  only their subagents' start and stop, so there it is their cwd alone. The DELETE CHECK names
+  them too, and the opt-in merged-worktree cleanup skips a checkout one is working in.
 - **Which of those signals you get depends on the harness.** Claude is installed with all nine hook
   groups — `UserPromptSubmit`, `Stop`, `SessionStart`, `PermissionRequest`, `Notification`, a
   `PreToolUse` on `AskUserQuestion`, an unmatched `PostToolUse` (the question's answer, a permission

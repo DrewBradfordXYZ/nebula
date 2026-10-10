@@ -1068,8 +1068,10 @@ fn draw_bands(
 }
 
 /// What an EMPTY BAND says under its rule, the root's without the delete
-/// it refuses.
-const EMPTY_BAND_HINT: &str = "nothing running · p: new session · t: terminal";
+/// it refuses. Another session's subagents at work there take the place
+/// of "nothing running" ([`crate::presence::label`]).
+const EMPTY_BAND_IDLE: &str = "nothing running";
+const EMPTY_BAND_HINT: &str = " · p: new session · t: terminal";
 const EMPTY_BAND_DELETE: &str = " · d: delete worktree";
 
 /// The line under an EMPTY BAND's rule — a checkout with nothing running
@@ -1100,11 +1102,15 @@ fn draw_empty_band(
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { th.dim };
+    let lead = match crate::presence::label(app, &band.worktree, nebula_core::clock::now_ms()) {
+        Some(presence) => Span::styled(format!("  {presence}"), Style::default().fg(th.warn)),
+        None => Span::styled(format!("  {EMPTY_BAND_IDLE}"), Style::default().fg(fg)),
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().fg(fg),
-        ))),
+        Paragraph::new(Line::from(vec![
+            lead,
+            Span::styled(text, Style::default().fg(fg)),
+        ])),
         placed.rect,
     );
 }
@@ -1698,6 +1704,15 @@ fn draw_band_rule(
             ));
         }
         let mut spans = vec![Span::styled(words, Style::default().fg(th.dim))];
+        // SUBAGENT PRESENCE: other sessions' subagents working here, in
+        // the heads-up color — no card on the band stands for them.
+        let agents = crate::presence::count(app, &band.worktree);
+        if agents > 0 {
+            spans.push(Span::styled(
+                format!(" · {}", crate::presence::agents_word(agents)),
+                Style::default().fg(th.warn),
+            ));
+        }
         if more > 0 {
             spans.push(Span::styled(
                 format!("  ▸ {more} more"),

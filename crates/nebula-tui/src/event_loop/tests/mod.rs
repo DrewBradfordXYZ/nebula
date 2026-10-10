@@ -22158,3 +22158,54 @@ fn a_card_delete_that_offers_the_worktree_checks_it_but_n_never_waits() {
         );
     });
 }
+
+/// SUBAGENT PRESENCE in the DELETE CHECK: a worktree another session's
+/// subagent is working in says so in its delete confirm, ahead of the
+/// check and in place of the check's "nothing is running" — the very
+/// case the check exists for, already known without asking.
+#[test]
+fn a_worktree_delete_names_another_sessions_subagent_working_there() {
+    with_default_config(|| {
+        let mut app = parity_tree();
+        hse(
+            &mut app,
+            ServerEvent::WorktreeActivity {
+                worktree: WorktreeId("w2".into()),
+                agents: vec![nebula_core::SubagentPresence {
+                    parent: AgentId("a1".into()),
+                    subagents: 2,
+                    last_active_ms: nebula_core::clock::now_ms(),
+                }],
+            },
+        );
+        let mut out = Vec::new();
+        let row = app.worktree_row_of(&WorktreeId("w2".into())).unwrap();
+        select_worktree_row(&mut app, row, &mut out);
+        app.nav.focus = Focus::Worktrees;
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        crate::delete_check::sync(&mut app, &mut out);
+        let [ClientRequest::CheckWorktree { req_id, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        let req_id = *req_id;
+        let screen = confirm_screen(&mut app);
+        assert!(
+            screen.contains("2 agents from 'agent-1' · active just now — working in it"),
+            "{screen}"
+        );
+        assert!(screen.contains("Checking 'feat'"), "{screen}");
+
+        hse(
+            &mut app,
+            ServerEvent::WorktreeChecked {
+                req_id,
+                id: WorktreeId("w2".into()),
+                check: Default::default(),
+            },
+        );
+        let screen = confirm_screen(&mut app);
+        assert!(screen.contains("2 agents from 'agent-1'"), "{screen}");
+        assert!(!screen.contains("nothing is running"), "{screen}");
+    });
+}

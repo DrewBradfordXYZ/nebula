@@ -188,6 +188,9 @@ pub struct Daemon {
     /// nebula hasn't adopted yet leaves its cwd here, so the worktree sync
     /// can finish the re-home once the row exists.
     last_cwd: Mutex<HashMap<AgentId, PathBuf>>,
+    /// SUBAGENT PRESENCE: the worktrees other sessions' subagents are
+    /// working in (`subagents`). One lock, taken alone.
+    subagents: Mutex<crate::subagents::SubagentTracker>,
     /// Where each Claude agent's transcript (and beside it, the session
     /// title `/rename` persists) lives, from its hook payloads. Read by
     /// the CLAUDE TITLE SYNC (`session_title.rs`) when the PTY's window
@@ -223,6 +226,7 @@ pub struct Daemon {
 
 mod exit;
 mod lifecycle;
+mod presence;
 mod prewarm;
 mod projects;
 mod sessions;
@@ -248,6 +252,7 @@ impl Daemon {
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
+            subagents: Mutex::new(Default::default()),
             transcripts: Mutex::new(HashMap::new()),
             pending_moves: Mutex::new(HashMap::new()),
             spawn_gate: Mutex::new(()),
@@ -4227,6 +4232,136 @@ mod tests {
             .await
             .unwrap();
         assert!(!wt.exists());
+    }
+
+    fn seed_project(daemon: &Daemon) {
+        daemon
+            .store
+            .insert_project(&Project {
+                id: ProjectId("p".into()),
+                name: "p".into(),
+                repo_path: "/repo".into(),
+                sort_order: 0,
+            })
+            .unwrap();
+    }
+
+    /// Every `WorktreeActivity` the daemon broadcast, in order.
+    fn drain_presence(
+        events: &mut broadcast::Receiver<ServerEvent>,
+    ) -> Vec<(String, Vec<nebula_core::SubagentPresence>)> {
+        let mut found = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let ServerEvent::WorktreeActivity { worktree, agents } = ev {
+                found.push((worktree.0, agents));
+            }
+        }
+        found
+    }
+
+    /// SUBAGENT PRESENCE, end to end in the daemon: a subagent of a
+    /// session in the root that edits a file in a nested checkout puts
+    /// itself on that checkout's band — never the parent's own, which its
+    /// card already covers — and comes off it when it stops.
+    #[test]
+    fn a_subagent_working_in_another_worktree_is_shown_there_until_it_stops() {
+        use crate::hooks::SubagentReport;
+        let daemon = test_daemon();
+        seed_project(&daemon);
+        seed_worktree(&daemon, "p", "root", "/repo", true);
+        seed_worktree(&daemon, "p", "x", "/repo/.claude/worktrees/x", false);
+        seed_agent(&daemon, "parent", "root", Some("s1"));
+        let parent = AgentId("parent".into());
+        let mut events = daemon.events.subscribe();
+        let tool = HookEvent::PostToolUse {
+            tool_name: Some("Edit".into()),
+            subagent_id: Some("sub-1".into()),
+        };
+
+        daemon.note_subagent(
+            &parent,
+            &tool,
+            SubagentReport {
+                id: "sub-1".into(),
+                paths: vec!["/repo".into(), "/repo/.claude/worktrees/x/src/a.rs".into()],
+            },
+        );
+        let told = drain_presence(&mut events);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0].0, "x");
+        assert_eq!(told[0].1[0].parent, parent);
+        assert_eq!(told[0].1[0].subagents, 1);
+        assert!(daemon
+            .subagent_presence(&WorktreeId("root".into()))
+            .is_empty());
+        assert!(matches!(
+            daemon.presence_events().as_slice(),
+            [ServerEvent::WorktreeActivity { worktree, .. }] if worktree.0 == "x"
+        ));
+
+        // The same subagent again at once: nothing new to say.
+        daemon.note_subagent(
+            &parent,
+            &tool,
+            SubagentReport {
+                id: "sub-1".into(),
+                paths: vec!["/repo/.claude/worktrees/x/src/b.rs".into()],
+            },
+        );
+        assert!(drain_presence(&mut events).is_empty());
+
+        daemon.note_subagent(
+            &parent,
+            &HookEvent::SubagentStop {
+                subagent_id: Some("sub-1".into()),
+            },
+            SubagentReport {
+                id: "sub-1".into(),
+                paths: vec![],
+            },
+        );
+        assert_eq!(drain_presence(&mut events), [("x".to_string(), vec![])]);
+        assert!(daemon.presence_events().is_empty());
+    }
+
+    /// A subagent's parent going takes the subagent off every band, and
+    /// a deleted worktree forgets who was in it.
+    #[test]
+    fn a_parent_going_clears_its_subagents_presence() {
+        use crate::hooks::SubagentReport;
+        let daemon = test_daemon();
+        seed_project(&daemon);
+        seed_worktree(&daemon, "p", "root", "/repo", true);
+        seed_worktree(&daemon, "p", "x", "/elsewhere/x", false);
+        seed_agent(&daemon, "parent", "root", Some("s1"));
+        let parent = AgentId("parent".into());
+        daemon.note_subagent(
+            &parent,
+            &HookEvent::SubagentStart {
+                subagent_id: Some("sub-1".into()),
+            },
+            SubagentReport {
+                id: "sub-1".into(),
+                paths: vec!["/elsewhere/x".into()],
+            },
+        );
+        assert_eq!(daemon.subagent_presence(&WorktreeId("x".into())).len(), 1);
+        let mut events = daemon.events.subscribe();
+        daemon.subagents_gone_with(&parent);
+        assert_eq!(drain_presence(&mut events), [("x".to_string(), vec![])]);
+
+        // An id with no row (a prewarm spare) attributes nothing.
+        daemon.note_subagent(
+            &AgentId("spare".into()),
+            &HookEvent::SubagentStart {
+                subagent_id: Some("s".into()),
+            },
+            SubagentReport {
+                id: "s".into(),
+                paths: vec!["/elsewhere/x".into()],
+            },
+        );
+        assert!(daemon.presence_events().is_empty());
     }
 
     fn git_in(repo: &Path, args: &[&str]) {

@@ -89,6 +89,9 @@ struct ClientConnection {
     handshaken: bool,
     /// The client process, when the socket's credentials name it.
     peer_pid: Option<u32>,
+    /// The protocol the client said it speaks: events newer than it are
+    /// never forwarded ([`reaches`]).
+    protocol: u32,
 }
 
 impl ClientConnection {
@@ -100,6 +103,7 @@ impl ClientConnection {
             subscription: None,
             handshaken: false,
             peer_pid: None,
+            protocol: 0,
         }
     }
 
@@ -640,6 +644,7 @@ impl ClientConnection {
 
     async fn handle_hello(&mut self, protocol_version: u32) -> bool {
         self.handshaken = nebula_core::protocol_compatible_with(protocol_version);
+        self.protocol = protocol_version;
         let reply = if self.handshaken {
             ServerEvent::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
@@ -664,8 +669,18 @@ impl ClientConnection {
             .await
             .unwrap_or_else(|_| empty_snapshot());
         self.send(snapshot).await;
+        for ev in self.daemon.presence_events() {
+            if reaches(&ev, self.protocol) {
+                self.send(ev).await;
+            }
+        }
         let tx = self.out_tx.clone();
-        let forward = tokio::spawn(forward_subscription_events(self.daemon.clone(), rx, tx));
+        let forward = tokio::spawn(forward_subscription_events(
+            self.daemon.clone(),
+            rx,
+            tx,
+            self.protocol,
+        ));
         if let Some(old) = self.subscription.replace(forward) {
             old.abort();
         }
@@ -1174,25 +1189,49 @@ fn snapshot_or_empty(daemon: &Daemon) -> ServerEvent {
     })
 }
 
-async fn send_snapshot(daemon: &Daemon, tx: &mpsc::Sender<ServerEvent>) -> bool {
-    tx.send(snapshot_or_empty(daemon)).await.is_ok()
+/// Whether a client speaking `protocol` can decode `ev`. A pushed event
+/// kind newer than the client is held back: an older peer fails to decode
+/// an enum variant it does not know.
+fn reaches(ev: &ServerEvent, protocol: u32) -> bool {
+    match ev {
+        ServerEvent::WorktreeActivity { .. } => protocol >= nebula_core::SUBAGENT_ACTIVITY_PROTOCOL,
+        _ => true,
+    }
+}
+
+/// A resync: the snapshot, then the state it cannot carry — SUBAGENT
+/// PRESENCE — for a client that reads it.
+async fn send_snapshot(daemon: &Daemon, tx: &mpsc::Sender<ServerEvent>, protocol: u32) -> bool {
+    if tx.send(snapshot_or_empty(daemon)).await.is_err() {
+        return false;
+    }
+    for ev in daemon.presence_events() {
+        if reaches(&ev, protocol) && tx.send(ev).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn forward_subscription_events(
     daemon: Arc<Daemon>,
     mut rx: broadcast::Receiver<ServerEvent>,
     tx: mpsc::Sender<ServerEvent>,
+    protocol: u32,
 ) {
     loop {
         match rx.recv().await {
             Ok(ev) => {
+                if !reaches(&ev, protocol) {
+                    continue;
+                }
                 if tx.send(ev).await.is_err() {
                     break;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(skipped, "client subscription lagged; sending snapshot");
-                if !send_snapshot(&daemon, &tx).await {
+                if !send_snapshot(&daemon, &tx, protocol).await {
                     break;
                 }
             }
@@ -1255,7 +1294,12 @@ mod tests {
             .unwrap();
 
         let (tx, mut out) = mpsc::channel(4);
-        let forward = tokio::spawn(forward_subscription_events(daemon, rx, tx));
+        let forward = tokio::spawn(forward_subscription_events(
+            daemon,
+            rx,
+            tx,
+            PROTOCOL_VERSION,
+        ));
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(1), out.recv())
             .await
@@ -1267,5 +1311,53 @@ mod tests {
             matches!(ev, ServerEvent::Snapshot { .. }),
             "lag should resync with a snapshot, got {ev:?}"
         );
+    }
+
+    /// SUBAGENT PRESENCE is a pushed event kind an older client cannot
+    /// decode: it never reaches one, live or on a resync.
+    #[tokio::test]
+    async fn worktree_activity_is_held_back_from_an_older_client() {
+        let activity = || ServerEvent::WorktreeActivity {
+            worktree: nebula_core::WorktreeId("w".into()),
+            agents: vec![],
+        };
+        assert!(reaches(
+            &activity(),
+            nebula_core::SUBAGENT_ACTIVITY_PROTOCOL
+        ));
+        assert!(!reaches(
+            &activity(),
+            nebula_core::SUBAGENT_ACTIVITY_PROTOCOL - 1
+        ));
+        assert!(reaches(
+            &ServerEvent::Ack {
+                req_id: 1,
+                created: None
+            },
+            0
+        ));
+
+        let daemon = test_daemon();
+        let (events, rx) = broadcast::channel(8);
+        let (tx, mut out) = mpsc::channel(8);
+        let forward = tokio::spawn(forward_subscription_events(
+            daemon,
+            rx,
+            tx,
+            nebula_core::SUBAGENT_ACTIVITY_PROTOCOL - 1,
+        ));
+        events.send(activity()).unwrap();
+        events
+            .send(ServerEvent::Ack {
+                req_id: 7,
+                created: None,
+            })
+            .unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), out.recv())
+            .await
+            .expect("forwarded nothing")
+            .expect("forwarder closed");
+        forward.abort();
+        assert!(matches!(ev, ServerEvent::Ack { req_id: 7, .. }), "{ev:?}");
     }
 }

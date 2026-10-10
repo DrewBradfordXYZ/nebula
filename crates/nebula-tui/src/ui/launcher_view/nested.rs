@@ -10,7 +10,10 @@
 //! and its pull request are on the DETAIL STRIP pinned under the list
 //! ([`draw_strip`]).
 
-use super::{draw_panel_edge_marks, session_look, truncate, EMPTY_BAND_DELETE, EMPTY_BAND_HINT};
+use super::{
+    draw_panel_edge_marks, session_look, truncate, EMPTY_BAND_DELETE, EMPTY_BAND_HINT,
+    EMPTY_BAND_IDLE,
+};
 use crate::app::{App, Focus, HitTarget};
 use crate::keymap::Action;
 use crate::launcher::{Band, BandsLayout, Card, CardRef, PanelLayout, RowPr, NESTED_ROW_H};
@@ -213,7 +216,9 @@ pub(super) fn draw_bands(
 }
 
 /// An empty worktree (**Show all worktrees**): one line, in the title
-/// column the roots use, saying what can be done there.
+/// column the roots use, saying what can be done there — and, when
+/// another session's subagents work in it, who (SUBAGENT PRESENCE) in
+/// place of "nothing running".
 fn draw_empty(buf: &mut Buffer, app: &App, r: Rect, band: &Band, lit: bool) {
     let th = app.chrome.theme;
     let mut text = String::from(EMPTY_BAND_HINT);
@@ -221,16 +226,23 @@ fn draw_empty(buf: &mut Buffer, app: &App, r: Rect, band: &Band, lit: bool) {
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { gray::DIM };
+    let presence = crate::presence::label(app, &band.worktree, nebula_core::clock::now_ms());
+    let lead_fg = if presence.is_some() { th.warn } else { fg };
+    let lead = presence.unwrap_or_else(|| EMPTY_BAND_IDLE.to_string());
     // Four cells: the caret column and the scope mark's, each with its
-    // space, so the words start where a root's title does.
-    let shown = format!(
-        "    {}",
-        truncate(&text, usize::from(r.width).saturating_sub(4))
-    );
-    Paragraph::new(Span::styled(
-        truncate(&shown, usize::from(r.width)),
-        Style::default().fg(fg),
-    ))
+    // space, so the words start where a root's title does. The lead keeps
+    // its place first; the keys give way to it.
+    let room = usize::from(r.width).saturating_sub(4);
+    let lead = truncate(&lead, room);
+    let rest = match room.saturating_sub(lead.chars().count()) {
+        0 => String::new(),
+        left => truncate(&text, left),
+    };
+    Paragraph::new(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(lead, Style::default().fg(lead_fg)),
+        Span::styled(rest, Style::default().fg(fg)),
+    ]))
     .render(r, buf);
 }
 

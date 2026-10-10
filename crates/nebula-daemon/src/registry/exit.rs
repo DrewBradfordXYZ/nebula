@@ -3,6 +3,9 @@ use super::*;
 impl Daemon {
     pub(super) fn install_session(self: &Arc<Self>, session: Arc<PtySession>) {
         self.touch_session(&session.sref);
+        if let SessionRef::Agent(id) = &session.sref {
+            self.subagents_may_return(id);
+        }
         self.sessions
             .lock()
             .insert(session.sref.clone(), session.clone());
@@ -44,6 +47,11 @@ impl Daemon {
                             SessionRef::Agent(id) => daemon.take_resume_watch(id, &session),
                             SessionRef::Terminal(_) => None,
                         };
+                        // Any exit, killed or natural: an agent's subagents
+                        // run inside its process and end with it.
+                        if let SessionRef::Agent(id) = &sref {
+                            daemon.subagents_gone_with(id);
+                        }
                         if !was_registered {
                             break;
                         }

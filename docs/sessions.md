@@ -319,7 +319,10 @@ is one key from there: `p` opens the QUICK PROMPT, focused, so the first thing y
   recently the newest was written, and commits its base lacks (or, on a detached HEAD, commits
   no branch holds). `Enter` waits for the check — up to ten seconds — so the delete is never
   confirmed ahead of it; a check that fails or runs out of time says so rather than reading as
-  clean. Each band is a
+  clean. Another session's subagents working in a checkout through absolute paths show on its
+  band in the warning color (SUBAGENT PRESENCE): `1 agent from 'Fix Login' · active 2m ago`
+  where an empty band would say "nothing running", `· 1 agent` beside the session count on its
+  rule, and first in its delete confirm. Each band is a
   titled rule over one row of cards: the rule names the checkout in its scope color (`↳ feat`,
   `⌂ main` for the root — the project is the grid's own scope, named once in the header), with
   that checkout's uncommitted changes right behind the branch in the warning color (`↳ feat +3

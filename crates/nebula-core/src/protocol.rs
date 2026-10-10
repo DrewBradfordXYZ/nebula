@@ -10,7 +10,7 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
@@ -24,6 +24,10 @@ pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
 /// a request it could not decode, and its delete confirm simply goes
 /// without the check.
 pub const CHECK_WORKTREE_PROTOCOL: u32 = 51;
+
+/// First protocol whose clients decode `ServerEvent::WorktreeActivity`. The
+/// DAEMON sends it only to a client that said it speaks at least this.
+pub const SUBAGENT_ACTIVITY_PROTOCOL: u32 = 52;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -645,6 +649,18 @@ pub struct WorktreeCheck {
     pub git_error: Option<String>,
 }
 
+/// One session's subagents at work in a worktree other than its own
+/// (`ServerEvent::WorktreeActivity`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentPresence {
+    /// The session the subagents belong to; its row names them.
+    pub parent: AgentId,
+    /// How many of its subagents are working there.
+    pub subagents: u32,
+    /// Epoch ms of the newest hook event from any of them there.
+    pub last_active_ms: i64,
+}
+
 /// One process `WorktreeCheck` found working inside a checkout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeProcess {
@@ -820,6 +836,16 @@ pub enum ServerEvent {
         flags: u8,
     },
 
+    /// SUBAGENT PRESENCE: the sessions whose subagents are working in
+    /// `worktree` right now — sessions whose own rows live in another
+    /// checkout, so the worktree's band would otherwise read "nothing
+    /// running". Pushed whenever that list changes, and after the
+    /// `Snapshot` once per worktree that has one; an empty `agents` clears
+    /// it. Only sent to clients at [`SUBAGENT_ACTIVITY_PROTOCOL`] or newer.
+    WorktreeActivity {
+        worktree: WorktreeId,
+        agents: Vec<SubagentPresence>,
+    },
     /// Reply to `ClientRequest::CheckWorktree`.
     WorktreeChecked {
         req_id: u64,

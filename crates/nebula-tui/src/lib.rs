@@ -36,6 +36,7 @@ pub mod pr_cache;
 pub mod pr_modal;
 pub mod pr_preview;
 pub mod pr_row;
+pub mod presence;
 pub mod preset_overlays;
 pub mod pull_request;
 pub mod quick_prompt;

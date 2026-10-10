@@ -19,6 +19,7 @@ pub mod session_title;
 pub mod sibling;
 pub mod status;
 pub mod store;
+pub mod subagents;
 pub mod worktree_check;
 pub mod worktree_hooks;
 
@@ -194,8 +195,13 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                 cwd,
                 transcript,
                 prompt,
+                subagent,
             }) = hook_rx.recv().await
             {
+                // A subagent's whereabouts go on the band it works in.
+                if let Some(report) = subagent {
+                    daemon.note_subagent(&agent_id, &event, report);
+                }
                 let captures_session = event.captures_session();
                 daemon.apply_hook_event(&agent_id, event.clone(), session_id.clone());
                 // The prompt itself, for the row's RECENT PROMPTS. After
@@ -247,6 +253,7 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
                     _ = interval.tick() => {
                         daemon.tick_status_machines();
                         daemon.reap_prewarmed();
+                        daemon.expire_subagents();
                     }
                 }
             }

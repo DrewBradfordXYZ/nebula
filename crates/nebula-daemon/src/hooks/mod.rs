@@ -145,6 +145,19 @@ pub struct HookDelivery {
     /// (`prompt_history::condense`). Only a `UserPromptSubmit` carries
     /// one, and only when the payload had a non-blank, user-written one.
     pub prompt: Option<String>,
+    /// Set when the event is a subagent's: which one, and where it says
+    /// it worked — for SUBAGENT PRESENCE (`subagents`), never for `cwd`
+    /// above, which a subagent must not move the row with.
+    pub subagent: Option<SubagentReport>,
+}
+
+/// A subagent's hook event, as SUBAGENT PRESENCE reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentReport {
+    pub id: String,
+    /// The payload's cwd and the paths in its tool call
+    /// (`subagents::touched_paths`).
+    pub paths: Vec<std::path::PathBuf>,
 }
 
 /// Permissive payload: every field optional, unknown fields ignored. Hook
@@ -167,6 +180,9 @@ pub struct HookPayload {
     pub conversation_id: Option<String>,
     pub notification_type: Option<String>,
     pub tool_name: Option<String>,
+    /// The tool call's arguments (`file_path`, `path`, `command`, …) —
+    /// read only for a subagent's paths, so any shape is fine.
+    pub tool_input: Option<serde_json::Value>,
     pub agent_id: Option<String>,
     /// Cursor's name for the subagent id in subagentStart/subagentStop.
     pub subagent_id: Option<String>,
@@ -400,6 +416,15 @@ async fn receive_hook(
     // in a scratch checkout must never drag the row out from under the
     // conversation. Only foreground payloads carry a cwd onward.
     let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
+    // Where a subagent works is still worth knowing — on the band of the
+    // worktree it works in, not by moving its parent's row.
+    let subagent = payload.subagent_id().map(|id| SubagentReport {
+        id,
+        paths: crate::subagents::touched_paths(
+            payload.cwd().as_deref(),
+            payload.tool_input.as_ref(),
+        ),
+    });
     // Only Claude persists a session title of its own beside a transcript.
     let transcript = match cli {
         HookCli::Claude => TranscriptRef::from_payload(
@@ -426,6 +451,7 @@ async fn receive_hook(
             cwd,
             transcript,
             prompt,
+            subagent,
         })
         .await;
 
@@ -764,6 +790,59 @@ mod tests {
         assert_eq!(status, 200);
         let delivery = rx.recv().await.unwrap();
         assert!(delivery.cwd.is_none(), "subagent cwd: {:?}", delivery.cwd);
+        assert_eq!(
+            delivery.subagent,
+            Some(SubagentReport {
+                id: "sub-1".into(),
+                paths: vec!["/w/scratch".into()],
+            }),
+            "it goes to SUBAGENT PRESENCE instead"
+        );
+    }
+
+    /// A subagent's tool call names where it worked: its cwd and the
+    /// file its tool touched — Claude's `agent_id`, Cursor's
+    /// `subagent_id` alike. A foreground call carries no report.
+    #[tokio::test]
+    async fn subagent_tool_calls_report_the_paths_they_touched() {
+        let store = seeded_store();
+        let (env, mut rx, _) = start_hook_server(store, None).await.unwrap();
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=PostToolUse",
+            &env.token,
+            r#"{"session_id":"s1","tool_name":"Edit","cwd":"/w/main","agent_id":"sub-1",
+                "tool_input":{"file_path":"/w/main/.claude/worktrees/x/a.rs","old_string":"a"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let report = rx.recv().await.unwrap().subagent.expect("a subagent's");
+        assert_eq!(
+            report.paths,
+            [
+                std::path::PathBuf::from("/w/main"),
+                "/w/main/.claude/worktrees/x/a.rs".into()
+            ]
+        );
+
+        http_post(
+            env.port,
+            "/api/hooks/cursor?agentId=titled&hookEvent=SubagentStop",
+            &env.token,
+            r#"{"conversation_id":"c1","subagent_id":"cs-2","workspace_roots":["/w/feat"]}"#,
+        )
+        .await;
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.subagent.map(|r| r.id).as_deref(), Some("cs-2"));
+
+        http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=PostToolUse",
+            &env.token,
+            r#"{"session_id":"s1","tool_name":"Read","cwd":"/w/main","tool_input":{"file_path":"/x"}}"#,
+        )
+        .await;
+        assert!(rx.recv().await.unwrap().subagent.is_none());
     }
 
     /// The prompt reaches the drain loop condensed, on its own event

@@ -4148,6 +4148,53 @@ mod tests {
             .unwrap_or_else(|| panic!("band {index} was not drawn"))
     }
 
+    /// SUBAGENT PRESENCE: an empty band another session's subagent is
+    /// working in says so where it would read "nothing running", and its
+    /// rule counts the agent beside the sessions — one `d` must not look
+    /// like it deletes an idle checkout. The DAEMON's empty list clears it.
+    #[test]
+    fn an_empty_band_another_sessions_subagent_works_in_says_who() {
+        with_default_config(|| {
+            let mut app = with_empty_band();
+            let activity = |agents| ServerEvent::WorktreeActivity {
+                worktree: WorktreeId("w3".into()),
+                agents,
+            };
+            hse(
+                &mut app,
+                activity(vec![nebula_core::SubagentPresence {
+                    parent: AgentId("a1".into()),
+                    subagents: 1,
+                    last_active_ms: nebula_core::clock::now_ms(),
+                }]),
+            );
+            let screen = screen_text(&draw_tall(&mut app));
+            assert!(
+                screen.contains("1 agent from 'agent-1' · active just now · p: new session"),
+                "{screen}"
+            );
+            assert!(!screen.contains("nothing running"), "{screen}");
+            assert!(screen.contains("0 sessions · 1 agent"), "{screen}");
+            // The NESTED layout's one-line empty worktree says it too.
+            app.launcher.launcher_nested = true;
+            let term = draw_tall(&mut app);
+            let (_, text) = band_header(&app, &term, 2);
+            assert!(
+                text.contains("1 agent from 'agent-1' · active just now · p: new session"),
+                "{text:?}"
+            );
+            app.launcher.launcher_nested = false;
+
+            hse(&mut app, activity(vec![]));
+            let screen = screen_text(&draw_tall(&mut app));
+            assert!(
+                screen.contains("nothing running · p: new session"),
+                "{screen}"
+            );
+            assert!(!screen.contains("1 agent"), "{screen}");
+        });
+    }
+
     /// With **Show all worktrees** on a checkout with nothing running is
     /// on the grid as an EMPTY BAND — its branch on the rule, and under
     /// it what can be done there — which `j` walks onto like any band.

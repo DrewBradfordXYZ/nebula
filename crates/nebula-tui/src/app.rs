@@ -2822,6 +2822,9 @@ pub struct Tree {
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
     pub links: Vec<Link>,
+    /// SUBAGENT PRESENCE: per worktree, the other sessions whose
+    /// subagents are working in it (`presence`). Only worktrees with any.
+    pub subagents: HashMap<WorktreeId, Vec<nebula_core::SubagentPresence>>,
 }
 
 impl Tree {
