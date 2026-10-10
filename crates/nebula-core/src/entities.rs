@@ -207,6 +207,32 @@ pub struct Worktree {
     pub sort_order: i64,
 }
 
+impl Worktree {
+    /// The subagent's name (`agent-<id>`) when this checkout is a Claude
+    /// Code SUBAGENT CHECKOUT: the one an `isolation: "worktree"` subagent
+    /// works in, which Claude Code creates at
+    /// `<repo>/.claude/worktrees/agent-<id>` on branch `worktree-agent-<id>`
+    /// and removes when the subagent finishes. The WORKTREE SYNC lists it
+    /// like any other checkout, but nothing started in it outlives the
+    /// subagent. Read from the path and branch rather than the lock Claude
+    /// Code holds on it, so a row whose checkout is already gone (and its
+    /// lock with it) is still recognised.
+    pub fn claude_subagent(&self) -> Option<&str> {
+        claude_subagent_checkout(&self.path, &self.branch)
+    }
+}
+
+/// [`Worktree::claude_subagent`] on a bare path and branch.
+pub fn claude_subagent_checkout<'a>(path: &'a Path, branch: &str) -> Option<&'a str> {
+    let dir = path.file_name()?.to_str()?;
+    let id = dir.strip_prefix("agent-")?;
+    let parent = path.parent()?;
+    let in_claude_worktrees = parent.file_name()? == "worktrees"
+        && parent.parent().and_then(Path::file_name)? == ".claude";
+    let hex = !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit());
+    (in_claude_worktrees && hex && branch.strip_prefix("worktree-") == Some(dir)).then_some(dir)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: AgentId,
@@ -368,4 +394,50 @@ pub enum EntityId {
     Agent(AgentId),
     Terminal(TerminalId),
     Link(LinkId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claude_subagent_checkout;
+    use std::path::Path;
+
+    #[test]
+    fn a_claude_subagent_checkout_is_known_by_its_path_and_branch() {
+        let path = Path::new("/repo/.claude/worktrees/agent-a5894d42027c65fda");
+        assert_eq!(
+            claude_subagent_checkout(path, "worktree-agent-a5894d42027c65fda"),
+            Some("agent-a5894d42027c65fda")
+        );
+        // A checkout someone named in the same folder, a subagent checkout
+        // switched to another branch, and the shape anywhere but Claude
+        // Code's own folder are ordinary worktrees.
+        for (path, branch) in [
+            (
+                "/repo/.claude/worktrees/jolly-yak-prowls",
+                "jolly-yak-prowls",
+            ),
+            (
+                "/repo/.claude/worktrees/agent-a5894d42027c65fda",
+                "fix-login",
+            ),
+            (
+                "/repo/.claude/worktrees/agent-notes",
+                "worktree-agent-notes",
+            ),
+            (
+                "/repo-worktrees/agent-a5894d42027c65fda",
+                "worktree-agent-a5894d42027c65fda",
+            ),
+            (
+                "/repo/worktrees/agent-a5894d42027c65fda",
+                "worktree-agent-a5894d42027c65fda",
+            ),
+        ] {
+            assert_eq!(
+                claude_subagent_checkout(Path::new(path), branch),
+                None,
+                "{path}"
+            );
+        }
+    }
 }

@@ -1071,6 +1071,11 @@ fn draw_bands(
 /// it refuses.
 const EMPTY_BAND_HINT: &str = "nothing running · p: new session · t: terminal";
 const EMPTY_BAND_DELETE: &str = " · d: delete worktree";
+/// What a Claude Code SUBAGENT CHECKOUT's rule says ahead of its counts.
+const SUBAGENT_RULE: &str = "subagent checkout · ";
+/// What its EMPTY BAND says ahead of the keys: a session started here ends
+/// when the subagent does, which nothing else on the band would say.
+const SUBAGENT_EMPTY_BAND: &str = "a Claude Code subagent's, removed when it finishes · ";
 
 /// The line under an EMPTY BAND's rule — a checkout with nothing running
 /// in it, drawn only with **Show all worktrees** on — in place of the row
@@ -1100,13 +1105,15 @@ fn draw_empty_band(
         text.push_str(EMPTY_BAND_DELETE);
     }
     let fg = if lit { th.accent } else { th.dim };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().fg(fg),
-        ))),
-        placed.rect,
-    );
+    let mut spans = vec![Span::raw("  ")];
+    if band.subagent {
+        spans.push(Span::styled(
+            SUBAGENT_EMPTY_BAND,
+            Style::default().fg(th.warn),
+        ));
+    }
+    spans.push(Span::styled(text, Style::default().fg(fg)));
+    f.render_widget(Paragraph::new(Line::from(spans)), placed.rect);
 }
 
 /// The EDGE MARKERS on a grid taller than its window: `↑ 2 more above`
@@ -1697,7 +1704,15 @@ fn draw_band_rule(
                 plural(band.terminals())
             ));
         }
-        let mut spans = vec![Span::styled(words, Style::default().fg(th.dim))];
+        let mut spans = Vec::new();
+        // A Claude Code subagent's checkout says whose it is ahead of the
+        // counts, in the heads-up color: Claude Code removes it when the
+        // subagent finishes, and the sessions on it stop with it. Part of
+        // the right end, which never yields to the branch.
+        if band.subagent {
+            spans.push(Span::styled(SUBAGENT_RULE, Style::default().fg(th.warn)));
+        }
+        spans.push(Span::styled(words, Style::default().fg(th.dim)));
         if more > 0 {
             spans.push(Span::styled(
                 format!("  ▸ {more} more"),
@@ -5032,6 +5047,7 @@ mod tests {
             worktree: WorktreeId("w1".into()),
             branch: branch.into(),
             is_main,
+            subagent: false,
             solo: false,
             pr: None,
             cards: vec![crate::launcher::Card::Session(LauncherRow {
@@ -5133,6 +5149,30 @@ mod tests {
         // The cards under it say what runs in the checkout, not where.
         let text = row_string(&worktree, 0);
         assert!(text.contains("1 session"), "{text:?}");
+    }
+
+    /// A Claude Code subagent's checkout says so at its rule's right end,
+    /// ahead of the counts and in the heads-up color, and keeps saying it
+    /// on a rule too narrow for the whole branch: the session on it stops
+    /// when Claude Code removes the checkout, and the branch alone
+    /// (`worktree-agent-a5…`) reads like any other.
+    #[test]
+    fn a_subagent_checkout_says_so_on_its_rule() {
+        let app = App::new();
+        let th = app.chrome.theme;
+        let mut band = a_band(false, "worktree-agent-a5894d42027c65fda");
+        band.subagent = true;
+        for width in [80, 44] {
+            let buf = rule_row(&app, &band, width);
+            let text = row_string(&buf, 0);
+            assert!(
+                text.contains("subagent checkout · 1 session"),
+                "{width}: {text:?}"
+            );
+            assert_eq!(painted(&buf, 0, th.warn).trim(), "subagent checkout ·");
+        }
+        let plain = rule_row(&app, &a_band(false, "feat-x"), 80);
+        assert!(!row_string(&plain, 0).contains("subagent"));
     }
 
     /// The checkout's changed-file count rides right behind the branch on

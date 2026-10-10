@@ -592,10 +592,22 @@ fn validate_starting_prompt(raw: &str) -> Result<String> {
 /// the path as an empty folder that is not a git checkout; either way the
 /// session would look like it runs in its worktree and doesn't. The row is
 /// kept while sessions hang off it and the WORKTREE SYNC matches rows by
-/// path, so recreating the checkout where it was brings them back.
+/// path, so recreating the checkout where it was brings them back — except
+/// a Claude Code SUBAGENT CHECKOUT ([`Worktree::claude_subagent`]), which
+/// was Claude Code's to remove: the way back there is moving the session
+/// to a checkout that stays, where its next launch resumes the same
+/// conversation.
 fn require_checkout(worktree: &Worktree) -> Result<()> {
     if worktree.path.is_dir() {
         return Ok(());
+    }
+    if let Some(subagent) = worktree.claude_subagent() {
+        bail!(
+            "this checkout was a Claude Code subagent's ({subagent}), and Claude Code removed it \
+             when the subagent finished ({path}). Move the session to another worktree (the \
+             card's Move to…) and it resumes there with its conversation, or delete the worktree",
+            path = worktree.path.display(),
+        );
     }
     bail!(
         "the checkout for '{branch}' is gone from disk ({path}). Recreate it where it was and \
@@ -1954,6 +1966,59 @@ mod tests {
         let agent = daemon.store.get_agent(&id).unwrap().unwrap();
         assert_eq!(agent.worktree_id, WorktreeId("here".into()));
         assert!(!daemon.relocation_pending(&id));
+    }
+
+    /// A session started in a Claude Code subagent's checkout, which Claude
+    /// Code removed when the subagent finished. Recreating the checkout is
+    /// not the way back — it was never the session's — so the refusal says
+    /// whose it was and points at moving the session, and the move works:
+    /// the same row boots in the checkout it was moved to.
+    #[tokio::test]
+    async fn a_removed_subagent_checkout_says_whose_it_was_and_the_move_works() {
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let daemon = test_daemon();
+        let repo = tempfile::tempdir().unwrap();
+        let scratch = repo
+            .path()
+            .join(".claude/worktrees/agent-a5894d42027c65fda");
+        std::fs::create_dir_all(&scratch).unwrap();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "main", repo.path().to_str().unwrap(), true);
+        seed_worktree(
+            &daemon,
+            "p",
+            "worktree-agent-a5894d42027c65fda",
+            scratch.to_str().unwrap(),
+            false,
+        );
+        seed_agent(
+            &daemon,
+            "a",
+            "worktree-agent-a5894d42027c65fda",
+            Some("sid-1"),
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+
+        let sref = SessionRef::Agent(AgentId("a".into()));
+        let err = daemon
+            .ensure_session(&sref, 80, 24)
+            .err()
+            .expect("a session in a removed subagent checkout is refused");
+        let why = err.to_string();
+        assert!(
+            why.contains("Claude Code subagent's (agent-a5894d42027c65fda)"),
+            "{why}"
+        );
+        assert!(why.contains("Move to…"), "{why}");
+        assert!(!why.contains("git worktree add"), "{why}");
+        assert!(!scratch.exists(), "the removed checkout was recreated");
+
+        daemon
+            .move_agent(&AgentId("a".into()), &WorktreeId("main".into()))
+            .unwrap();
+        daemon.ensure_session(&sref, 80, 24).unwrap();
+        assert!(daemon.is_alive(&sref));
+        daemon.kill_session(&sref);
     }
 
     #[test]

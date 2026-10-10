@@ -233,6 +233,10 @@ pub struct Band {
     pub branch: String,
     /// The checkout is the project's ROOT WORKTREE (`⌂`).
     pub is_main: bool,
+    /// A Claude Code SUBAGENT CHECKOUT (`Worktree::claude_subagent`):
+    /// Claude Code removes it when the subagent finishes, and anything
+    /// started in it stops with it, so its rule says so.
+    pub subagent: bool,
     /// One card of the root checkout standing as a NESTED thread of its
     /// own: prompts run on the root are separate work, not one thread,
     /// so each gets its own band. Several bands share the checkout then,
@@ -301,6 +305,7 @@ pub fn bands(app: &App) -> Vec<Band> {
             worktree: w.id.clone(),
             branch: w.branch.clone(),
             is_main: w.is_main,
+            subagent: w.claude_subagent().is_some(),
             solo: false,
             pr: row_pr(app, &w.id, &project.id, &w.branch),
             cards: Vec::new(),

@@ -94,6 +94,11 @@
   `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.
+  A Claude Code subagent's checkout (`.claude/worktrees/agent-<id>` on branch `worktree-agent-<id>`,
+  made for an `isolation: "worktree"` subagent) shows up the same way, but Claude Code removes it when
+  the subagent finishes, so its band's rule says `subagent checkout`. A session started there and
+  left behind refuses to start again and says to move it to another worktree (the card's **Move to…**),
+  where it resumes with its conversation.
 - **The root checkout changes branch in place — the BRANCH SWITCHER.** `c` on a root-branch card (or
   with no card selected) lists the repo's branches with one `git for-each-ref` and switches with
   `git switch`, asking first when the checkout has uncommitted changes whether to stash, bring along,
