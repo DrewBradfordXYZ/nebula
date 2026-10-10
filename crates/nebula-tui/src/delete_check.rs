@@ -140,7 +140,7 @@ pub(crate) fn sync(app: &mut App, out: &mut Vec<ClientRequest>) {
         out.push(ClientRequest::CheckWorktree {
             req_id,
             id: id.clone(),
-            git_only: false,
+            band: false,
         });
         app.requests.delete_checks.entries.insert(
             id,
