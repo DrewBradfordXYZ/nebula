@@ -112,6 +112,25 @@ fn env_guard() -> String {
     format!("[ -z \"${AGENT_ID}\" ] || [ -z \"${API_URL}\" ]")
 }
 
+/// The endpoint of Claude's hooks, and of every custom harness on its dialect.
+const CLAUDE_ENDPOINT: &str = "claude";
+
+/// The Claude hooks' second test: a non-interactive Claude — `claude -p`, or
+/// an Agent SDK app — started from inside the session inherits its whole
+/// NEBULA_* env and fires these same hooks as the agent, so its own session
+/// id would replace the agent's, its prompt would take the row's preview, and
+/// the next respawn would resume a session that is not the agent's (from a
+/// `--no-session-persistence` run: none at all, a blank pane). The daemon
+/// drops `CLAUDE_CODE_ENTRYPOINT` from every PTY, so the pane's `claude`
+/// reports `cli`, and a `claude -p` under it (attached or detached, a merge
+/// queue's background push included) turns the inherited `cli` into
+/// `sdk-cli`; Claude's `/background` worker, whose hooks are the row's,
+/// stays `cli`. The test only applies where the agent's own CLI is known to
+/// be interactive (`NEBULA_CLAUDE_INTERACTIVE`, a built-in Claude agent): a
+/// custom harness may run `claude -p` as the agent itself.
+const CLAUDE_NON_INTERACTIVE_GUARD: &str = "case \"$CLAUDE_CODE_ENTRYPOINT\" in \
+     sdk-*) [ -n \"$NEBULA_CLAUDE_INTERACTIVE\" ] && exit 0;; esac; ";
+
 /// The POST itself, identical for every dialect: bearer auth, the hook's
 /// stdin payload passed straight through, and the agent id plus event
 /// name on the query string so the daemon needs nothing else to route it.
@@ -134,8 +153,13 @@ fn hook_command(endpoint: &str, event: &str) -> String {
     } else {
         ">/dev/null 2>&1"
     };
+    let guard = if endpoint == CLAUDE_ENDPOINT {
+        CLAUDE_NON_INTERACTIVE_GUARD
+    } else {
+        ""
+    };
     format!(
-        "if {}; then exit 0; fi; {} {silence} || true",
+        "if {}; then exit 0; fi; {guard}{} {silence} || true",
         env_guard(),
         hook_curl(endpoint, event)
     )
@@ -210,7 +234,7 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
     install_managed_hooks(
         &cwd.join(CLAUDE_DIR),
         CLAUDE_SETTINGS_FILE,
-        "claude",
+        CLAUDE_ENDPOINT,
         CLAUDE_EVENTS,
         CLAUDE_ALLOW_RULES,
     )
@@ -502,6 +526,8 @@ mod tests {
         assert_eq!(
             hook_command("claude", "UserPromptSubmit"),
             "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then exit 0; fi; \
+             case \"$CLAUDE_CODE_ENTRYPOINT\" in \
+             sdk-*) [ -n \"$NEBULA_CLAUDE_INTERACTIVE\" ] && exit 0;; esac; \
              curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
              -H \"Content-Type: application/json\" --data-binary @- \
              \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\" \

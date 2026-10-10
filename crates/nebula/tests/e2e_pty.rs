@@ -5395,3 +5395,148 @@ exit 0
     wait_for_exit(&mut daemon);
     assert_eq!(runs(), "1");
 }
+
+/// A non-interactive Claude started from inside an agent's session — a
+/// script's `claude -p` review, attached or detached from the pane, which
+/// inherits the session's whole NEBULA_* env and runs the same managed hooks
+/// — must not take over the row (2026-10-08: its SessionStart read as a
+/// restart, its first prompt saved its session id over the agent's, its
+/// prompt became the card's preview, and the next respawn resumed a
+/// `--no-session-persistence` session with no transcript, a blank pane).
+///
+/// Runs the installed hook commands, with the entrypoint each process would
+/// report as Claude sets it (measured on Claude Code 2.1.294): the pane's
+/// `claude` keeps an inherited value or else reports `cli`, and a `claude -p`
+/// under it turns that `cli` into `sdk-cli`. The daemon itself is started
+/// with `CLAUDE_CODE_ENTRYPOINT=sdk-ts` — as from an Agent SDK app — which
+/// must not reach the pane, or the agent's own hooks would go quiet.
+#[tokio::test]
+async fn hooks_of_a_non_interactive_claude_inside_the_session_are_inert() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "outer", 2).await;
+
+    // The installed hook commands, one script each, so the PTY's shell can
+    // run them as Claude would: payload on stdin, the CLI's env around it.
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    let hook = |event: &str| {
+        let cmd = settings["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        let path = env.tmp.path().join(format!("{event}.sh"));
+        std::fs::write(&path, cmd).unwrap();
+        path.display().to_string()
+    };
+    let (start, prompt, stop) = (hook("SessionStart"), hook("UserPromptSubmit"), hook("Stop"));
+    // `CLI` is the pane's own `claude`; `SDK` a `claude -p` started under it.
+    const CLI: &str = "\"${CLAUDE_CODE_ENTRYPOINT:-cli}\"";
+    const SDK: &str = "sdk-cli";
+    let fire = |entrypoint: &str, script: &str, body: &str| {
+        format!("printf '{body}' | CLAUDE_CODE_ENTRYPOINT={entrypoint} sh {script} >/dev/null")
+    };
+
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 200,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    let prompted = |evs: &[ServerEvent], text: &str| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.recent_prompts.iter().any(|p| p.text == text))
+        })
+    };
+    let finished = |evs: &[ServerEvent]| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
+                if *agent == agent_id)
+        })
+    };
+
+    // The pane's CLI starts and takes a prompt.
+    let line = [
+        fire(
+            CLI,
+            &start,
+            r#"{"session_id":"own-sid","source":"startup"}"#,
+        ),
+        fire(
+            CLI,
+            &prompt,
+            r#"{"session_id":"own-sid","prompt":"own work"}"#,
+        ),
+    ]
+    .join("; ");
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: format!("{line}\n").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| prompted(evs, "own work")).await;
+    assert!(
+        prompted(&events, "own work"),
+        "own prompt recorded: {events:#?}"
+    );
+
+    // A `claude -p` inside it starts its own session and takes its prompt;
+    // then the pane's turn ends. Had the nested SessionStart been adopted,
+    // that Stop would read as a foreign session's and be ignored.
+    let line = [
+        fire(
+            SDK,
+            &start,
+            r#"{"session_id":"child-sid","source":"startup"}"#,
+        ),
+        fire(
+            SDK,
+            &prompt,
+            r#"{"session_id":"child-sid","prompt":"Do an adversarial review"}"#,
+        ),
+        fire(CLI, &stop, r#"{"session_id":"own-sid"}"#),
+    ]
+    .join("; ");
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: format!("{line}\n").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, finished).await;
+    assert!(
+        finished(&events),
+        "the agent's own Stop ends its turn: {events:#?}"
+    );
+    assert!(
+        !prompted(&events, "Do an adversarial review"),
+        "the nested run's prompt stays off the row: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+
+    // The session a respawn resumes is still the agent's own.
+    let store = nebula_daemon::store::Store::open(&env.tmp.path().join("data/nebula.db")).unwrap();
+    let row = store.get_agent(&agent_id).unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("own-sid"));
+}
