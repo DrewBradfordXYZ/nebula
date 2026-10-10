@@ -25,14 +25,16 @@ use nebula_core::{AgentId, ClientRequest, ProjectId, SessionRef, WorktreeId};
 /// Rows of cards `Ctrl+d` / `Ctrl+u` jump.
 const HALF_PAGE: i64 = 2;
 
-/// What `⇧A` says each way: which of the two lists the grid is now of.
+/// What `⇧A` and `⇧U` say each way: which list the grid is now of.
 const ARCHIVED_VIEW: &str = "archived sessions — u unarchives one, ⇧A back to the live ones";
-const LIVE_VIEW: &str = "live sessions — ⇧A reads the archived ones";
+const DELETED_VIEW: &str = "recently deleted sessions — u restores one, ⇧U back to the live ones";
+const LIVE_VIEW: &str = "live sessions — ⇧A reads the archived ones, ⇧U the recently deleted";
 
 /// What the grid says when there is nothing to step through yet — of
 /// whichever of the two lists it is showing ([`toggle_archived`]).
 const NO_SESSIONS: &str = "no sessions yet — p starts one";
 const NO_ARCHIVED_SESSIONS: &str = "nothing archived here — ⇧A back to the live sessions";
+const NO_DELETED_SESSIONS: &str = "nothing deleted here — ⇧U back to the live sessions";
 
 /// Is the card under this id one of the ARCHIVED VIEW's? Its session was
 /// reaped when it was archived, so nothing on it can be stepped into.
@@ -40,12 +42,27 @@ fn is_archived(app: &App, id: &AgentId) -> bool {
     app.tree.agents.iter().any(|a| &a.id == id && a.archived)
 }
 
+/// What Enter on a card put away says, in the words of the list it is
+/// on: an archived card's, or a recently deleted one's.
+fn put_away(app: &App, id: &AgentId) -> &'static str {
+    if app
+        .tree
+        .agents
+        .iter()
+        .any(|a| &a.id == id && a.deleted_at > 0)
+    {
+        super::AGENT_DELETED
+    } else {
+        super::AGENT_ARCHIVED
+    }
+}
+
 /// The one of those two this grid means.
 fn nothing_here(app: &App) -> &'static str {
-    if app.launcher.show_archived {
-        NO_ARCHIVED_SESSIONS
-    } else {
-        NO_SESSIONS
+    match (app.launcher.show_archived, app.launcher.show_deleted) {
+        (true, true) => NO_DELETED_SESSIONS,
+        (true, false) => NO_ARCHIVED_SESSIONS,
+        (false, _) => NO_SESSIONS,
     }
 }
 
@@ -180,16 +197,40 @@ pub(super) fn clear_aim(app: &mut App) {
 /// INPUT PARITY: the one function behind the `⇧A` key and the card
 /// menu's **Show/hide archived**, so both end in the same state.
 pub(crate) fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.launcher.show_archived = !app.launcher.show_archived;
+    // From the RECENTLY DELETED VIEW it goes across to the archived one,
+    // as `⇧U` from here goes across to that: each key opens its own list
+    // from wherever the grid is, and closes it back to the live sessions.
+    let archived = !(app.launcher.show_archived && !app.launcher.show_deleted);
+    show_list(app, archived, false, out);
+}
+
+/// `⇧U`: swap the grid between a project's LIVE sessions and its
+/// RECENTLY DELETED ones — the sessions deleted with `d`, kept restorable
+/// while `deleted_sessions_kept` lets them, newest first. The same grid
+/// as the ARCHIVED VIEW in every other way (a deleted session is an
+/// archived one): `u` restores the card under the cursor, `d` deletes it
+/// for good. INPUT PARITY: the key and the card menu's **Show/hide
+/// recently deleted** both end here.
+pub(crate) fn toggle_deleted(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let deleted = !app.launcher.show_deleted;
+    show_list(app, deleted, deleted, out);
+}
+
+/// Put the grid on one of its three lists — live, archived, or recently
+/// deleted (`deleted` rides `archived`) — and the cursor on its first
+/// card, with the flash saying which list arrived.
+fn show_list(app: &mut App, archived: bool, deleted: bool, out: &mut Vec<ClientRequest>) {
+    app.launcher.show_archived = archived;
+    app.launcher.show_deleted = archived && deleted;
     match view::rows(app).first().map(|row| row.agent.id.clone()) {
         Some(first) => select(app, first, out),
         None => clear_aim(app),
     }
     app.chrome.flash = Some(
-        if app.launcher.show_archived {
-            ARCHIVED_VIEW
-        } else {
-            LIVE_VIEW
+        match (app.launcher.show_archived, app.launcher.show_deleted) {
+            (true, true) => DELETED_VIEW,
+            (true, false) => ARCHIVED_VIEW,
+            (false, _) => LIVE_VIEW,
         }
         .into(),
     );
@@ -846,6 +887,9 @@ pub(super) fn handle_action(
         // group fold: there is no ARCHIVED group to open, only the other
         // list of cards.
         Action::ToggleArchived => toggle_archived(app, out),
+        // `⇧U` swaps it for the project's recently deleted sessions, and
+        // back, the same way.
+        Action::ToggleDeleted => toggle_deleted(app, out),
         // Space on a card: its FOLLOW-UP MODAL, a box over the grid —
         // the card itself has no room to grow one, and the pane stays
         // exactly as it is.
@@ -2318,9 +2362,10 @@ pub(super) struct CursorCard {
     /// The grid's project, and which of its two lists it was showing. A
     /// switch to another project, or to the ARCHIVED VIEW and back, takes
     /// every band off the grid at once, which [`keep_cursor`] has to tell
-    /// from one card leaving it.
+    /// from one card leaving it. The RECENTLY DELETED VIEW is a list of its
+    /// own for that, so the pair is (archived, deleted).
     project: Option<ProjectId>,
-    archived: bool,
+    archived: (bool, bool),
 }
 
 /// `band`'s cards in the order the grid shows them: the NESTED layout's
@@ -2349,7 +2394,7 @@ pub(super) fn cursor_entry(app: &App) -> Option<CursorCard> {
         before: at.and_then(|n| n.checked_sub(1)).and_then(sref_at),
         after: at.and_then(|n| sref_at(n + 1)),
         project: app.selected_project().map(|p| p.id.clone()),
-        archived: app.launcher.show_archived,
+        archived: (app.launcher.show_archived, app.launcher.show_deleted),
     })
 }
 
@@ -2374,7 +2419,7 @@ pub(super) fn keep_cursor(app: &mut App, before: CursorCard, out: &mut Vec<Clien
     // left it, this one with them, and whatever put the cursor on one of
     // the new ones meant to.
     if app.selected_project().map(|p| p.id.clone()) != before.project
-        || app.launcher.show_archived != before.archived
+        || (app.launcher.show_archived, app.launcher.show_deleted) != before.archived
         // A create is still being followed onto its own row (`n`, the
         // box): that landing is the one the user asked for.
         || app.requests.select_when_seen.is_some()
@@ -2491,7 +2536,7 @@ pub(super) fn enter_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
             // it when it was archived. Say what to press rather than
             // handing the keys to an empty pane.
             if is_archived(app, &id) {
-                app.chrome.flash = Some(super::AGENT_ARCHIVED.into());
+                app.chrome.flash = Some(put_away(app, &id).into());
                 return;
             }
             jump_to_target(app, PaletteTarget::Session(id), Landing::Attach, out);
@@ -2524,7 +2569,7 @@ pub(super) fn open_session(app: &mut App, out: &mut Vec<ClientRequest>) -> bool 
         }
         SessionRef::Agent(id) => {
             if is_archived(app, &id) {
-                app.chrome.flash = Some(super::AGENT_ARCHIVED.into());
+                app.chrome.flash = Some(put_away(app, &id).into());
                 return false;
             }
             take_aim(app);
@@ -3118,6 +3163,7 @@ mod tests {
                     status: AgentStatus::Running,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -3159,6 +3205,7 @@ mod tests {
                     status: AgentStatus::Running,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -3212,6 +3259,7 @@ mod tests {
                     status: AgentStatus::Running,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -8626,6 +8674,7 @@ mod tests {
                         status: AgentStatus::Fresh,
                         archived: false,
                         archived_at: 0,
+                        deleted_at: 0,
                         unseen: false,
                         kind: AgentKind::Claude,
                         custom_harness: None,
@@ -8879,6 +8928,90 @@ mod tests {
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             let text = buffer_text(&draw_at(&mut app, 130, 50));
             assert!(text.contains("agent-1"), "{text}");
+        });
+    }
+
+    /// `⇧U` swaps the grid for the project's RECENTLY DELETED sessions and
+    /// back, as `⇧A` does for the archived ones, and the two lists never
+    /// mix: a deleted card is only in the one, an archived card only in
+    /// the other, and each header names its own. Each key opens its own
+    /// list from the other one, and closes it back to the live sessions,
+    /// so neither ever takes two presses.
+    #[test]
+    fn shift_u_swaps_the_grid_for_the_recently_deleted_sessions() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            // A second card in `polish-nav`'s checkout, archived by hand.
+            let beside = app
+                .tree
+                .agents
+                .iter()
+                .find(|a| a.id == AgentId("a2".into()))
+                .cloned()
+                .expect("polish-nav");
+            app.tree.agents.push(nebula_core::Agent {
+                id: AgentId("a9".into()),
+                name: "old-work".into(),
+                archived: true,
+                ..beside
+            });
+            // `polish-nav` deleted, `old-work` archived, `agent-1` live.
+            for agent in &mut app.tree.agents {
+                if agent.id == AgentId("a2".into()) {
+                    agent.archived = true;
+                    agent.deleted_at = crate::app::now_ms();
+                }
+            }
+            let shift = |app: &mut App, c: char| {
+                key(app, KeyCode::Char(c), KeyModifiers::SHIFT);
+                buffer_text(&draw(app))
+            };
+
+            let text = shift(&mut app, 'U');
+            assert!((app.launcher.show_archived, app.launcher.show_deleted) == (true, true));
+            assert!(text.contains("polish-nav"), "the deleted card: {text}");
+            assert!(!text.contains("old-work"), "not the archived one: {text}");
+            assert!(!text.contains("agent-1"), "nor the live one: {text}");
+            assert!(text.contains("1 recently deleted session"), "{text}");
+            assert_eq!(
+                app.selected_session().map(|a| a.id),
+                Some(AgentId("a2".into())),
+                "the cursor lands on the first card of the list that arrived"
+            );
+
+            let text = shift(&mut app, 'A');
+            assert!((app.launcher.show_archived, app.launcher.show_deleted) == (true, false));
+            assert!(text.contains("old-work"), "across to the archived: {text}");
+            assert!(
+                !text.contains("polish-nav"),
+                "which leaves deleted out: {text}"
+            );
+            assert!(text.contains("1 archived session"), "{text}");
+
+            shift(&mut app, 'U');
+            assert!(app.launcher.show_deleted, "and across again");
+            let text = shift(&mut app, 'U');
+            assert!(!app.launcher.show_archived && !app.launcher.show_deleted);
+            assert!(!text.contains("deleted session"), "back to live: {text}");
+
+            // Enter there says what to press, in the view's own words.
+            shift(&mut app, 'U');
+            app.chrome.flash = None;
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some(crate::event_loop::AGENT_DELETED)
+            );
+
+            // `u` in the view restores the card under the cursor.
+            let out = key(&mut app, KeyCode::Char('u'), KeyModifiers::NONE);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::UnarchiveAgent { id, .. } if *id == AgentId("a2".into())
+                )),
+                "{out:?}"
+            );
         });
     }
 

@@ -46,6 +46,11 @@ pub struct Loaded<T> {
 /// to it.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: &str = "5m";
 
+/// `deleted_sessions_kept`'s default: how many deleted sessions each
+/// project keeps restorable in the RECENTLY DELETED VIEW before the DAEMON purges
+/// the oldest. The daemon and the TUI both default their configs to it.
+pub const DEFAULT_DELETED_SESSIONS_KEPT: u32 = 10;
+
 pub fn load<T: DeserializeOwned + Default>(config: &Path, local: &Path) -> Loaded<T> {
     let mut problems = Vec::new();
     let mut merged = read_layer(config, &mut problems);

@@ -18,6 +18,7 @@ fn seed_agent_in(app: &mut App, id: &str, worktree: &nebula_core::WorktreeId) {
                 status: AgentStatus::Finished,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -48,6 +49,7 @@ fn seed_second_agent(app: &mut App, status: nebula_core::AgentStatus) {
                 status,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -842,6 +844,7 @@ pub(super) fn seed_tree(app: &mut App) {
                 status: AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -5183,6 +5186,7 @@ fn working_sessions_head_the_list_regardless_of_age() {
                 status,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -5238,6 +5242,7 @@ fn sessions_order_by_last_interaction() {
             status,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
             custom_harness: None,
@@ -5321,6 +5326,7 @@ fn a_session_created_running_leads_the_working_ones() {
             status,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
             custom_harness: None,
@@ -5382,6 +5388,7 @@ fn status_change_resorts_and_selection_follows() {
                 status: AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -5451,6 +5458,7 @@ fn worktree_delete_is_optimistic_and_rolls_back_on_error() {
                 status: AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -7736,6 +7744,7 @@ fn walking_onto_a_reaped_session_still_waits_out_the_debounce() {
                 status: AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -8341,6 +8350,7 @@ fn archived_agent(id: &str, name: &str, archived_at: i64, sort: i64) -> nebula_c
         archived: true,
         unseen: false,
         archived_at,
+        deleted_at: 0,
         kind: nebula_core::AgentKind::Claude,
         custom_harness: None,
         model: None,
@@ -8381,6 +8391,78 @@ fn archived_group_orders_newest_first() {
         })
         .collect();
     assert_eq!(names, ["newest", "mid", "old", "legacy"]);
+}
+
+/// The panels list the ARCHIVED VIEW and the RECENTLY DELETED VIEW apart,
+/// as the grid does: the archived sessions alone in the one, the deleted
+/// ones alone in the other, each newest first.
+#[test]
+fn archived_and_deleted_sessions_are_listed_apart() {
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let deleted = |id: &str, at: i64, sort: i64| {
+        let mut e = archived_agent(id, id, at, sort);
+        if let nebula_core::Entity::Agent(a) = &mut e {
+            a.deleted_at = at;
+        }
+        e
+    };
+    for ev in [
+        archived_agent("archived-new", "archived-new", 500, 1),
+        deleted("deleted-old", 100, 2),
+        archived_agent("archived-old", "archived-old", 50, 3),
+        deleted("deleted-new", 300, 4),
+    ] {
+        hse(&mut app, ServerEvent::EntityUpserted { entity: ev });
+    }
+    app.launcher.show_archived = true;
+    let names = |app: &App| -> Vec<String> {
+        app.visible_session_rows()
+            .iter()
+            .filter(|r| r.is_archived_agent())
+            .map(|r| match r {
+                SessionRow::Agent(a) => a.name.clone(),
+                SessionRow::Terminal(_) | SessionRow::Link(_) => unreachable!(),
+            })
+            .collect()
+    };
+    assert_eq!(names(&app), ["archived-new", "archived-old"]);
+    app.launcher.show_deleted = true;
+    assert_eq!(names(&app), ["deleted-new", "deleted-old"]);
+}
+
+/// The delete confirm says what a restorable delete keeps and how to get
+/// it back; with the setting at 0, or on an archived card, it is final.
+#[test]
+fn delete_confirm_says_whether_the_session_is_kept() {
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let a = app.tree.agents[0].clone();
+
+    let final_one = crate::event_loop::commands::confirm_delete_agent_in(&app, &a);
+    assert!(
+        final_one.message.contains("go away"),
+        "{}",
+        final_one.message
+    );
+
+    app.launcher.deleted_kept = 10;
+    let kept = crate::event_loop::commands::confirm_delete_agent_in(&app, &a);
+    assert!(
+        kept.message
+            .contains("moves to recently deleted (⇧U); u restores it"),
+        "{}",
+        kept.message
+    );
+
+    let mut archived = a.clone();
+    archived.archived = true;
+    let from_archive = crate::event_loop::commands::confirm_delete_agent_in(&app, &archived);
+    assert!(
+        from_archive.message.contains("go away"),
+        "{}",
+        from_archive.message
+    );
 }
 
 /// Collapsing the ARCHIVED group (A) while the cursor sits on an
@@ -9940,6 +10022,7 @@ fn selection_follows_the_selected_agent_when_the_daemon_rehomes_it() {
         status: AgentStatus::Fresh,
         archived: false,
         archived_at: 0,
+        deleted_at: 0,
         unseen: false,
         kind: nebula_core::AgentKind::Claude,
         custom_harness: None,
@@ -10135,6 +10218,7 @@ fn agent_stamped(id: &str, wt: &str, at: i64) -> nebula_core::Entity {
         },
         archived: false,
         archived_at: 0,
+        deleted_at: 0,
         unseen: false,
         kind: nebula_core::AgentKind::Claude,
         custom_harness: None,
@@ -11887,6 +11971,7 @@ fn seed_second_project(app: &mut App) {
                 status: AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Codex,
                 custom_harness: None,
@@ -11913,6 +11998,7 @@ fn seed_second_project(app: &mut App) {
                 status: AgentStatus::Terminated,
                 archived: true,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -12244,6 +12330,7 @@ fn seed_attention_ring(app: &mut App) {
         status,
         archived: false,
         archived_at: 0,
+        deleted_at: 0,
         unseen,
         kind: nebula_core::AgentKind::Claude,
         custom_harness: None,
@@ -12709,6 +12796,7 @@ fn palette_rows_take_their_status_color_and_sweep() {
                 status: AgentStatus::Running,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -14983,6 +15071,7 @@ fn shift_d_bulk_deletes_the_visible_sessions() {
                     status: AgentStatus::Fresh,
                     archived,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     custom_harness: None,
@@ -15036,6 +15125,84 @@ fn shift_d_bulk_deletes_the_visible_sessions() {
     assert_eq!(deleted, ["a1", "a2"], "one request per session: {out:?}");
 }
 
+/// A bulk delete that takes more live sessions than a project keeps says
+/// so rather than promising every one back — the DAEMON trims after each
+/// delete, so the batch pushes out its own first ones — and each request
+/// carries the promise the confirm made, for the DAEMON to keep whatever
+/// its own copy of the setting says.
+#[test]
+fn a_bulk_delete_past_the_kept_says_which_go_for_good() {
+    let mut app = App::new();
+    seed_tree(&mut app); // p1/w1(main) + agent-1
+    upsert_agent(&mut app, "a2", "w1", "agent-2", false);
+    upsert_agent(&mut app, "a3", "w1", "agent-3", false);
+    app.nav.focus = Focus::Sessions;
+    let confirm = |app: &mut App, kept: u32, sent_id: &str| -> (String, Vec<u32>) {
+        app.launcher.deleted_kept = kept;
+        let mut out = Vec::new();
+        press(app, KeyCode::Char('D'), KeyModifiers::SHIFT, &mut out);
+        let Some(Overlay::Confirm(c)) = &app.modals.overlay else {
+            panic!("Shift+D confirms first: {:?}", app.modals.overlay);
+        };
+        let message = c.message.clone();
+        app.modals.overlay = None;
+        let mut sent = Vec::new();
+        crate::event_loop::optimistic::delete_agent(app, AgentId(sent_id.into()), true, &mut sent);
+        let keeps = sent
+            .iter()
+            .filter_map(|r| match r {
+                ClientRequest::DeleteAgent { keep, .. } => Some(*keep),
+                _ => None,
+            })
+            .collect();
+        (message, keeps)
+    };
+
+    let (message, keeps) = confirm(&mut app, 2, "a3");
+    assert!(
+        message.contains("u restores them")
+            && message.contains("Only 2 can be kept: the other one goes for good."),
+        "{message}"
+    );
+    assert_eq!(keeps, [2], "the count the confirm was worded from");
+
+    upsert_agent(&mut app, "a3", "w1", "agent-3", false);
+    let (message, _) = confirm(&mut app, 10, "a3");
+    assert!(!message.contains("for good"), "all three fit: {message}");
+
+    // With the archived rows on show, `D` takes them too, and they are
+    // final: the confirm says so rather than promising them back.
+    upsert_agent(&mut app, "a3", "w1", "agent-3", true);
+    app.launcher.show_archived = true;
+    let (message, _) = confirm(&mut app, 10, "a3");
+    assert!(
+        message.contains("The one already archived goes for good."),
+        "{message}"
+    );
+    app.launcher.show_archived = false;
+
+    // In the RECENTLY DELETED VIEW, `D` takes the deleted cards it shows,
+    // and its fine print calls them that.
+    upsert_agent(&mut app, "a5", "w1", "agent-5", true);
+    if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id.0 == "a5") {
+        a.deleted_at = crate::app::now_ms();
+    }
+    app.launcher.show_archived = true;
+    app.launcher.show_deleted = true;
+    let (message, _) = confirm(&mut app, 10, "a5");
+    assert!(
+        message.contains("The one recently deleted goes for good."),
+        "{message}"
+    );
+    app.launcher.show_archived = false;
+    app.launcher.show_deleted = false;
+
+    upsert_agent(&mut app, "a4", "w1", "agent-4", false);
+    let (message, keeps) = confirm(&mut app, 0, "a4");
+    assert!(!message.contains("restores"), "{message}");
+    assert_eq!(keeps, [0], "no promise made, none sent");
+}
+
 fn wt_entity(id: &str, project: &str, branch: &str, is_main: bool) -> nebula_core::Entity {
     use nebula_core::{Entity, Worktree};
     Entity::Worktree(Worktree {
@@ -15057,6 +15224,7 @@ fn agent_entity(id: &str, wt: &str, name: &str, archived: bool) -> nebula_core::
         status: AgentStatus::Fresh,
         archived,
         archived_at: 0,
+        deleted_at: 0,
         unseen: false,
         kind: nebula_core::AgentKind::Claude,
         custom_harness: None,
@@ -15753,6 +15921,7 @@ fn a_cross_project_session_jump_attaches_only_the_session_picked() {
                 status: nebula_core::AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -15821,6 +15990,7 @@ fn seed_background_run(app: &mut App) {
                 status: AgentStatus::Running,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 custom_harness: None,
@@ -16643,6 +16813,7 @@ fn the_issue_quick_prompt_stands_on_the_modal() {
                     status: nebula_core::AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     custom_harness: None,
@@ -18113,6 +18284,7 @@ fn a_quick_prompt_lands_the_row_without_taking_the_pane() {
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Codex,
                     custom_harness: None,
@@ -20105,6 +20277,7 @@ fn parity_tree() -> App {
                 status: AgentStatus::Finished,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -21833,6 +22006,131 @@ fn delete_empty_worktree_setting_skips_the_question() {
         );
         assert_eq!(delete_worktree_requests(&out), ["w2"]);
         assert!(!app.tree.worktrees.iter().any(|w| w.id.0 == "w2"));
+    });
+}
+
+/// A kept delete on the last card of a linked worktree: the dialog says
+/// the session waits in the RECENTLY DELETED VIEW, and that a `y` to the worktree
+/// takes it for good — the two promises never contradict each other.
+#[test]
+fn a_kept_delete_says_what_the_worktree_question_costs() {
+    with_default_config(|| {
+        let mut app = App::new();
+        seed_emptiable_tree(&mut app);
+        app.launcher.deleted_kept = 10;
+        upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+        let c = menu_delete(&mut app, "a2");
+        assert!(
+            matches!(
+                c.action,
+                PendingAction::ThenDeleteWorktree { offered: true, .. }
+            ),
+            "{:?}",
+            c.action
+        );
+        assert!(
+            c.message.contains("moves to recently deleted")
+                && c.message.contains("delete it from disk too?")
+                && c.message.contains("y deletes the worktree too"),
+            "{}",
+            c.message
+        );
+    });
+}
+
+/// With **Delete emptied worktree** on, the worktree goes for certain and
+/// the session with it, so a kept delete is worded as the final one.
+#[test]
+fn a_forced_worktree_delete_promises_no_restore() {
+    with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+        let mut app = App::new();
+        seed_emptiable_tree(&mut app);
+        app.launcher.deleted_kept = 10;
+        upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+        let c = menu_delete(&mut app, "a2");
+        assert!(
+            matches!(
+                c.action,
+                PendingAction::ThenDeleteWorktree { offered: false, .. }
+            ),
+            "{:?}",
+            c.action
+        );
+        assert!(
+            !c.message.contains("restores") && c.message.contains("go away"),
+            "{}",
+            c.message
+        );
+        // The request still sends the session restorable: the worktree's
+        // delete takes it anyway, and a refused one leaves it waiting
+        // rather than gone for nothing.
+        let mut out = Vec::new();
+        crate::event_loop::commands::run_pending_action(&mut app, c.action, &mut out);
+        assert!(
+            out.iter().any(|r| matches!(
+                r,
+                ClientRequest::DeleteAgent { id, keep, .. } if id.0 == "a2" && *keep > 0
+            )),
+            "{out:?}"
+        );
+    });
+}
+
+/// A recently deleted session under the worktree is not a filed archive:
+/// the forcing setting still skips the question, and the dialog says the
+/// deleted session goes with the checkout.
+#[test]
+fn recently_deleted_sessions_do_not_make_the_worktree_question() {
+    with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+        let mut app = App::new();
+        seed_emptiable_tree(&mut app);
+        upsert_agent(&mut app, "a2", "w2", "agent-2", false);
+        let mut kept = agent_entity("a3", "w2", "agent-3", true);
+        if let nebula_core::Entity::Agent(a) = &mut kept {
+            a.deleted_at = crate::app::now_ms();
+        }
+        hse(&mut app, ServerEvent::EntityUpserted { entity: kept });
+        let c = menu_delete(&mut app, "a2");
+        assert!(
+            matches!(
+                c.action,
+                PendingAction::ThenDeleteWorktree { offered: false, .. }
+            ),
+            "{:?}",
+            c.action
+        );
+        assert!(
+            c.message
+                .contains("Its 1 recently deleted session(s) go with it for good."),
+            "{}",
+            c.message
+        );
+    });
+}
+
+/// Clearing a recently deleted card out of a checkout that holds nothing
+/// live is not the delete the forcing setting is about: it still asks,
+/// three ways, so `n` takes the card alone and the checkout — with any
+/// uncommitted work in it — stays.
+#[test]
+fn deleting_a_deleted_card_never_forces_the_worktree() {
+    with_config_json(r#"{"delete_empty_worktree": true}"#, || {
+        let mut app = App::new();
+        seed_emptiable_tree(&mut app);
+        let mut kept = agent_entity("a3", "w2", "agent-3", true);
+        if let nebula_core::Entity::Agent(a) = &mut kept {
+            a.deleted_at = crate::app::now_ms();
+        }
+        hse(&mut app, ServerEvent::EntityUpserted { entity: kept });
+        let c = menu_delete(&mut app, "a3");
+        assert!(
+            matches!(
+                c.action,
+                PendingAction::ThenDeleteWorktree { offered: true, .. }
+            ),
+            "{:?}",
+            c.action
+        );
     });
 }
 

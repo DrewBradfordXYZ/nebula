@@ -535,6 +535,25 @@ cursor the whole card lifts a step, so the one you are about to unarchive stays 
 selection fill, and with color off entirely the two shapes still tell the grids apart. No card says
 the word `archived`: the header says it once, for all of them.
 
+**A deleted session waits in the RECENTLY DELETED VIEW before it is gone.** `d` on a live card (or a
+`D` that takes several) archives it and marks it deleted rather than erasing it; the confirm says so
+and how to undo it. `⇧U` swaps the grid for those sessions, as `⇧A` does for the archived ones: the
+same bands, of the deleted sessions alone, newest first, the header counting them under their own
+words (`3 recently deleted sessions`). The archived view leaves them out, so the three lists never
+mix; `⇧A` and `⇧U` each open their own from the other and close back to the live sessions. A deleted
+card is drawn as an archived one on its way out — a cross `✕` where the square was, its name struck
+through, the badge counting from the delete — and on the grid the cursor's card says `u restores`.
+`u` restores it on the same conversation; `d` there deletes it for good. Each project keeps as many
+deleted sessions as **Keep deleted sessions** says (Settings → Sessions, 10 by default), and a
+delete past that purges the project's oldest; a `D` that takes more live sessions than that says in
+its confirm how many go for good. A setting lowered while the daemon is down takes effect when it
+starts. A worktree's delete — from a card's confirm, the worktree's own, or the merged-worktree
+cleanup — takes its archived and recently deleted sessions with it for good, as it always took
+archived ones: they would have no checkout to come back to. A checkout removed outside nebula
+likewise goes from the grid once only deleted sessions are left under it. With the setting off, a
+delete is final at once, as it always was. Until it is purged a deleted session keeps what an
+archived one keeps on disk — its name, recent prompts and resume id.
+
 ## The ISSUES MODAL and ISSUE SESSIONS
 
 `i` lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,

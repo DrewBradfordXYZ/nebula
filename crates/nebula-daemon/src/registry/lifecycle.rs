@@ -422,6 +422,15 @@ impl Daemon {
     }
 
     pub fn unarchive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+        // A deleted row purged a moment before the `u` landed: the client
+        // still drawing it is told it is gone rather than left holding a
+        // card the store no longer has.
+        if self.store.get_agent(id)?.is_none() {
+            self.broadcast(ServerEvent::EntityRemoved {
+                id: EntityId::Agent(id.clone()),
+            });
+            return Ok(());
+        }
         self.store.set_agent_archived(id, false)?;
         self.broadcast_agent(id)?;
         Ok(())
@@ -438,15 +447,64 @@ impl Daemon {
         Ok(())
     }
 
-    pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+    /// Delete a session. With `keep` above 0 — the client's word to the
+    /// user that the delete can be undone, and the count it named — a live
+    /// row is archived and stamped with
+    /// its `deleted_at`, so it waits in the RECENTLY DELETED VIEW, where unarchive
+    /// brings it back, until newer deletes in its project push it out
+    /// ([`Self::trim_deleted_agents`]). Without it, or on a row already
+    /// archived (or deleted), the row goes for good, as every delete did
+    /// before. Either way the project is trimmed to `deleted_sessions_kept`
+    /// after, so a setting just lowered takes effect at the next delete.
+    pub fn delete_agent(self: &Arc<Self>, id: &AgentId, keep: u32) -> Result<()> {
+        let kept = crate::config::Config::load().deleted_sessions_kept;
+        self.delete_agent_keeping(id, keep, kept)
+    }
+
+    /// [`Self::delete_agent`] with the setting already read: `kept` is how
+    /// many deleted sessions each project holds.
+    pub(crate) fn delete_agent_keeping(
+        self: &Arc<Self>,
+        id: &AgentId,
+        keep: u32,
+        kept: u32,
+    ) -> Result<()> {
+        let live = self.store.get_agent(id)?.is_some_and(|a| !a.archived);
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.last_cwd.lock().remove(id);
         self.pending_moves.lock().remove(id);
+        if keep > 0 && live {
+            self.store.set_agent_deleted(id)?;
+            self.broadcast_agent(id)?;
+            // The user was promised this one back, and as many as the
+            // client said are kept: both hold even when the setting read
+            // here has since gone lower.
+            self.trim_deleted_agents(kept.max(keep));
+            return Ok(());
+        }
         self.store.delete_agent(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Agent(id.clone()),
         });
+        self.trim_deleted_agents(kept);
         Ok(())
+    }
+
+    /// Remove the deleted rows past each project's `keep` newest and tell
+    /// every client they are gone. Run after every delete, and at boot so a
+    /// lowered setting takes effect without waiting for one.
+    pub(crate) fn trim_deleted_agents(self: &Arc<Self>, keep: u32) {
+        match self.store.trim_deleted_agents(keep) {
+            Ok(ids) => {
+                for id in ids {
+                    tracing::info!(agent = %id, "purged a deleted session");
+                    self.broadcast(ServerEvent::EntityRemoved {
+                        id: EntityId::Agent(id),
+                    });
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "purging deleted sessions failed"),
+        }
     }
 
     pub async fn restart_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {

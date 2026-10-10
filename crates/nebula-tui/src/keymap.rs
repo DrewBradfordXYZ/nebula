@@ -116,6 +116,7 @@ pub enum Action {
     Archive,
     Unarchive,
     ToggleArchived,
+    ToggleDeleted,
     Delete,
     DeleteAll,
     /// The AGENT PRESETS list: saved launch definitions for the checkout
@@ -514,6 +515,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["shift+a"],
+    },
+    ActionSpec {
+        action: Action::ToggleDeleted,
+        id: "toggle_deleted",
+        label: "Show / hide recently deleted",
+        hint: "Swap the grid between the live sessions and the recently deleted ones (u restores one)",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["shift+u"],
     },
     ActionSpec {
         action: Action::Delete,

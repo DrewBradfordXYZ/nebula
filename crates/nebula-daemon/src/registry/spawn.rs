@@ -130,6 +130,7 @@ impl Daemon {
             },
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind,
             custom_harness: custom_harness

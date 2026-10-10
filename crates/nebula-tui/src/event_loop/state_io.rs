@@ -55,6 +55,7 @@ pub(crate) fn ui_state_json(app: &App) -> String {
         worktree: app.selected_worktree().map(|w| w.id.to_string()),
         session_agent: app.selected_session().map(|a| a.id.to_string()),
         show_archived: app.launcher.show_archived,
+        show_deleted: app.launcher.show_deleted,
         collapsed: app.pane.collapsed,
         open_prs_collapsed: app.launcher.open_prs_collapsed,
         issues_collapsed: app.launcher.issues_collapsed,
@@ -143,6 +144,7 @@ pub(crate) fn restore_ui_state(app: &mut App, json: &str) -> bool {
         return false;
     };
     app.launcher.show_archived = state.show_archived;
+    app.launcher.show_deleted = state.show_archived && state.show_deleted;
     app.launcher.open_prs_collapsed = state.open_prs_collapsed;
     app.launcher.issues_collapsed = state.issues_collapsed;
     if let Some(w) = state.diff_files_width {

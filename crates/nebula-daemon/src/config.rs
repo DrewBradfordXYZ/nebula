@@ -29,6 +29,10 @@ pub struct Config {
     /// reaped session revives on the next attach or prewarm (agents resume
     /// their conversation). Malformed values fall back to the 5m default.
     pub session_idle_timeout: String,
+    /// How many deleted sessions each project keeps restorable in the
+    /// RECENTLY DELETED VIEW: a delete past this many purges that project's oldest
+    /// deleted rows. 0 deletes at once, as nebula always used to.
+    pub deleted_sessions_kept: u32,
     /// The branch every new WORKTREE nobody named a base for starts from
     /// — a project's **New worktree**, a bare `nebula worktree`, the QUICK
     /// PROMPT's auto-created one. Empty (the default) means origin's own
@@ -74,6 +78,7 @@ impl Default for Config {
             prewarm_agents: true,
             prewarm_sessions: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
+            deleted_sessions_kept: DEFAULT_DELETED_SESSIONS_KEPT,
             worktree_base_branch: String::new(),
             custom_harnesses: Vec::new(),
             harnesses: BTreeMap::new(),
@@ -82,7 +87,7 @@ impl Default for Config {
     }
 }
 
-pub use nebula_core::settings::DEFAULT_SESSION_IDLE_TIMEOUT;
+pub use nebula_core::settings::{DEFAULT_DELETED_SESSIONS_KEPT, DEFAULT_SESSION_IDLE_TIMEOUT};
 
 impl Config {
     pub fn load() -> Self {

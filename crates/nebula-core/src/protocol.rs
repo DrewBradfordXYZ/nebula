@@ -10,14 +10,14 @@ use std::path::PathBuf;
 ///
 /// Bump on every protocol change. Additive changes keep
 /// [`MIN_COMPATIBLE_PROTOCOL`] where it is; breaking changes bump both.
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 
 /// Oldest IPC protocol this build can safely talk to.
 ///
 /// Compatibility is a range overlap: two peers can talk when each peer's
 /// `[MIN_COMPATIBLE_PROTOCOL, PROTOCOL_VERSION]` range includes at least one
 /// version the other peer also supports.
-pub const MIN_COMPATIBLE_PROTOCOL: u32 = 49;
+pub const MIN_COMPATIBLE_PROTOCOL: u32 = 51;
 
 pub fn protocol_ranges_overlap(
     local_min: u32,
@@ -390,9 +390,15 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
     },
+    /// `keep`: the `deleted_sessions_kept` the client told the user about
+    /// when it said this delete can be undone, so a live row is kept
+    /// restorable in the RECENTLY DELETED VIEW, its project trimmed to no fewer
+    /// than that, whatever the daemon's own copy of the setting says. 0 is
+    /// a final delete.
     DeleteAgent {
         req_id: u64,
         id: AgentId,
+        keep: u32,
     },
     /// Respawn; resumes the stored session id (`claude --resume` /
     /// `codex resume` / `cursor-agent --resume`) when one is stored.

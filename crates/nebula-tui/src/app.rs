@@ -346,6 +346,8 @@ pub enum MenuAction {
     /// first, next to the `+`, if it had none.
     OpenProject(ProjectId),
     ToggleArchived,
+    /// The card menu's **Show/hide recently deleted** (`⇧U`'s twin).
+    ToggleDeleted,
     /// Fold / unfold the PROJECT OPEN PRS GROUP (Worktrees panel menu).
     ToggleOpenPrs,
     /// Fold / unfold the PROJECT ISSUES GROUP (Worktrees panel menu).
@@ -3083,6 +3085,10 @@ pub struct UiState {
     pub worktree: Option<String>,
     pub session_agent: Option<String>,
     pub show_archived: bool,
+    /// The RECENTLY DELETED VIEW, which rides `show_archived`; absent in
+    /// older blobs, which come back to the plain archived view.
+    #[serde(default)]
+    pub show_deleted: bool,
     pub collapsed: bool,
     /// The PROJECT OPEN PRS GROUP folded down to its header; absent in
     /// older blobs, which keep it open.
@@ -3373,6 +3379,7 @@ struct RowsKey {
     cursor: (usize, usize, usize),
     shape: [usize; 5],
     show_archived: bool,
+    show_deleted: bool,
 }
 
 impl RowsMemo {
@@ -3567,6 +3574,13 @@ pub struct PaneState {
 #[derive(Default)]
 pub struct LauncherState {
     pub show_archived: bool,
+    /// With `show_archived`, the RECENTLY DELETED VIEW (`⇧U`): the grid of
+    /// the project's deleted sessions, kept restorable, rather than the
+    /// sessions archived by hand. The two never mix, as the archived and
+    /// live lists never do; every rule of the archived view holds in it,
+    /// since a deleted session is an archived one. Meaningless without
+    /// `show_archived`.
+    pub show_deleted: bool,
     /// The Worktrees panel's OPEN PRS group folded down to its header (a
     /// click on it). Like `show_archived`, it rides the UI-state blob so a
     /// restart brings it back folded.
@@ -3792,6 +3806,12 @@ pub struct LauncherState {
     /// Mirrors the config, refreshed at startup and when the settings
     /// overlay applies a change.
     pub hide_card_marks: bool,
+    /// The `deleted_sessions_kept` setting, 0 when off: how many deleted
+    /// sessions each project keeps restorable in the RECENTLY DELETED VIEW. Words
+    /// the delete confirm, and decides whether a
+    /// delete keeps the card on screen. Mirrors the config, refreshed at
+    /// startup and when the settings overlay applies a change.
+    pub deleted_kept: u32,
     /// The `highlight_current_card` setting: the cursor's card is washed
     /// faintly in its status color instead of the gray fill
     /// (`launcher_view::card_tint`). Mirrors the config, refreshed at
@@ -5058,6 +5078,7 @@ impl App {
                 self.tree.links.len(),
             ],
             show_archived: self.launcher.show_archived,
+            show_deleted: self.launcher.show_deleted,
         }
     }
 
@@ -5743,11 +5764,16 @@ impl App {
                 .tree
                 .agents
                 .iter()
-                .filter(|a| &a.worktree_id == wt && a.archived)
+                .filter(|a| {
+                    &a.worktree_id == wt
+                        && a.archived
+                        && (a.deleted_at > 0) == self.launcher.show_deleted
+                })
                 .cloned()
                 .collect();
-            // Most recently archived first; pre-`archived_at` rows (stamp 0)
-            // keep tree order at the bottom (stable sort).
+            // Most recently archived (or deleted, which archives) first;
+            // pre-`archived_at` rows (stamp 0) keep tree order at the
+            // bottom (stable sort).
             archived.sort_by_key(|a| std::cmp::Reverse(a.archived_at));
             rows.extend(archived);
         }
@@ -6076,6 +6102,7 @@ mod tests {
                 status: AgentStatus::Finished,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -6369,6 +6396,7 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             status_changed_at: 0,
             kind: AgentKind::Claude,
@@ -6603,6 +6631,7 @@ mod tests {
                 },
                 archived: i == 4,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,

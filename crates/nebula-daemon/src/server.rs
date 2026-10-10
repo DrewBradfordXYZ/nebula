@@ -534,9 +534,9 @@ impl ClientConnection {
                 reply_done(&self.out_tx, req_id, result).await;
                 Ok(true)
             }
-            ClientRequest::DeleteAgent { req_id, id } => {
+            ClientRequest::DeleteAgent { req_id, id, keep } => {
                 let result = self
-                    .blocking_daemon(move |daemon| daemon.delete_agent(&id))
+                    .blocking_daemon(move |daemon| daemon.delete_agent(&id, keep))
                     .await;
                 reply_done(&self.out_tx, req_id, result).await;
                 Ok(true)

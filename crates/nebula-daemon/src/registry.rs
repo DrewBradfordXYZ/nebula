@@ -2910,6 +2910,7 @@ mod tests {
                 status: AgentStatus::Running,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -3304,6 +3305,7 @@ mod tests {
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -4390,6 +4392,149 @@ mod tests {
 
         daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/p-feat", None, false);
         assert_eq!(agent_worktree(&daemon, "a1"), "root");
+    }
+
+    /// With `deleted_sessions_kept` above 0, deleting a live session keeps
+    /// its row archived and stamped with the delete's time — clients get
+    /// the row, not its removal — and an unarchive brings it back as an
+    /// ordinary session.
+    #[test]
+    fn deleting_a_live_session_keeps_it_restorable() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_agent(&daemon, "a1", "root", Some("sess-1"));
+        let id = AgentId("a1".into());
+        let mut rx = daemon.events.subscribe();
+        let before = nebula_core::clock::now_ms();
+
+        daemon.delete_agent_keeping(&id, 10, 10).unwrap();
+        let row = daemon
+            .store
+            .get_agent(&id)
+            .unwrap()
+            .expect("the row is kept");
+        assert!(row.archived);
+        assert!(
+            row.deleted_at >= before && row.deleted_at <= nebula_core::clock::now_ms(),
+            "stamped at the delete"
+        );
+        assert_eq!(row.session_id.as_deref(), Some("sess-1"));
+        match rx.try_recv().unwrap() {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } => assert_eq!(a.deleted_at, row.deleted_at),
+            other => panic!("expected the kept row, got {other:?}"),
+        }
+
+        daemon.unarchive_agent(&id).unwrap();
+        let row = daemon.store.get_agent(&id).unwrap().unwrap();
+        assert!(!row.archived);
+        assert_eq!(row.deleted_at, 0);
+        assert_eq!(row.session_id.as_deref(), Some("sess-1"));
+    }
+
+    /// A delete is final when the client did not promise a restore, and on
+    /// a row already archived (or deleted) — the `d` made in the ARCHIVED
+    /// VIEW. One it did promise is kept even when the daemon's setting has
+    /// gone to 0 since: the user was told `u` brings it back.
+    #[test]
+    fn deleting_an_archived_session_or_keeping_none_is_final() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_agent(&daemon, "a1", "root", None);
+        seed_agent(&daemon, "a2", "root", None);
+        seed_agent(&daemon, "a3", "root", None);
+        let (a1, a2, a3) = (
+            AgentId("a1".into()),
+            AgentId("a2".into()),
+            AgentId("a3".into()),
+        );
+
+        daemon.delete_agent_keeping(&a1, 0, 10).unwrap();
+        assert!(daemon.store.get_agent(&a1).unwrap().is_none());
+
+        daemon.store.set_agent_archived(&a2, true).unwrap();
+        daemon.delete_agent_keeping(&a2, 10, 10).unwrap();
+        assert!(daemon.store.get_agent(&a2).unwrap().is_none());
+
+        daemon.delete_agent_keeping(&a3, 10, 0).unwrap();
+        let row = daemon.store.get_agent(&a3).unwrap();
+        assert!(row.is_some_and(|a| a.deleted_at > 0), "promised, so kept");
+        daemon.delete_agent_keeping(&a3, 10, 10).unwrap();
+        assert!(daemon.store.get_agent(&a3).unwrap().is_none());
+    }
+
+    /// A delete past the setting purges its project's OLDEST deleted rows,
+    /// and nothing else: a plain archived row is never the purge's
+    /// business, and another project's deletes count against its own.
+    #[test]
+    fn deletes_past_the_setting_purge_the_projects_oldest() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p", "q"]);
+        seed_worktree(&daemon, "p", "wp", "/nebula-test/p", true);
+        seed_worktree(&daemon, "q", "wq", "/nebula-test/q", true);
+        for id in ["p1", "p2", "p3", "archived"] {
+            seed_agent(&daemon, id, "wp", None);
+        }
+        seed_agent(&daemon, "q1", "wq", None);
+        let id = |s: &str| AgentId(s.into());
+        let alive = |s: &str| daemon.store.get_agent(&id(s)).unwrap().is_some();
+        daemon
+            .store
+            .set_agent_archived(&id("archived"), true)
+            .unwrap();
+        // Inside one millisecond, as a bulk delete makes them: the order
+        // they were made in still decides which is the oldest.
+        daemon.delete_agent_keeping(&id("q1"), 2, 2).unwrap();
+        daemon.delete_agent_keeping(&id("p1"), 2, 2).unwrap();
+        daemon.delete_agent_keeping(&id("p2"), 2, 2).unwrap();
+        assert!(
+            alive("p1") && alive("p2") && alive("q1"),
+            "two in p: none over"
+        );
+
+        let mut rx = daemon.events.subscribe();
+        daemon.delete_agent_keeping(&id("p3"), 2, 2).unwrap();
+        assert!(!alive("p1"), "the third delete in p pushes out its oldest");
+        assert!(alive("p2") && alive("p3"));
+        assert!(alive("q1"), "q's delete counts against q alone");
+        assert!(alive("archived"), "archived by hand is not deleted");
+        let removed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                ServerEvent::EntityRemoved {
+                    id: EntityId::Agent(a),
+                } => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, [id("p1")]);
+
+        // Lowered to 1, the next delete — a final one, from the archived
+        // view — trims every project to it.
+        daemon.delete_agent_keeping(&id("archived"), 1, 1).unwrap();
+        assert!(!alive("archived"), "an archived card's delete is final");
+        assert!(!alive("p2") && alive("p3") && alive("q1"));
+
+        // Lowered to nothing, the boot trim empties every project.
+        daemon.trim_deleted_agents(0);
+        assert!(!alive("p3") && !alive("q1"));
+    }
+
+    /// A `u` that lands just after the purge took its row tells clients
+    /// the row is gone instead of failing and leaving them drawing it.
+    #[test]
+    fn unarchiving_a_purged_row_reports_it_gone() {
+        let daemon = test_daemon();
+        let id = AgentId("gone".into());
+        let mut rx = daemon.events.subscribe();
+
+        daemon.unarchive_agent(&id).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerEvent::EntityRemoved { id: EntityId::Agent(a) } if a == id
+        ));
     }
 
     /// The status broadcast carries the flag it persisted: a live turn

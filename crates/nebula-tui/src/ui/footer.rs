@@ -234,19 +234,31 @@ fn launcher_grid_footer_hint(app: &App, th: Theme) -> FooterHint {
             ]),
         };
     }
-    let text = if app.launcher.show_archived {
+    let text = if app.launcher.show_archived && app.launcher.show_deleted {
         format!(
-            "{move_keys}: move  {}: unarchive  {}: delete  {}: back to live sessions  {}: jump  {}: help  {}: quit",
+            "{move_keys}: move  {}: restore  {}: delete for good  {}: back to live sessions  {}: archived  {}: jump  {}: help  {}: quit",
+            k(Action::Unarchive),
+            k(Action::Delete),
+            k(Action::ToggleDeleted),
+            k(Action::ToggleArchived),
+            k(Action::Palette),
+            k(Action::Help),
+            k(Action::Quit),
+        )
+    } else if app.launcher.show_archived {
+        format!(
+            "{move_keys}: move  {}: unarchive  {}: delete  {}: back to live sessions  {}: recently deleted  {}: jump  {}: help  {}: quit",
             k(Action::Unarchive),
             k(Action::Delete),
             k(Action::ToggleArchived),
+            k(Action::ToggleDeleted),
             k(Action::Palette),
             k(Action::Help),
             k(Action::Quit),
         )
     } else {
         format!(
-            "{move_keys}: move  {}: open  {}: new session  {}{}: project tabs  {}: terminals  {}: archive  {}: archived  {}: diff  {}: jump  {}: settings  {}: help  {}: quit",
+            "{move_keys}: move  {}: open  {}: new session  {}{}: project tabs  {}: terminals  {}: archive  {}: archived  {}: deleted  {}: diff  {}: jump  {}: settings  {}: help  {}: quit",
             k(Action::Activate),
             k(Action::QuickPrompt),
             k(Action::PrevProjectTab),
@@ -254,6 +266,7 @@ fn launcher_grid_footer_hint(app: &App, th: Theme) -> FooterHint {
             k(Action::PaneTabs),
             k(Action::Archive),
             k(Action::ToggleArchived),
+            k(Action::ToggleDeleted),
             k(Action::GitDiff),
             k(Action::Palette),
             k(Action::Settings),

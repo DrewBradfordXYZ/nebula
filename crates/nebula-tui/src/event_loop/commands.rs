@@ -335,7 +335,7 @@ pub(crate) fn run_pending_action(
                 close_terminal(app, id, out);
             }
         }
-        PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
+        PendingAction::DeleteAgent(id) => delete_agent(app, id, true, out),
         PendingAction::MoveAgent { id, worktree } => launcher::move_agent(app, id, worktree, out),
         PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
         PendingAction::DeleteLink(id) => {
@@ -347,6 +347,10 @@ pub(crate) fn run_pending_action(
         } => {
             // The row's own delete drops its card; the worktree delete
             // then takes the emptied band and settles the cursor once.
+            // Its sessions are sent restorable even though the confirm
+            // promised nothing back: the worktree's delete takes them with
+            // it, and should that delete be refused, they wait in the
+            // RECENTLY DELETED VIEW rather than being gone for nothing.
             run_pending_action(app, *first, out);
             delete_worktree_and_settle(app, worktree, out);
         }
@@ -362,7 +366,7 @@ pub(crate) fn run_pending_action(
         }
         PendingAction::DeleteAllSessions { agents, terminals } => {
             for id in agents {
-                delete_agent(app, id, out);
+                delete_agent(app, id, true, out);
             }
             for id in terminals {
                 close_terminal(app, id, out);
@@ -402,10 +406,17 @@ pub(crate) fn run_pending_action(
     }
 }
 
-/// Delete an agent for good, detaching the pane first if it's showing it.
-pub(crate) fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+/// Delete an agent, detaching the pane first if it's showing it.
+/// `restorable` is whether its confirm promised a restore
+/// ([`optimistic::delete_agent`]).
+pub(crate) fn delete_agent(
+    app: &mut App,
+    id: AgentId,
+    restorable: bool,
+    out: &mut Vec<ClientRequest>,
+) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
-    optimistic::delete_agent(app, id, out);
+    optimistic::delete_agent(app, id, restorable, out);
 }
 
 /// Close a terminal tab, detaching the pane first if it's showing it.
@@ -459,8 +470,8 @@ pub(crate) fn live_cards_in(app: &App, id: &WorktreeId) -> usize {
 /// the card and then the checkout, `n` deletes the card alone, `Esc`
 /// keeps the card. Archived sessions still filed under the worktree are
 /// counted in the question, since the delete takes their history. With
-/// the **Delete emptied worktree** SETTING on and nothing archived left
-/// the question is skipped: the dialog stays two-way, says the worktree
+/// the **Delete emptied worktree** SETTING on, a live card's delete and
+/// nothing archived left, the question is skipped: the dialog stays two-way, says the worktree
 /// goes with the card, and `Enter` does both. With **Show all worktrees**
 /// on the question is never asked — the emptied checkout keeps its band
 /// on the grid, and `d` on that band is the way to delete it — but
@@ -486,13 +497,21 @@ pub(crate) fn with_worktree_offer(
     if app.launcher.show_all_worktrees && !force {
         return dialog;
     }
-    let archived = app
+    // Deleted sessions kept restorable are archived rows too, but
+    // not filed ones: they never make the question, only its fine print.
+    let (deleted, archived) = app
         .tree
         .agents
         .iter()
         .filter(|a| &a.worktree_id == worktree && a.archived)
-        .count();
-    let offered = !(force && archived == 0);
+        .partition::<Vec<_>, _>(|a| a.deleted_at > 0);
+    let (deleted, archived) = (deleted.len(), archived.len());
+    // The setting is about deleting the last LIVE card. The delete of a
+    // card already put away — an archived or recently deleted one being
+    // cleared out — always asks, as it did before deleted rows were left
+    // out of the count: forcing there would run `git worktree remove
+    // --force` on a checkout the user only meant to tidy a card out of.
+    let offered = !(force && archived == 0 && live_taken > 0);
     let branch = &w.branch;
     dialog.message.push('\n');
     dialog.message.push_str(&match (offered, archived) {
@@ -502,12 +521,47 @@ pub(crate) fn with_worktree_offer(
             "Nothing live is left in worktree '{branch}': delete it from disk too?\nIts {n} archived session(s) would go with it."
         ),
     });
+    if deleted > 0 {
+        dialog.message.push_str(&format!(
+            "\nIts {deleted} recently deleted session(s) go with it for good."
+        ));
+    }
     dialog.action = PendingAction::ThenDeleteWorktree {
         first: Box::new(dialog.action),
         worktree: worktree.clone(),
         offered,
     };
     dialog
+}
+
+/// [`with_worktree_offer`] for a delete that keeps its sessions
+/// restorable when `kept` (false when it keeps nothing), `build` wording the
+/// dialog with or without that. A worktree that goes for certain (DELETE
+/// EMPTIED WORKTREE) takes the sessions with it for good, so the dialog is
+/// worded as final; one that is offered says what its `y` costs.
+pub(crate) fn with_worktree_offer_keeping(
+    app: &App,
+    kept: bool,
+    build: impl Fn(bool) -> ConfirmDialog,
+    worktree: &WorktreeId,
+    live_taken: usize,
+) -> ConfirmDialog {
+    let mut dialog = with_worktree_offer(app, build(kept), worktree, live_taken);
+    if !kept {
+        return dialog;
+    }
+    match &dialog.action {
+        PendingAction::ThenDeleteWorktree { offered: false, .. } => {
+            with_worktree_offer(app, build(false), worktree, live_taken)
+        }
+        PendingAction::ThenDeleteWorktree { offered: true, .. } => {
+            dialog.message.push_str(
+                "\ny deletes the worktree too, and every session filed there with it, for good.",
+            );
+            dialog
+        }
+        _ => dialog,
+    }
 }
 
 /// The confirm before an agent is deleted, with the worktree question
@@ -519,8 +573,13 @@ pub(crate) fn confirm_delete_agent_in(app: &App, a: &nebula_core::Agent) -> Conf
     if let Some(band) = crate::launcher::nested_thread(app, &SessionRef::Agent(a.id.clone())) {
         return confirm_delete_thread(app, &band);
     }
-    let dialog = confirm_delete_agent(&a.name, a.id.clone());
-    with_worktree_offer(app, dialog, &a.worktree_id, usize::from(!a.archived))
+    with_worktree_offer_keeping(
+        app,
+        deleted_kept(app) && !a.archived,
+        |kept| confirm_delete_agent(&a.name, a.id.clone(), kept),
+        &a.worktree_id,
+        usize::from(!a.archived),
+    )
 }
 
 /// The confirm before a terminal is closed, with the worktree question
@@ -732,6 +791,7 @@ pub(crate) fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<C
             }
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
+        MenuAction::ToggleDeleted => toggle_deleted(app, out),
         MenuAction::ToggleOpenPrs => toggle_open_prs(app, out),
         MenuAction::ToggleIssues => toggle_issues(app, out),
         MenuAction::ToggleDraftPrs => toggle_hide_draft_prs(app, out),

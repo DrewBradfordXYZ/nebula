@@ -3116,6 +3116,9 @@ async fn archive_and_delete_kill_the_agent_process() {
     )
     .unwrap();
     make_executable(&script);
+    // Pinned rather than left to the default: the delete below is a kept
+    // one, then a final one from the recently deleted view.
+    env.write_config(r#"{"deleted_sessions_kept": 10}"#);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -3170,18 +3173,41 @@ async fn archive_and_delete_kill_the_agent_process() {
         &ClientRequest::DeleteAgent {
             req_id: 5,
             id: a2.clone(),
+            keep: 10,
+        },
+    )
+    .await
+    .unwrap();
+    // Deleted sessions are kept: the row stays, archived and stamped with
+    // its delete time, restorable from the RECENTLY DELETED VIEW.
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        find_ack(evs, 5).is_some()
+            && evs.iter().any(|e| {
+                matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                    if a.id == a2 && a.archived && a.deleted_at > 0 && !a.alive)
+            })
+    })
+    .await;
+    wait_pid_dead(pid2, EVENT_TIMEOUT, "deleted agent CLI").await;
+
+    // ---- deleting it again, from the recently deleted view, is final ----
+    write_frame(
+        &mut c,
+        &ClientRequest::DeleteAgent {
+            req_id: 6,
+            id: a2.clone(),
+            keep: 10,
         },
     )
     .await
     .unwrap();
     read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
-        find_ack(evs, 5).is_some()
+        find_ack(evs, 6).is_some()
             && evs
                 .iter()
                 .any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Agent(id) } if *id == a2))
     })
     .await;
-    wait_pid_dead(pid2, EVENT_TIMEOUT, "deleted agent CLI").await;
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);

@@ -114,18 +114,41 @@ pub(crate) fn confirm_delete_thread(app: &App, band: &crate::launcher::Band) -> 
         .filter(|&(n, _)| n > 0)
         .map(|(n, noun)| count_of(n, noun))
         .collect();
-    let dialog = ConfirmDialog {
-        title: format!("Delete thread · {}", count_of(names.len(), "row")),
-        message: format!(
-            "Delete '{}' and everything nested under it?\n{} go away, history and shells.\n{}",
-            names[0],
-            gone.join(" and "),
-            bulk_confirm_listing(&names),
-        ),
-        action: PendingAction::DeleteAllSessions { agents, terminals },
-        area: ratatui::layout::Rect::default(),
+    let live_agents = agents
+        .iter()
+        .filter(|id| app.tree.agents.iter().any(|a| &a.id == *id && !a.archived))
+        .count();
+    let build = |kept: bool| {
+        let gone_line = if kept {
+            format!(
+                "{} go away.\nSessions move to recently deleted (⇧U); u restores them.{}",
+                gone.join(" and "),
+                past_the_kept(app, &agents),
+            )
+        } else {
+            format!("{} go away, history and shells.", gone.join(" and "))
+        };
+        ConfirmDialog {
+            title: format!("Delete thread · {}", count_of(names.len(), "row")),
+            message: format!(
+                "Delete '{}' and everything nested under it?\n{gone_line}\n{}",
+                names[0],
+                bulk_confirm_listing(&names),
+            ),
+            action: PendingAction::DeleteAllSessions {
+                agents: agents.clone(),
+                terminals: terminals.clone(),
+            },
+            area: ratatui::layout::Rect::default(),
+        }
     };
-    with_worktree_offer(app, dialog, &band.worktree, band.cards.len())
+    with_worktree_offer_keeping(
+        app,
+        deleted_kept(app) && live_agents > 0,
+        build,
+        &band.worktree,
+        band.cards.len(),
+    )
 }
 
 /// The confirm before an agent is archived. The message says why saying
@@ -147,6 +170,12 @@ pub(crate) fn confirm_archive_agent(name: &str, id: AgentId) -> ConfirmDialog {
 /// here, so both ends land the cursor the same way.
 pub(crate) fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
     launcher::toggle_archived(app, out);
+}
+
+/// Show/hide the RECENTLY DELETED VIEW: `⇧U` and the card menu alike, as
+/// [`toggle_archived`] is for the archived one.
+pub(crate) fn toggle_deleted(app: &mut App, out: &mut Vec<ClientRequest>) {
+    launcher::toggle_deleted(app, out);
 }
 
 /// Fold/unfold the Worktrees panel's OPEN PRS group (header click, context
@@ -303,12 +332,59 @@ pub(crate) fn open_delete_confirm(app: &mut App) {
     }
 }
 
+/// Whether a live session's delete keeps it restorable in the RECENTLY
+/// DELETED VIEW: false when `deleted_sessions_kept` is 0 and a delete is final.
+pub(crate) fn deleted_kept(app: &App) -> bool {
+    app.launcher.deleted_kept > 0
+}
+
+/// A bulk delete's fine print when it takes more live sessions than the
+/// project keeps: the DAEMON trims after each one, so the batch pushes
+/// out its own first deletes, and the confirm must not promise them back.
+/// Cards already put away in the batch are final whatever the setting,
+/// and say so too, in the words of the list they were on. Empty when
+/// every session in the batch is kept.
+fn past_the_kept(app: &App, agents: &[AgentId]) -> String {
+    let (mut live, mut archived, mut deleted) = (0usize, 0usize, 0usize);
+    for a in app.tree.agents.iter().filter(|a| agents.contains(&a.id)) {
+        match (a.archived, a.deleted_at > 0) {
+            (false, _) => live += 1,
+            (true, false) => archived += 1,
+            (true, true) => deleted += 1,
+        }
+    }
+    let kept = app.launcher.deleted_kept as usize;
+    let mut note = match live.saturating_sub(kept) {
+        0 => String::new(),
+        1 => format!("\nOnly {kept} can be kept: the other one goes for good."),
+        over => format!("\nOnly {kept} can be kept: the other {over} go for good."),
+    };
+    for (n, words) in [
+        (archived, "already archived"),
+        (deleted, "recently deleted"),
+    ] {
+        match n {
+            0 => {}
+            1 => note.push_str(&format!("\nThe one {words} goes for good.")),
+            n => note.push_str(&format!("\nThe {n} {words} go for good.")),
+        }
+    }
+    note
+}
+
 /// The confirm before an agent is deleted — from the `d` key and the row
-/// menu alike, so the two never drift apart in wording.
-pub(crate) fn confirm_delete_agent(name: &str, id: AgentId) -> ConfirmDialog {
+/// menu alike, so the two never drift apart in wording. `kept` is whether
+/// the DAEMON keeps it restorable ([`deleted_kept`]); false for a delete
+/// that is final — the setting at 0, or an archived card.
+pub(crate) fn confirm_delete_agent(name: &str, id: AgentId, kept: bool) -> ConfirmDialog {
+    let message = if kept {
+        format!("Delete agent '{name}'?\nIt moves to recently deleted (⇧U); u restores it.")
+    } else {
+        format!("Delete agent '{name}'? Its session and history go away.")
+    };
     ConfirmDialog {
         title: "Delete agent".into(),
-        message: format!("Delete agent '{name}'? Its session and history go away."),
+        message,
         action: PendingAction::DeleteAgent(id),
         area: ratatui::layout::Rect::default(),
     }
@@ -473,19 +549,36 @@ pub(crate) fn open_delete_all_confirm(app: &mut App) {
                 .filter(|id| app.tree.agents.iter().any(|a| &a.id == *id && !a.archived))
                 .count()
                 + terminals.len();
-            let dialog = ConfirmDialog {
-                title: format!("Delete ALL {} session(s)", names.len()),
-                message: format!(
-                    "Delete these {} session(s)? Their history goes away.\n{}",
-                    names.len(),
-                    bulk_confirm_listing(&names),
-                ),
-                action: PendingAction::DeleteAllSessions { agents, terminals },
-                area: ratatui::layout::Rect::default(),
+            let build = |kept: bool| {
+                let fate = match (kept, terminals.is_empty()) {
+                    (true, true) => format!(
+                        "\nThey move to recently deleted (⇧U); u restores them.{}",
+                        past_the_kept(app, &agents)
+                    ),
+                    (true, false) => format!(
+                        "\nSessions move to recently deleted (⇧U), u restores them; terminals close.{}",
+                        past_the_kept(app, &agents)
+                    ),
+                    (false, _) => " Their history goes away.".to_string(),
+                };
+                ConfirmDialog {
+                    title: format!("Delete ALL {} session(s)", names.len()),
+                    message: format!(
+                        "Delete these {} session(s)?{fate}\n{}",
+                        names.len(),
+                        bulk_confirm_listing(&names),
+                    ),
+                    action: PendingAction::DeleteAllSessions {
+                        agents: agents.clone(),
+                        terminals: terminals.clone(),
+                    },
+                    area: ratatui::layout::Rect::default(),
+                }
             };
+            let kept = deleted_kept(app) && live_taken > terminals.len();
             let dialog = match app.selected_worktree().map(|w| w.id.clone()) {
-                Some(wt) => with_worktree_offer(app, dialog, &wt, live_taken),
-                None => dialog,
+                Some(wt) => with_worktree_offer_keeping(app, kept, build, &wt, live_taken),
+                None => build(kept),
             };
             app.modals.overlay = Some(Overlay::Confirm(dialog));
         }
@@ -533,8 +626,15 @@ pub(crate) fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
         ];
     }
     if a.archived {
+        // `u` on a deleted card restores it, in the RECENTLY DELETED VIEW's
+        // own word; it is the same unarchive underneath.
+        let unarchive = if a.deleted_at > 0 {
+            "Restore"
+        } else {
+            "Unarchive"
+        };
         vec![
-            MenuItem::new("Unarchive", MenuAction::UnarchiveAgent(a.id.clone())),
+            MenuItem::new(unarchive, MenuAction::UnarchiveAgent(a.id.clone())),
             MenuItem::new("Duplicate", MenuAction::DuplicateAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
         ]
@@ -934,6 +1034,7 @@ pub(crate) fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
                 vec![
                     MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
                     MenuItem::new("Show/hide archived", MenuAction::ToggleArchived),
+                    MenuItem::new("Show/hide recently deleted", MenuAction::ToggleDeleted),
                 ]
             })
             .unwrap_or_default(),

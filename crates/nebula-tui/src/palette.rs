@@ -408,6 +408,7 @@ mod tests {
             status,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen,
             kind: AgentKind::Claude,
             custom_harness: None,

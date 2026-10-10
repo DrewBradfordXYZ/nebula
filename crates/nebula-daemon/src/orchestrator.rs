@@ -325,6 +325,7 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             status_changed_at: 0,
             kind: AgentKind::Claude,

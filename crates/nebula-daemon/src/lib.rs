@@ -135,6 +135,10 @@ async fn serve(opts: DaemonOpts) -> Result<()> {
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
+    // A `deleted_sessions_kept` lowered while no daemon ran takes effect
+    // now rather than at the next delete. No client is connected yet, so
+    // there is nobody to tell.
+    daemon.trim_deleted_agents(config::Config::load().deleted_sessions_kept);
 
     if let Some(carry) = carry {
         let sessions = daemon.adopt_sessions(carry.sessions);

@@ -88,11 +88,16 @@ pub fn rows(app: &App) -> Vec<LauncherRow> {
     // two lists never mix — a grid of cards has no room for a group
     // header to fold, and an archived card answers to none of the keys a
     // live one does.
+    // The RECENTLY DELETED VIEW (`⇧U`) is the archived grid of the deleted
+    // sessions alone, and the archived view leaves them out: the two lists
+    // never mix either.
     let want_archived = app.launcher.show_archived;
+    let want_deleted = want_archived && app.launcher.show_deleted;
     let mut rows: Vec<LauncherRow> = app
         .tree
         .agents
         .iter()
+        .filter(|agent| !want_archived || (agent.deleted_at > 0) == want_deleted)
         .filter_map(|agent| row_of(app, agent, scope.as_ref(), Some(want_archived)))
         .collect();
     let now = crate::app::now_ms();
@@ -106,6 +111,11 @@ pub fn rows(app: &App) -> Vec<LauncherRow> {
     // `App::just_launched`.
     if let Some(id) = &app.requests.just_launched {
         rows.sort_by_key(|r| &r.agent.id != id);
+    }
+    // Deleted sessions by when they were deleted, newest first: the one
+    // deleted by mistake is the one being looked for.
+    if want_deleted {
+        rows.sort_by_key(|r| std::cmp::Reverse(r.agent.deleted_at));
     }
     rows
 }
@@ -2106,6 +2116,7 @@ mod tests {
             status: AgentStatus::Running,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
             custom_harness: None,

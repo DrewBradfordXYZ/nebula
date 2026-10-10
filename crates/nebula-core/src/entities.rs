@@ -275,6 +275,12 @@ pub struct Agent {
     /// the bottom. Empty for every row that predates the capture.
     #[serde(default)]
     pub recent_prompts: Vec<PromptEntry>,
+    /// When the row was deleted, epoch ms; 0 = not deleted. A deleted row
+    /// is archived too: it waits in the RECENTLY DELETED VIEW, restorable with
+    /// unarchive (which clears this), until more deletes in its project
+    /// than `deleted_sessions_kept` push it out, oldest first.
+    #[serde(default)]
+    pub deleted_at: i64,
 }
 
 impl Agent {

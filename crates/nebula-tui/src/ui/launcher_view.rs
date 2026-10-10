@@ -89,7 +89,12 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, body: Rect) {
         // task" would be advice about the wrong list, so the ARCHIVED
         // VIEW gets the plain empty line and the way back out of it.
         if app.launcher.show_archived {
-            draw_list_empty(f, app, g.area, NO_ARCHIVED);
+            let empty = if app.launcher.show_deleted {
+                NO_DELETED
+            } else {
+                NO_ARCHIVED
+            };
+            draw_list_empty(f, app, g.area, empty);
         } else {
             draw_empty(f, app, g.area);
         }
@@ -214,6 +219,7 @@ impl HeadCount {
 
 /// What the ARCHIVED VIEW says with nothing in it.
 const NO_ARCHIVED: &str = "nothing archived in this project — ⇧A back to the live sessions";
+const NO_DELETED: &str = "nothing recently deleted in this project — ⇧U back to the live sessions";
 
 /// The header over the grid: the PROJECT TABS on the left, each with its
 /// status dots, how many cards the grid holds on the right — and how many
@@ -748,10 +754,10 @@ fn head_count(
 /// none — under the ARCHIVED VIEW's own word there, so the header says
 /// which of the two lists is on screen without a second line to read.
 fn count_words(app: &App, count: HeadCount) -> String {
-    let noun = if app.launcher.show_archived {
-        "archived session"
-    } else {
-        "session"
+    let noun = match (app.launcher.show_archived, app.launcher.show_deleted) {
+        (true, true) => "recently deleted session",
+        (true, false) => "archived session",
+        (false, _) => "session",
     };
     let mut out = format!("{} {noun}{}", count.sessions, plural(count.sessions));
     if count.terminals > 0 {
@@ -2181,6 +2187,11 @@ fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
 /// so the name behind it starts in the same column on both grids.
 const ARCHIVED_MARK: &str = "▪ ";
 
+/// What stands for the STATUS DOT on a deleted card in the RECENTLY DELETED VIEW:
+/// a cross, against an archived card's square, so the two read apart
+/// with the colors off.
+const DELETED_MARK: &str = "✕ ";
+
 /// One session's card: its name and how long since it last moved, what
 /// it runs on, and the last thing it was asked to do. Where it runs —
 /// the checkout, its changes, its pull request — is on its BAND's rule,
@@ -2294,6 +2305,39 @@ fn draw_card(
             ];
         }
     }
+    // On the cursor's DELETED card, how to take the delete back, in the
+    // key the keymap has for it: the badge says when it was deleted, this
+    // says what to press. Left of the issue number when there is one, so
+    // that chip keeps the cell its click target is placed at.
+    if selected && a.archived && a.deleted_at > 0 {
+        let hint = format!(
+            "{} restores",
+            super::key_hint(app, crate::keymap::Action::Unarchive)
+        );
+        // The issue chip is the row's third span when it has one.
+        let chip = if second.len() == 3 {
+            second.pop()
+        } else {
+            None
+        };
+        let chip_w = chip.as_ref().map_or(0, |c| c.content.chars().count() + 1);
+        let hint_w = hint.chars().count();
+        if hint_w + chip_w < width {
+            let harness = truncate(&harness, width - hint_w - chip_w - 1);
+            let pad = width - harness.chars().count() - hint_w - chip_w;
+            second = vec![
+                Span::styled(harness, Style::default().fg(quiet_or(dim))),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(hint, Style::default().fg(th.accent)),
+            ];
+            if let Some(chip) = chip {
+                second.push(Span::raw(" "));
+                second.push(chip);
+            }
+        } else if let Some(chip) = chip {
+            second.push(chip);
+        }
+    }
 
     // The last thing it was asked to do, on the prompt's own `›` (which
     // `hide_card_marks` leaves off), over the card's last rows rather than
@@ -2398,6 +2442,30 @@ struct SessionLook {
     ago_style: Style,
 }
 
+/// A deleted card's badge: how long ago it was deleted, as an archived
+/// card's counts from the archiving. No word says `deleted`: the
+/// RECENTLY DELETED VIEW's header says it once, for all of them. A stamp
+/// ahead of this clock (the DAEMON's runs elsewhere, or moved) reads as
+/// `just now` rather than leaving the badge empty.
+fn deleted_badge(deleted_at: i64) -> String {
+    super::ago_badge(deleted_at.min(crate::app::now_ms()))
+}
+
+#[cfg(test)]
+mod deleted_badge_tests {
+    use super::deleted_badge;
+
+    #[test]
+    fn counts_up_from_the_delete() {
+        const HOUR: i64 = 3_600_000;
+        let now = crate::app::now_ms();
+        assert_eq!(deleted_badge(now), " just now");
+        assert_eq!(deleted_badge(now - 2 * HOUR), " 2h ago");
+        assert_eq!(deleted_badge(now - 3 * 24 * HOUR), " 3d ago");
+        assert_eq!(deleted_badge(now + HOUR), " just now");
+    }
+}
+
 /// `a`'s [`SessionLook`], on the cursor's entry when `selected`.
 ///
 /// An ARCHIVED session is the same session put away, and it is drawn as
@@ -2410,14 +2478,22 @@ struct SessionLook {
 /// whole grid's answer to "which of the two lists am I looking at" without
 /// a word repeated on every card - the header's `n archived sessions` says
 /// that once.
+///
+/// A DELETED session is an archived one on its way out, and says so on
+/// top: `DELETED_MARK` for the square, its name struck through, and the
+/// badge counting from the delete rather than from the archive. It is
+/// drawn only in the RECENTLY DELETED VIEW, whose header names the list.
 fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) -> SessionLook {
     let pending = app.is_placeholder_agent(&a.id);
     let cold = !a.alive && a.cloud_session_id.is_none();
     let archived = a.archived;
+    let deleted = archived && a.deleted_at > 0;
     let quiet = if selected { th.muted } else { th.dim };
     // The dot and the sweep read the session's status, cold and pending
     // alike.
-    let dot = if archived {
+    let dot = if deleted {
+        Span::styled(DELETED_MARK, Style::default().fg(quiet))
+    } else if archived {
         Span::styled(ARCHIVED_MARK, Style::default().fg(quiet))
     } else if pending {
         status_dot(None, false, th)
@@ -2444,7 +2520,11 @@ fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) ->
     // step above the quiet the rest of the card is in — muted over dim,
     // and text over muted on the card the cursor is on, the same one-step
     // lift `quiet` takes there.
-    let name_style = if archived {
+    let name_style = if deleted {
+        Style::default()
+            .fg(if selected { th.text } else { th.muted })
+            .add_modifier(Modifier::CROSSED_OUT)
+    } else if archived {
         Style::default().fg(if selected { th.text } else { th.muted })
     } else {
         Style::default().fg(th.text).add_modifier(Modifier::BOLD)
@@ -2453,7 +2533,9 @@ fn session_look(app: &App, a: &nebula_core::Agent, selected: bool, th: Theme) ->
     // turn last moved: the status behind it stopped being news the moment
     // it was put away. A row archived before the stamp existed carries 0
     // and simply has no badge.
-    let ago = if archived {
+    let ago = if deleted {
+        deleted_badge(a.deleted_at)
+    } else if archived {
         ago_badge(a.archived_at)
     } else if pending {
         PENDING_SESSION_BADGE.to_string()
@@ -3824,6 +3906,7 @@ mod tests {
                 status: AgentStatus::Finished,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -5042,6 +5125,7 @@ mod tests {
                     status: AgentStatus::Finished,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -5278,6 +5362,7 @@ mod tests {
             status: AgentStatus::Finished,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
             custom_harness: None,
@@ -5387,6 +5472,7 @@ mod tests {
                 status: AgentStatus::Finished,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -5443,6 +5529,7 @@ mod tests {
                 status: AgentStatus::Running,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -5594,6 +5681,7 @@ mod tests {
                     // Filed two hours ago, last turn a minute ago: the two
                     // badges cannot be mistaken for one another.
                     archived_at: crate::app::now_ms() - 2 * 3_600_000,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -5690,5 +5778,65 @@ mod tests {
         assert_eq!(colored(&live, 2, th.dim), "claude");
         assert_eq!(colored(&gone, 2, th.dim), "claude");
         assert_eq!(colored(&live, 2, th.root), "");
+    }
+
+    /// The cursor's DELETED card says how to take the delete back, in the
+    /// key the keymap has for it, on the row saying what it runs on; the
+    /// deleted cards around it stay quiet.
+    #[test]
+    fn the_selected_deleted_card_says_how_to_restore_it() {
+        use nebula_core::{Agent, AgentId, AgentKind, AgentStatus, WorktreeId};
+
+        let row = LauncherRow {
+            agent: Agent {
+                id: AgentId("a1".into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: "fix login".into(),
+                status: AgentStatus::Finished,
+                archived: true,
+                archived_at: crate::app::now_ms(),
+                deleted_at: crate::app::now_ms(),
+                unseen: false,
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: crate::app::now_ms(),
+                alive: false,
+                issue_url: None,
+                role: nebula_core::AgentRole::Worker,
+                recent_prompts: Vec::new(),
+            },
+            project: "nebula".into(),
+            branch: "main".into(),
+            pr: None,
+        };
+        let th = Theme::default();
+        let app = App::new();
+        let area = Rect::new(0, 0, 44, crate::launcher::CARD_H);
+        let harness_row = |selected: bool| -> String {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .unwrap();
+            terminal
+                .draw(|f| draw_one(f, &app, area, &row, selected, true, th))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..area.width)
+                .filter_map(|x| buf.cell((x, 2)))
+                .map(|c| c.symbol().to_string())
+                .collect::<String>()
+        };
+        let on = harness_row(true);
+        let want = format!(
+            "{} restores",
+            crate::ui::key_hint(&app, crate::keymap::Action::Unarchive)
+        );
+        assert!(on.contains("claude") && on.contains(&want), "{on:?}");
+        let off = harness_row(false);
+        assert!(!off.contains("restores"), "{off:?}");
     }
 }

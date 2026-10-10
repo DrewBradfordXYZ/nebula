@@ -697,7 +697,12 @@ impl Daemon {
             if entries.iter().any(|e| e.path == w.path) {
                 continue;
             }
-            let occupied = agents.iter().any(|a| a.worktree_id == w.id)
+            // A deleted session waiting for its purge holds nothing: its
+            // checkout is gone, so there is nowhere left to restore it to,
+            // and the row goes with the worktree's.
+            let occupied = agents
+                .iter()
+                .any(|a| a.worktree_id == w.id && a.deleted_at == 0)
                 || terminals.iter().any(|t| t.worktree_id == w.id);
             if occupied {
                 continue;

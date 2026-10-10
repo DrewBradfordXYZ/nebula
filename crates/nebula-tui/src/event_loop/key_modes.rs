@@ -309,6 +309,7 @@ fn handle_global_action(
         | Action::Archive
         | Action::Unarchive
         | Action::ToggleArchived
+        | Action::ToggleDeleted
         | Action::Palette
         | Action::NextAttention
         | Action::PrevAttention
@@ -584,6 +585,11 @@ fn handle_session_state_action(
         Action::ToggleArchived => {
             if app.nav.focus == Focus::Sessions {
                 toggle_archived(app, out);
+            }
+        }
+        Action::ToggleDeleted => {
+            if app.nav.focus == Focus::Sessions {
+                toggle_deleted(app, out);
             }
         }
         // Fuzzy-search palette over every project / worktree / session.

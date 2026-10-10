@@ -332,6 +332,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'worker';
     ",
+    // 30: when an agent was deleted; 0 = not deleted. A deleted row stays
+    // archived and restorable until its project's newer deletes push it
+    // out (`deleted_sessions_kept`).
+    "
+    ALTER TABLE agents ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 pub struct Store {
@@ -534,8 +540,8 @@ impl Store {
         issue_url: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness, role)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness, role, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -557,6 +563,7 @@ impl Store {
                 issue_url,
                 a.custom_harness,
                 a.role.as_str(),
+                a.deleted_at,
             ],
         )?;
         Ok(())
@@ -709,9 +716,11 @@ impl Store {
         // order the ARCHIVED group newest-first.
         let archived_at = if archived { now_ms() } else { 0 };
         // An archived row is out of sight by definition: nothing left to
-        // go and read, so its unseen-finish flag goes with it.
+        // go and read, so its unseen-finish flag goes with it. Either way
+        // the row is no longer a deleted one: archiving a row by hand
+        // files it for keeps, and unarchiving restores it.
         self.conn.lock().execute(
-            "UPDATE agents SET archived = ?2, archived_at = ?3,
+            "UPDATE agents SET archived = ?2, archived_at = ?3, deleted_at = 0,
                     unseen = CASE WHEN ?2 THEN 0 ELSE unseen END
              WHERE id = ?1",
             params![id.as_str(), archived as i64, archived_at],
@@ -795,6 +804,46 @@ impl Store {
 
     pub fn delete_agent(&self, id: &AgentId) -> Result<()> {
         self.delete_by_id("agents", id.as_str())
+    }
+
+    /// Delete `id` restorably: the row is archived and stamped with the
+    /// time of the delete, so it waits in the RECENTLY DELETED VIEW until
+    /// [`Store::trim_deleted_agents`] pushes it out. The stamp is kept
+    /// strictly after every earlier delete's, so a bulk delete made inside
+    /// one millisecond still trims in the order it was made. Its unseen
+    /// flag goes as on any archive.
+    pub fn set_agent_deleted(&self, id: &AgentId) -> Result<()> {
+        let now = now_ms();
+        self.conn.lock().execute(
+            "UPDATE agents SET archived = 1, archived_at = ?2, unseen = 0,
+                    deleted_at = MAX(?2, (SELECT COALESCE(MAX(deleted_at), 0) + 1 FROM agents))
+             WHERE id = ?1",
+            params![id.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Remove every deleted row but each project's `keep` newest, and
+    /// return their ids so the caller can tell clients they are gone.
+    /// `keep` 0 removes them all.
+    pub fn trim_deleted_agents(&self, keep: u32) -> Result<Vec<AgentId>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "DELETE FROM agents WHERE id IN (
+               SELECT id FROM (
+                 SELECT a.id, ROW_NUMBER() OVER (
+                   PARTITION BY w.project_id
+                   ORDER BY a.deleted_at DESC
+                 ) AS n
+                 FROM agents a JOIN worktrees w ON w.id = a.worktree_id
+                 WHERE a.deleted_at > 0
+               ) WHERE n > ?1
+             ) RETURNING id",
+        )?;
+        let ids = stmt
+            .query_map(params![keep], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids.into_iter().map(AgentId).collect())
     }
 
     /// Boot sweep: agents whose PTYs died with the previous daemon. Those in
@@ -1081,7 +1130,7 @@ const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_orde
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
                              archived_at, unseen, cloud_session_id, recent_prompts, custom_harness, \
-                             issue_url, role";
+                             issue_url, role, deleted_at";
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order, run_command";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
@@ -1121,6 +1170,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         model: r.get(9)?,
         effort: r.get(10)?,
         archived_at: r.get(11)?,
+        deleted_at: r.get(18)?,
         unseen: r.get::<_, i64>(12)? != 0,
         cloud_session_id: r.get(13)?,
         alive: false,
@@ -1217,6 +1267,7 @@ mod tests {
             status: AgentStatus::Running,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
             custom_harness: None,
@@ -1242,6 +1293,7 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Codex,
             custom_harness: None,
@@ -1264,6 +1316,7 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Cursor,
             custom_harness: None,
@@ -1287,6 +1340,7 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
             custom_harness: None,
@@ -1330,6 +1384,7 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Custom,
             custom_harness: Some("agy".into()),
@@ -1836,6 +1891,7 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
+            deleted_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
             custom_harness: None,
@@ -1925,6 +1981,7 @@ mod tests {
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -2055,6 +2112,7 @@ mod tests {
                     status,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -2120,6 +2178,7 @@ mod tests {
                     status: AgentStatus::Running,
                     archived: false,
                     archived_at: 0,
+                    deleted_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
                     custom_harness: None,
@@ -2182,6 +2241,7 @@ mod tests {
                 status,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,
@@ -2283,6 +2343,7 @@ mod tests {
                 status: AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
+                deleted_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
                 custom_harness: None,

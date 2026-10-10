@@ -160,6 +160,9 @@ pub(super) fn set_archived(
         Some(before) if before.archived != archived => {
             let mut after = before.clone();
             after.archived = archived;
+            // Either way it is no longer a deleted row: an unarchive
+            // restores it, as the DAEMON's store does.
+            after.deleted_at = 0;
             if archived {
                 after.alive = false;
                 after.archived_at = crate::app::now_ms();
@@ -176,12 +179,45 @@ pub(super) fn set_archived(
     }
 }
 
-pub(super) fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+/// Delete an agent. With `restorable` (a delete whose confirm promised a
+/// restore) a live one, while `deleted_sessions_kept` is above 0, is kept
+/// by the DAEMON, archived and stamped with the delete's time, so here it
+/// turns into that card on the spot rather than leaving the tree; an
+/// archived one, or any other delete, goes for good. The oldest deleted
+/// card it pushes out of the project is the daemon's to remove, and it
+/// says so.
+pub(super) fn delete_agent(
+    app: &mut App,
+    id: AgentId,
+    restorable: bool,
+    out: &mut Vec<ClientRequest>,
+) {
+    // The request carries the promise, and the count the confirm was
+    // worded from, for the DAEMON to keep whatever its own copy of the
+    // setting says.
+    let live = app.tree.agents.iter().any(|a| a.id == id && !a.archived);
+    let keep = if restorable && live {
+        app.launcher.deleted_kept
+    } else {
+        0
+    };
     let make = |req_id| ClientRequest::DeleteAgent {
         req_id,
         id: id.clone(),
+        keep,
     };
     match app.tree.agents.iter().position(|a| a.id == id) {
+        Some(index) if keep > 0 => {
+            let before = app.tree.agents[index].clone();
+            let mut after = before.clone();
+            let now = crate::app::now_ms();
+            after.archived = true;
+            after.alive = false;
+            after.unseen = false;
+            after.archived_at = now;
+            after.deleted_at = now;
+            upsert(app, Entity::Agent(before), Entity::Agent(after), out, make);
+        }
         Some(index) => {
             let row = Entity::Agent(app.tree.agents[index].clone());
             remove(app, EntityId::Agent(id.clone()), index, row, out, make);
@@ -337,7 +373,7 @@ mod tests {
         let straggler = Entity::Agent(app.tree.agents[0].clone());
         let mut out = Vec::new();
 
-        delete_agent(&mut app, AgentId("a1".into()), &mut out);
+        delete_agent(&mut app, AgentId("a1".into()), true, &mut out);
         assert!(agent_name(&app, "a1").is_none(), "gone before any answer");
 
         hse(
@@ -361,6 +397,58 @@ mod tests {
         assert!(app.requests.deleting.is_empty(), "the Ack ends the wait");
     }
 
+    /// With deleted sessions kept, a live session's delete turns its card into a
+    /// deleted one on the keypress — archived, stamped, not alive — and the
+    /// DAEMON's upsert of that row is shown, not held back as a straggler.
+    /// A refusal puts the live card back; `u` restores it.
+    #[test]
+    fn a_kept_delete_turns_the_card_deleted_at_once() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.launcher.deleted_kept = 10;
+        let mut out = Vec::new();
+
+        delete_agent(&mut app, AgentId("a1".into()), true, &mut out);
+        let a = &app.tree.agents[0];
+        assert!(a.archived && a.deleted_at > 0 && !a.alive);
+        assert!(
+            app.requests.deleting.is_empty(),
+            "nothing waits on a removal"
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::DeleteAgent { .. }]
+        ));
+
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id_of(&out)),
+                message: "database is locked".into(),
+            },
+        );
+        assert!(!app.tree.agents[0].archived && app.tree.agents[0].deleted_at == 0);
+
+        delete_agent(&mut app, AgentId("a1".into()), true, &mut out);
+        set_archived(&mut app, AgentId("a1".into()), false, &mut out);
+        let a = &app.tree.agents[0];
+        assert!(!a.archived && a.deleted_at == 0, "u restores it");
+    }
+
+    /// An archived card's delete is final even with deleted sessions kept: the row
+    /// leaves the tree, as every delete used to.
+    #[test]
+    fn deleting_an_archived_card_removes_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.launcher.deleted_kept = 10;
+        app.tree.agents[0].archived = true;
+        let mut out = Vec::new();
+
+        delete_agent(&mut app, AgentId("a1".into()), true, &mut out);
+        assert!(agent_name(&app, "a1").is_none());
+    }
+
     /// A delete the DAEMON refuses puts the row back where it was.
     #[test]
     fn a_refused_delete_puts_the_row_back_in_its_place() {
@@ -375,7 +463,7 @@ mod tests {
         let before = order(&app);
         let mut out = Vec::new();
 
-        delete_agent(&mut app, AgentId("a1".into()), &mut out);
+        delete_agent(&mut app, AgentId("a1".into()), true, &mut out);
         assert_eq!(order(&app), vec!["a2".to_string()]);
 
         hse(

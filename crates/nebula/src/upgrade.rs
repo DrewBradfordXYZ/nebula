@@ -421,7 +421,11 @@ mod tests {
             MIN_COMPATIBLE_PROTOCOL,
             PROTOCOL_VERSION
         )));
-        assert!(protocol_range_is_compatible((49, 50)));
+        // A peer whose range only reaches our oldest version still talks.
+        assert!(protocol_range_is_compatible((
+            MIN_COMPATIBLE_PROTOCOL - 1,
+            MIN_COMPATIBLE_PROTOCOL
+        )));
         assert!(!protocol_range_is_compatible((
             PROTOCOL_VERSION + 1,
             PROTOCOL_VERSION + 1

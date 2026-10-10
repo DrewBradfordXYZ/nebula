@@ -413,8 +413,16 @@ use crate::keymap::Action::*;
 enum HelpKeys {
     Lit(&'static str),
     Act(&'static [crate::keymap::Action]),
+    /// Each action's first chord only, an action group's chords joined by
+    /// a space and the groups by ` / ` — for a row that walks a whole
+    /// flow (open a view, send a session there, bring it back) in one
+    /// line, where every alias would not fit.
+    First(&'static [&'static [crate::keymap::Action]]),
+    /// An action's chords after its first: the aliases a [`First`] row
+    /// leaves out, said once for every place the action works.
+    Rest(crate::keymap::Action),
 }
-use HelpKeys::{Act, Lit};
+use HelpKeys::{Act, First, Lit, Rest};
 type HelpSection = (&'static str, &'static [(HelpKeys, &'static str)]);
 const HELP_LEFT: &[HelpSection] = &[
     (
@@ -487,11 +495,17 @@ const HELP_RIGHT: &[HelpSection] = &[
             ),
             (Act(&[FollowUp]), "follow-up prompt to the agent"),
             (Act(&[Rename]), "rename the session"),
+            // One line per place a session can go: the view, the key
+            // that sends it there, and `u`, which brings it back from
+            // either.
             (
-                Act(&[Archive, Unarchive, ToggleArchived]),
-                "archive / unarchive / show",
+                First(&[&[ToggleArchived], &[Archive], &[Unarchive]]),
+                "archived / archive / restore",
             ),
-            (Act(&[Delete, DeleteAll]), "delete one / delete all"),
+            (
+                First(&[&[ToggleDeleted], &[Delete, DeleteAll], &[Unarchive]]),
+                "deleted / delete / restore",
+            ),
         ],
     ),
     (
@@ -517,6 +531,9 @@ const HELP_RIGHT: &[HelpSection] = &[
             // The SHIFT PAIRS' rule (#93), once, for every
             // letter above that has a shifted twin.
             (Lit("⇧ + letter"), "bigger, or outside nebula"),
+            // Delete's aliases, once, for every row above that names
+            // only its first key.
+            (Rest(Delete), "delete too, everywhere"),
             (Act(&[Hosts]), "ssh hosts (a: new, d: del)"),
             (Act(&[Settings]), "settings; Hotkeys tab rebinds"),
             (Act(&[Metrics]), "memory: nebula + agents"),
@@ -545,6 +562,31 @@ fn draw_help_overlay(f: &mut Frame, app: &mut App, _: crate::app::HelpView) {
     let keys_of = |k: &HelpKeys| -> String {
         match k {
             Lit(s) => (*s).to_string(),
+            First(groups) => groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(|a| {
+                            app.chrome.keymap.shown_first(*a).map_or_else(
+                                || crate::keymap::UNBOUND.to_string(),
+                                |c| c.display().to_string(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join(" / "),
+            Rest(action) => app
+                .chrome
+                .keymap
+                .shown_chords(*action)
+                .iter()
+                .skip(1)
+                .map(|c| c.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
             Act(actions) => {
                 let full = actions
                     .iter()
@@ -2523,5 +2565,37 @@ fn draw_tree_overlay(f: &mut Frame, app: &mut App, mut view: crate::tree_browser
         v.preview_area = preview_inner;
         v.area = area;
         v.files_width = files_w;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The SESSIONS column names the RECENTLY DELETED VIEW's key beside
+    /// delete, in the keymap's own chord, so a delete's way back is on the
+    /// same screen as the delete.
+    #[test]
+    fn the_help_names_the_recently_deleted_view() {
+        let mut app = crate::app::App::new();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).unwrap();
+        terminal
+            .draw(|f| super::draw_help_overlay(f, &mut app, Default::default()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|c| c.symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(text.contains("⇧A / a / u"), "{text}");
+        assert!(text.contains("archived / archive / restore"), "{text}");
+        assert!(text.contains("⇧U / d ⇧D / u"), "{text}");
+        assert!(text.contains("deleted / delete / restore"), "{text}");
+        assert!(text.contains("Del ⌫"), "{text}");
+        assert!(text.contains("delete too, everywhere"), "{text}");
     }
 }

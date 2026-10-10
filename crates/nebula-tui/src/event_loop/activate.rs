@@ -252,6 +252,9 @@ pub(super) fn no_follow_up(app: &App, row: &SessionRow) -> Option<String> {
         return None;
     }
     Some(match row {
+        SessionRow::Agent(a) if a.deleted_at > 0 => {
+            "deleted sessions take no follow-up — u restores it".into()
+        }
         SessionRow::Agent(a) if a.archived => {
             "archived sessions take no follow-up — u brings it back".into()
         }

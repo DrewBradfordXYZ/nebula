@@ -23,6 +23,11 @@ use std::path::{Path, PathBuf};
 /// is reaped).
 pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1h"];
 
+/// Values the settings overlay cycles through for `deleted_sessions_kept`
+/// (daemon-owned: how many deleted sessions each project keeps restorable
+/// in the RECENTLY DELETED VIEW before the oldest is purged).
+pub const DELETED_SESSIONS_KEPT: &[&str] = &["off", "5", "10", "20", "50"];
+
 /// Editor commands the settings overlay cycles through. Every entry
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
 /// models, hand-edited configs can name any command the list doesn't.
@@ -393,6 +398,7 @@ pub enum SettingKind {
     CloseFinderOnOpen,
     SshSyncConfig,
     SessionIdleTimeout,
+    DeletedSessionsKept,
     PrewarmAgents,
     PrewarmSessions,
     DoneSound,
@@ -518,6 +524,7 @@ impl SettingKind {
             SettingKind::AskBeforeArchive => (2026, 10, 3),
             SettingKind::ConfirmDragMove => (2026, 10, 2),
             SettingKind::SourceControlGraph | SettingKind::InlineGraphics => (2026, 10, 9),
+            SettingKind::DeletedSessionsKept => (2026, 10, 9),
         }
     }
 
@@ -600,6 +607,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (busy ones spared; off disables)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::DeletedSessionsKept,
+                label: "Keep deleted sessions",
+                hint: "How many deleted sessions each project keeps in recently deleted (⇧U), u to restore (off deletes at once)",
                 group: "",
             },
             SettingSpec {
@@ -1024,6 +1037,12 @@ pub struct Config {
     /// disables. Owned by the daemon (which does the parsing and reaping);
     /// the TUI writes it so the settings overlay can cycle it.
     pub session_idle_timeout: String,
+    /// How many deleted sessions each project keeps restorable in the
+    /// RECENTLY DELETED VIEW: 5, 10, 20, 50 in the overlay, any number by hand; 0
+    /// deletes at once. Owned by the daemon (which purges the oldest past
+    /// it); the TUI writes it so the settings overlay can cycle it, and
+    /// reads it to word the delete confirm.
+    pub deleted_sessions_kept: u32,
     /// PREWARM POOL: keep one booted agent CLI standing by in the selected
     /// worktree, so creating a session there adopts it instead of waiting
     /// on a cold start. Owned by the daemon (which spawns, adopts and reaps
@@ -1491,6 +1510,7 @@ impl Default for Config {
             close_finder_on_open: true,
             ssh_sync_config: true,
             session_idle_timeout: nebula_core::settings::DEFAULT_SESSION_IDLE_TIMEOUT.into(),
+            deleted_sessions_kept: nebula_core::settings::DEFAULT_DELETED_SESSIONS_KEPT,
             prewarm_agents: true,
             prewarm_sessions: true,
             done_sound: "Glass".into(),
@@ -2344,6 +2364,10 @@ impl Config {
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SshSyncConfig => on_off(self.ssh_sync_config).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
+            SettingKind::DeletedSessionsKept => match self.deleted_sessions_kept {
+                0 => "off".into(),
+                n => n.to_string(),
+            },
             SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
             SettingKind::DoneSound => self.done_sound.clone(),
@@ -2423,6 +2447,12 @@ impl Config {
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
+            }
+            SettingKind::DeletedSessionsKept => {
+                let shown = self.value_label(SettingKind::DeletedSessionsKept);
+                self.deleted_sessions_kept = cycle_choice(&shown, DELETED_SESSIONS_KEPT, step)
+                    .parse()
+                    .unwrap_or(0);
             }
             SettingKind::PrewarmAgents => {
                 self.prewarm_agents = !self.prewarm_agents;
