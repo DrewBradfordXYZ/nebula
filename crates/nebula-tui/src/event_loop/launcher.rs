@@ -12683,6 +12683,81 @@ mod tests {
         });
     }
 
+    /// A move into a Claude Code subagent's checkout waits for a yes:
+    /// Claude Code removes that checkout when the subagent finishes. `n`
+    /// sends nothing and leaves no request waiting on an answer; `y` sends
+    /// the move as it was built.
+    #[test]
+    fn a_move_into_a_subagent_checkout_asks_first() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w3".into()),
+                        project_id: ProjectId("p1".into()),
+                        path: "/tmp/demo/.claude/worktrees/agent-a5894d42027c65fda".into(),
+                        branch: "worktree-agent-a5894d42027c65fda".into(),
+                        is_main: false,
+                        sort_order: 2,
+                    }),
+                },
+            );
+            draw_at(&mut app, 130, 50);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            draw_at(&mut app, 130, 50);
+            let (x, y) = row_cell(&app, 0);
+            click_at(&mut app, x, y);
+            assert_eq!(app.selected_session().unwrap().id.0, "a2");
+            let pick = |app: &mut App| {
+                key(app, KeyCode::Char('m'), KeyModifiers::NONE);
+                for c in "worktree-agent".chars() {
+                    key(app, KeyCode::Char(c), KeyModifiers::NONE);
+                }
+                key(app, KeyCode::Enter, KeyModifiers::NONE)
+            };
+
+            let waiting = app.requests.pending.len();
+            let out = pick(&mut app);
+            assert_eq!(sent_move(&out), None, "held, not sent");
+            let Some(Overlay::Confirm(dialog)) = &app.modals.overlay else {
+                panic!("the move asks first");
+            };
+            assert_eq!(dialog.title, "Subagent checkout");
+            assert!(
+                dialog
+                    .message
+                    .contains("Claude Code subagent's checkout (agent-a5894d42027c65fda)"),
+                "{}",
+                dialog.message
+            );
+            let out = key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), None);
+            assert!(app.modals.overlay.is_none());
+            assert_eq!(app.requests.pending.len(), waiting, "nothing left waiting");
+            assert_eq!(
+                app.chrome.flash.as_deref(),
+                Some(
+                    "not moved: worktree-agent-a5894d42027c65fda is a Claude Code \
+                     subagent's checkout"
+                )
+            );
+
+            pick(&mut app);
+            let out = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert_eq!(sent_move(&out), Some(("a2".into(), "w3".into())));
+            assert!(app.modals.overlay.is_none());
+            assert!(app.requests.subagent_hold.is_none());
+
+            // An ordinary checkout is not asked about.
+            key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(sent_move(&out).is_some(), "sent at once");
+            assert!(app.modals.overlay.is_none());
+        });
+    }
+
     /// A card dragged onto another project's tab lights the tab and, let
     /// go there and confirmed, moves its session into that project's root;
     /// the daemon's upsert takes the grid into that project with it.

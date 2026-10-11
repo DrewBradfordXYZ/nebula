@@ -658,6 +658,9 @@ pub(crate) const CLOUD_LABEL: &str = " · cloud";
 /// Destructive action waiting behind a confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
+    /// The SUBAGENT HOLD's yes: send the start or move it held
+    /// (`RequestState::subagent_hold`).
+    SendSubagentHold,
     /// A project's stored `repo_path` is gone from disk. Answering yes
     /// opens the path-completing prompt that sends `SetProjectPath`.
     LocateProjectPath {
@@ -4048,6 +4051,12 @@ pub struct RequestState {
     /// (`event_loop::optimistic`): an upsert of one of them is a straggler
     /// from before the delete, and is ignored rather than shown.
     pub deleting: std::collections::HashSet<nebula_core::EntityId>,
+    /// A start or move aimed at a Claude Code SUBAGENT CHECKOUT, held
+    /// while its confirm is up (`event_loop::subagent_hold`).
+    pub subagent_hold: Option<nebula_core::protocol::ClientRequest>,
+    /// The `req_id` a yes on that confirm just let through, so the same
+    /// event's check does not hold it a second time.
+    pub subagent_allowed: Option<u64>,
 }
 
 impl Default for RequestState {
@@ -4064,6 +4073,8 @@ impl Default for RequestState {
             pending_prewarm: None,
             next_keepwarm: None,
             deleting: std::collections::HashSet::new(),
+            subagent_hold: None,
+            subagent_allowed: None,
         }
     }
 }

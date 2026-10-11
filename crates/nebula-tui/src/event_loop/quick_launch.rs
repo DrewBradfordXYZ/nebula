@@ -279,7 +279,7 @@ mod tests {
     //! on the cards.
     use super::super::tests::{buffer_text, hse, seed_tree, with_config_json, with_default_config};
     use super::super::{handle_server_event, handle_terminal_event};
-    use crate::app::{App, Focus};
+    use crate::app::{App, Focus, Overlay};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use nebula_core::{
         Agent, AgentId, AgentKind, AgentStatus, ClientRequest, Entity, EntityId, Project,
@@ -377,6 +377,65 @@ mod tests {
 
     fn new_session() -> Option<SessionRef> {
         Some(SessionRef::Agent(AgentId("a9".into())))
+    }
+
+    /// A quick prompt aimed at a Claude Code subagent's checkout asks
+    /// first, and backing out of the question loses nothing: the box
+    /// comes back with its task, and no stand-in card is left on the grid.
+    /// A yes then sends the launch. (The seeded checkout is given the
+    /// subagent's path and branch in place: what is under test is the
+    /// hold on the request, not how the checkout got there.)
+    #[test]
+    fn a_launch_into_a_subagent_checkout_asks_first_and_keeps_the_task() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w1".into()),
+                        project_id: ProjectId("p1".into()),
+                        path: "/tmp/demo/.claude/worktrees/agent-a5894d42027c65fda".into(),
+                        branch: "worktree-agent-a5894d42027c65fda".into(),
+                        is_main: true,
+                        sort_order: 0,
+                    }),
+                },
+            );
+            draw(&mut app);
+            let agents = app.tree.agents.len();
+
+            key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            type_text(&mut app, "tidy the nav");
+            let out = key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::CreateAgent { .. })),
+                "held: {out:?}"
+            );
+            assert!(
+                matches!(&app.modals.overlay, Some(Overlay::Confirm(c)) if c.title == "Subagent checkout"),
+                "the launch asks first"
+            );
+
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+                panic!("the box comes back");
+            };
+            assert_eq!(prompt.input.as_str(), "tidy the nav");
+            assert_eq!(app.tree.agents.len(), agents, "no stand-in left behind");
+
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let out = key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::CreateAgent { worktree, .. } if worktree.0 == "w1"
+                )),
+                "the yes sends it: {out:?}"
+            );
+        });
     }
 
     /// Enter shows what it started: a pane folded away with `^~` unfolds,

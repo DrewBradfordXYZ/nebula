@@ -113,6 +113,7 @@ pub(crate) fn draw_frame<B: ratatui::backend::Backend>(
 pub(crate) fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
     let watch = follows_to_watch(app);
     dispatch_terminal_event(app, event, out);
+    subagent_hold::hold_for_subagent_checkout(app, out);
     let Some((before, in_flight)) = watch else {
         return;
     };

@@ -96,7 +96,8 @@
   further down are the TUI's own.
   A Claude Code subagent's checkout (`.claude/worktrees/agent-<id>` on branch `worktree-agent-<id>`,
   made for an `isolation: "worktree"` subagent) shows up the same way, but Claude Code removes it when
-  the subagent finishes, so its band's rule says `subagent checkout`. A session started there and
+  the subagent finishes, so its band's rule says `subagent checkout`, and starting a session there or
+  moving one in (a quick prompt, a preset, `m`, a dragged card) asks first. A session started there and
   left behind refuses to start again and says to move it to another worktree (the card's **Move to…**),
   where it resumes with its conversation.
 - **The root checkout changes branch in place — the BRANCH SWITCHER.** `c` on a root-branch card (or
